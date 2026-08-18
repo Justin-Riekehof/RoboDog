@@ -1,0 +1,60 @@
+[project]
+name = "robodog"
+version = "0.1.0"
+description = "Software platform for the Waveshare WAVEGO quadruped: one robot API, swappable mock/sim/hardware backends, teach-in routines, gamepad teleop, digital twin."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+viz = ["matplotlib>=3.8"]
+sim = ["mujoco>=3.2"]
+
+[project.scripts]
+robodog = "robodog.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "types-pyyaml>=6.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/robodog"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",   # pycodestyle / pyflakes
+    "I",             # import sorting
+    "UP",            # pyupgrade
+    "B",             # bugbear
+    "C4",            # comprehensions
+    "SIM",           # simplify
+    "RUF",           # ruff-specific
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+files = ["src/robodog", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["matplotlib.*", "mujoco.*"]
+ignore_missing_imports = true

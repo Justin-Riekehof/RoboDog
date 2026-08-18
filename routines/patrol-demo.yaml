@@ -1,0 +1,18 @@
+# Example command-timeline routine. Needs gestures and LEDs, which the stock
+# firmware only exposes over serial (ASSUMPTIONS D2) — see patrol-wifi.yaml for
+# a variant that runs over Wi-Fi.
+schema: robodog.routine/v1
+name: patrol-demo
+description: Walk forward, stop, look around, duck briefly, LEDs off.
+kind: commands
+requires: [LOCOMOTION, GESTURE, PERIPHERALS]
+steps:
+  - {at: 0.0, do: led, args: {color: 3}}
+  - {at: 0.0, do: drive, args: {forward: 1}}
+  - {at: 2.0, do: drive, args: {forward: 0}}
+  - {at: 2.5, do: gesture, args: {axis: yaw, direction: 1}}
+  - {at: 3.0, do: gesture, args: {axis: yaw, direction: 1}}
+  - {at: 3.5, do: gesture, args: {axis: yaw, direction: -1}}
+  - {at: 4.0, do: gesture, args: {axis: yaw, direction: -1}}
+  - {at: 4.5, do: function, args: {mode: stay_low}}
+  - {at: 6.5, do: led, args: {color: 0}}

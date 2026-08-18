@@ -1,0 +1,27 @@
+# Example motion routine: keyframed leg-space trajectory (needs LEG_TARGET —
+# mock/sim today, hardware after the M5 firmware milestone).
+schema: robodog.routine/v1
+name: bow
+description: Lower the front legs into a bow, hold, and stand back up.
+kind: motion
+requires: [LEG_TARGET]
+interpolation: cosine
+keyframes:
+  - at: 0.0
+    legs:
+      front_left: {x: 16, y: 95, z: 25}
+      front_right: {x: 16, y: 95, z: 25}
+      hind_left: {x: -16, y: 95, z: 25}
+      hind_right: {x: -16, y: 95, z: 25}
+  - at: 1.0
+    legs:
+      front_left: {x: 16, y: 78, z: 25}
+      front_right: {x: 16, y: 78, z: 25}
+  - at: 2.0
+    legs:
+      front_left: {x: 16, y: 78, z: 25}
+      front_right: {x: 16, y: 78, z: 25}
+  - at: 3.0
+    legs:
+      front_left: {x: 16, y: 95, z: 25}
+      front_right: {x: 16, y: 95, z: 25}

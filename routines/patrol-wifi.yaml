@@ -1,0 +1,15 @@
+# Wi-Fi-capable variant: uses only what the stock firmware accepts over HTTP
+# (drive + function modes, ASSUMPTIONS D2). This is the routine to try first on
+# real hardware — with the robot on a stand.
+schema: robodog.routine/v1
+name: patrol-wifi
+description: Short forward walk, pause, turn in place, pause, stop.
+kind: commands
+requires: [LOCOMOTION]
+steps:
+  - {at: 0.0, do: drive, args: {forward: 1}}
+  - {at: 2.0, do: drive, args: {forward: 0}}
+  - {at: 3.0, do: drive, args: {turn: 1}}
+  - {at: 5.0, do: drive, args: {turn: 0}}
+  - {at: 6.0, do: drive, args: {forward: -1}}
+  - {at: 8.0, do: drive, args: {}}
