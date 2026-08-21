@@ -177,6 +177,52 @@ def cmd_bringup(args: argparse.Namespace) -> int:
     return 1 if report.errors else 0
 
 
+def cmd_teach(args: argparse.Namespace) -> int:
+    import threading
+
+    from robodog.teach.repl import RealtimeTicker, TeachRepl
+    from robodog.teach.session import TeachSession
+    from robodog.teach.webui import serve_teach_ui
+
+    backend = make_backend(args.backend, viewer=args.viewer)
+    with RobotClient(backend) as client:
+        client.arm()
+        session = TeachSession(
+            client,
+            name=args.name,
+            description=args.description,
+            default_spacing=args.spacing,
+            default_path=Path(args.out) if args.out else None,
+        )
+        for leg, message in session.start().items():
+            print(f"warning: {leg.name}: {message}")
+
+        lock = threading.Lock()
+        ticker = RealtimeTicker(client, lock)
+        ticker.start()
+        try:
+            if args.repl:
+                repl = TeachRepl(
+                    session, client, ask=input, say=print, realtime=args.viewer, lock=lock
+                )
+                repl.run()
+                result = 0
+            else:
+                result = serve_teach_ui(
+                    session,
+                    client,
+                    lock=lock,
+                    realtime=args.viewer,
+                    port=args.port,
+                    open_browser=not args.no_browser,
+                    say=print,
+                )
+        finally:
+            ticker.stop()
+            client.disarm()
+    return result
+
+
 def cmd_viz(args: argparse.Namespace) -> int:
     from robodog.viz.stick import render_pose  # matplotlib import stays optional
 
@@ -242,6 +288,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--report-dir", default=str(BRINGUP_REPORT_DIR), help="where to write the report"
     )
     p_bringup.set_defaults(func=cmd_bringup)
+
+    p_teach = sub.add_parser(
+        "teach", help="interactive teach-in: pose the robot, capture keyframes, save a routine"
+    )
+    p_teach.add_argument("name", help="routine name (lowercase slug, e.g. 'wave')")
+    p_teach.add_argument(
+        "--backend",
+        choices=("sim", "mock"),
+        default="sim",
+        help="sim = pose against live MuJoCo physics; mock = headless (hardware needs M4)",
+    )
+    p_teach.add_argument(
+        "--viewer", action="store_true", help="open the MuJoCo viewer next to the console"
+    )
+    p_teach.add_argument("--out", default=None, help="output file (default routines/<name>.yaml)")
+    p_teach.add_argument("--description", default="", help="one-line routine description")
+    p_teach.add_argument(
+        "--spacing", type=float, default=1.0, help="default seconds between keyframes"
+    )
+    p_teach.add_argument(
+        "--repl", action="store_true", help="text console instead of the web UI (scriptable)"
+    )
+    p_teach.add_argument(
+        "--port", type=int, default=0, help="web UI port (default: pick a free one)"
+    )
+    p_teach.add_argument(
+        "--no-browser", action="store_true", help="do not open the browser automatically"
+    )
+    p_teach.set_defaults(func=cmd_teach)
 
     p_viz = sub.add_parser("viz", help="render a stick-figure pose (needs viz extra)")
     p_viz.add_argument("--pose", choices=("stand", "crouch"), default="stand")

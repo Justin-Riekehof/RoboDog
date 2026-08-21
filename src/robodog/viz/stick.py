@@ -37,6 +37,17 @@ def _to_world(point: tuple[float, float, float], leg: LegId) -> tuple[float, flo
     return hip_x + lx, hip_y + side * lz, -ly
 
 
+# Public aliases for other consumers (the teach web UI renders from these).
+HIPS: dict[LegId, tuple[float, float]] = _HIPS
+SEGMENTS: tuple[tuple[int, int], ...] = _SEGMENTS
+to_world = _to_world
+
+
+def leg_chain_world(leg: LegId, target: LegTarget) -> list[tuple[float, float, float]]:
+    """All 7 linkage joint positions for one leg in world coordinates (mm)."""
+    return [_to_world(point, leg) for point in leg_points_3d(leg_ik(target))]
+
+
 def render_pose(
     targets: Mapping[LegId, LegTarget],
     *,

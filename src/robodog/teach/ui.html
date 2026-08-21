@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RoboDog Teach</title>
+<style>
+  :root {
+    --bg: #14171c; --panel: #1d232b; --line: #2c3540; --text: #dfe6ee;
+    --dim: #8b98a7; --accent: #4da3ff; --bad: #ff6b6b; --good: #62d0a5;
+    --fl: #4da3ff; --fr: #62d0a5; --hl: #e5b567; --hr: #e57373;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 system-ui, "Segoe UI", sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+           padding: 10px 14px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  header .title { font-weight: 600; margin-right: 8px; }
+  header .backend { color: var(--dim); font-size: 12px; margin-right: auto; }
+  main { display: flex; gap: 14px; padding: 14px; align-items: flex-start; flex-wrap: wrap; }
+  .col-views { flex: 1 1 560px; min-width: 480px; display: flex; flex-direction: column; gap: 14px; }
+  .col-ctrl  { flex: 0 0 380px; display: flex; flex-direction: column; gap: 14px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+  .panel h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase;
+              letter-spacing: .08em; color: var(--dim); font-weight: 600; }
+  svg { width: 100%; display: block; background: #171c22; border-radius: 6px;
+        touch-action: none; user-select: none; }
+  .grid line { stroke: #222a33; stroke-width: 1; }
+  .axis-label { fill: #55616e; font-size: 9px; }
+  .chain { fill: none; stroke-width: 2.5; stroke-linecap: round; opacity: .9; }
+  .foot { stroke: #fff; stroke-width: 1.2; cursor: grab; }
+  .foot.dragging { cursor: grabbing; stroke-width: 2.5; }
+  .ghost { fill: none; stroke-width: 1.5; opacity: .55; stroke-dasharray: 2 2; }
+  .trunk { fill: #2a323d; stroke: #3a4552; }
+  button { background: #2a3542; color: var(--text); border: 1px solid #3a4character552;
+           border: 1px solid #3a4552; border-radius: 6px; padding: 5px 10px;
+           cursor: pointer; font: inherit; }
+  button:hover { background: #33404f; }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #0b1016; font-weight: 600; }
+  button.danger { border-color: #5a3a3a; color: #ffb0b0; }
+  button.nudge { padding: 3px 7px; font-size: 12px; }
+  input, select { background: #12161b; color: var(--text); border: 1px solid var(--line);
+                  border-radius: 6px; padding: 5px 8px; font: inherit; }
+  input[type=number] { width: 64px; }
+  input[type=range] { width: 100%; padding: 0; }
+  #status { padding: 6px 10px; border-radius: 6px; min-width: 220px; font-size: 13px;
+            background: #12161b; border: 1px solid var(--line); color: var(--dim); }
+  #status.bad { color: var(--bad); border-color: #5a3a3a; }
+  #status.good { color: var(--good); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  td, th { padding: 4px 6px; text-align: left; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: 500; font-size: 12px; }
+  .legname { font-weight: 600; }
+  .coords { color: var(--dim); font-variant-numeric: tabular-nums; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .row + .row { margin-top: 8px; }
+  label.small { color: var(--dim); font-size: 12px; }
+  #kf-table button { padding: 2px 8px; font-size: 12px; }
+  .busy-note { color: var(--accent); font-size: 12px; display: none; }
+  body.busy .busy-note { display: inline; }
+  body.busy .disable-when-busy { pointer-events: none; opacity: .5; }
+</style>
+</head>
+<body>
+<header>
+  <span class="title">RoboDog Teach</span>
+  <span class="backend" id="backend-label"></span>
+  <span class="busy-note">preview running &hellip;</span>
+  <span id="status">connecting &hellip;</span>
+  <button id="btn-quit" class="danger">Quit</button>
+</header>
+
+<main>
+  <div class="col-views disable-when-busy">
+    <div class="panel">
+      <h2>Side view &mdash; drag feet: x (forward) / height</h2>
+      <svg id="svg-side" viewBox="-160 -30 320 175"></svg>
+    </div>
+    <div class="panel">
+      <h2>Top view &mdash; drag feet: x (forward) / sideways</h2>
+      <svg id="svg-top" viewBox="-160 -125 320 250"></svg>
+    </div>
+  </div>
+
+  <div class="col-ctrl">
+    <div class="panel disable-when-busy">
+      <h2>Legs (mm) &mdash; drag in the views or nudge here</h2>
+      <table id="leg-table"></table>
+      <div class="row" style="margin-top:8px">
+        <label class="small"><input type="checkbox" id="mirror"> mirror left&harr;right</label>
+      </div>
+      <div class="row">
+        <label class="small" style="flex:0 0 auto">body height</label>
+        <input type="range" id="height" min="75" max="110" step="0.5" style="flex:1">
+        <span class="coords" id="height-val"></span>
+      </div>
+      <div class="row">
+        <button data-pose="stand">Stand</button>
+        <button data-pose="crouch">Crouch</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Keyframes</h2>
+      <div class="row disable-when-busy">
+        <button id="btn-capture" class="primary">Capture pose</button>
+        <label class="small">after <input type="number" id="spacing" value="1.0" step="0.1" min="0.1"> s</label>
+        <button id="btn-undo">Undo</button>
+      </div>
+      <table id="kf-table" style="margin-top:8px"></table>
+      <div class="row" style="margin-top:8px">
+        <button id="btn-preview">Preview</button>
+        <select id="interp" class="disable-when-busy">
+          <option value="cosine">cosine easing</option>
+          <option value="linear">linear</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="panel disable-when-busy">
+      <h2>Save routine</h2>
+      <div class="row">
+        <input type="text" id="name" style="flex:1" placeholder="routine-name">
+        <label class="small"><input type="checkbox" id="overwrite"> overwrite</label>
+        <button id="btn-save" class="primary">Save</button>
+      </div>
+      <div class="row"><span class="coords" id="save-path"></span></div>
+    </div>
+  </div>
+</main>
+
+<script>
+"use strict";
+const LEGS = ["front_left", "hind_left", "front_right", "hind_right"];
+const SHORT = {front_left: "FL", hind_left: "HL", front_right: "FR", hind_right: "HR"};
+const COLOR = {front_left: "var(--fl)", hind_left: "var(--hl)",
+               front_right: "var(--fr)", hind_right: "var(--hr)"};
+const PAIR = {front_left: "front_right", front_right: "front_left",
+              hind_left: "hind_right", hind_right: "hind_left"};
+const SEGMENTS = [[0, 2], [1, 3], [2, 4], [3, 4], [4, 5], [5, 6]];
+
+let state = null;
+let drag = null;            // {leg, view, svg}
+let dragSendTimer = null;
+let statusTimer = null;
+let nameTouched = false;
+
+function $(id) { return document.getElementById(id); }
+
+function setStatus(msg, kind) {
+  const el = $("status");
+  el.textContent = msg;
+  el.className = kind || "";
+  clearTimeout(statusTimer);
+  if (kind) statusTimer = setTimeout(() => { el.className = ""; }, 4000);
+}
+
+async function api(action, body) {
+  try {
+    const response = await fetch("/api/" + action, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body || {}),
+    });
+    const data = await response.json();
+    if (data.message) setStatus(data.message, data.ok ? "good" : "bad");
+    return data;
+  } catch (err) {
+    setStatus("connection lost -- is the teach session still running?", "bad");
+    return {ok: false};
+  }
+}
+
+/* ---------- rendering ---------- */
+
+// side view: sx = world x, sy = -world z (up).  top view: sx = world x, sy = -world y (left).
+function project(view, p) {
+  return view === "side" ? [p[0], -p[2]] : [p[0], -p[1]];
+}
+
+function svgEl(tag, attrs) {
+  const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const k in attrs) el.setAttribute(k, attrs[k]);
+  return el;
+}
+
+function renderView(view) {
+  const svg = $(view === "side" ? "svg-side" : "svg-top");
+  svg.replaceChildren();
+
+  const grid = svgEl("g", {class: "grid"});
+  for (let x = -150; x <= 150; x += 50)
+    grid.appendChild(svgEl("line", {x1: x, y1: view === "side" ? -25 : -120,
+                                    x2: x, y2: view === "side" ? 140 : 120}));
+  const ys = view === "side" ? [0, 25, 50, 75, 100, 125] : [-100, -50, 0, 50, 100];
+  for (const y of ys)
+    grid.appendChild(svgEl("line", {x1: -155, y1: y, x2: 155, y2: y}));
+  svg.appendChild(grid);
+
+  if (view === "top") {
+    svg.appendChild(svgEl("rect", {x: -70, y: -38, width: 140, height: 76, rx: 8, class: "trunk"}));
+    svg.appendChild(Object.assign(svgEl("text", {x: -150, y: -108, class: "axis-label"}),
+                                  {textContent: "left"}));
+    svg.appendChild(Object.assign(svgEl("text", {x: -150, y: 118, class: "axis-label"}),
+                                  {textContent: "right"}));
+  } else {
+    svg.appendChild(svgEl("rect", {x: -70, y: -12, width: 140, height: 14, rx: 5, class: "trunk"}));
+    svg.appendChild(Object.assign(svgEl("text", {x: -150, y: 133, class: "axis-label"}),
+                                  {textContent: "ground direction v"}));
+  }
+  svg.appendChild(Object.assign(svgEl("text", {x: 130, y: view === "side" ? -18 : -113,
+                                               class: "axis-label"}),
+                                {textContent: "x fwd >"}));
+
+  for (const leg of LEGS) {
+    const chain = state.chains[leg];
+    if (!chain) continue;
+    const color = COLOR[leg];
+    for (const [i, j] of SEGMENTS) {
+      const [x1, y1] = project(view, chain[i]);
+      const [x2, y2] = project(view, chain[j]);
+      svg.appendChild(svgEl("line", {x1, y1, x2, y2, class: "chain", stroke: color}));
+    }
+    const ghost = state.measured_feet[leg];
+    if (ghost) {
+      const [gx, gy] = project(view, ghost);
+      svg.appendChild(svgEl("circle", {cx: gx, cy: gy, r: 5.5, class: "ghost", stroke: color}));
+    }
+    const [fx, fy] = project(view, chain[6]);
+    const foot = svgEl("circle", {cx: fx, cy: fy, r: 6, class: "foot", fill: color,
+                                  "data-leg": leg});
+    if (drag && drag.leg === leg && drag.view === view) foot.classList.add("dragging");
+    svg.appendChild(foot);
+  }
+}
+
+function renderLegTable() {
+  const table = $("leg-table");
+  table.replaceChildren();
+  for (const leg of LEGS) {
+    const t = state.targets[leg];
+    const tr = document.createElement("tr");
+    const nudges = ["x", "y", "z"].map(axis =>
+      `<button class="nudge" data-leg="${leg}" data-axis="${axis}" data-delta="-5">-5</button>` +
+      `<button class="nudge" data-leg="${leg}" data-axis="${axis}" data-delta="5">+5</button>`
+    );
+    tr.innerHTML =
+      `<td class="legname"><span class="dot" style="background:${COLOR[leg]}"></span>${SHORT[leg]}</td>` +
+      `<td class="coords">x ${t.x.toFixed(1)}</td><td>${nudges[0]}</td>` +
+      `<td class="coords">y ${t.y.toFixed(1)}</td><td>${nudges[1]}</td>` +
+      `<td class="coords">z ${t.z.toFixed(1)}</td><td>${nudges[2]}</td>`;
+    table.appendChild(tr);
+  }
+}
+
+let kfSignature = "";
+function renderKeyframes() {
+  const signature = JSON.stringify(state.keyframes.map(k => k.at)) + state.interpolation;
+  if (signature === kfSignature) return;
+  kfSignature = signature;
+  const table = $("kf-table");
+  table.replaceChildren();
+  if (!state.keyframes.length) {
+    table.innerHTML = "<tr><td class='coords'>none yet -- pose the robot and hit Capture</td></tr>";
+    return;
+  }
+  const head = document.createElement("tr");
+  head.innerHTML = "<th>#</th><th>t [s]</th><th></th><th></th>";
+  table.appendChild(head);
+  state.keyframes.forEach((kf, i) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      `<td>${i + 1}</td><td class="coords">${kf.at.toFixed(2)}</td>` +
+      `<td><button data-kf-apply="${i}">Go to</button></td>` +
+      `<td><button data-kf-delete="${i}" class="danger">Delete</button></td>`;
+    table.appendChild(tr);
+  });
+}
+
+function render() {
+  if (!state) return;
+  document.body.classList.toggle("busy", !!state.busy);
+  $("backend-label").textContent =
+    `backend: ${state.backend}` + (state.dirty ? " -- unsaved keyframes" : "");
+  renderView("side");
+  renderView("top");
+  renderLegTable();
+  renderKeyframes();
+  if (document.activeElement !== $("height")) {
+    const ys = LEGS.map(l => state.targets[l].y);
+    $("height").min = state.limits.height_min;
+    $("height").max = state.limits.height_max;
+    $("height").value = ys.reduce((a, b) => a + b, 0) / ys.length;
+  }
+  $("height-val").textContent = Number($("height").value).toFixed(1) + " mm";
+  if (!nameTouched && document.activeElement !== $("name")) $("name").value = state.name;
+  $("save-path").textContent = state.save_path;
+  $("interp").value = state.interpolation;
+}
+
+async function poll() {
+  try {
+    const response = await fetch("/api/state");
+    state = await response.json();
+    render();
+  } catch (err) { /* server gone; status set by the next action */ }
+}
+setInterval(poll, 150);
+poll();
+
+/* ---------- interactions ---------- */
+
+function svgPoint(svg, event) {
+  const pt = new DOMPoint(event.clientX, event.clientY);
+  return pt.matrixTransform(svg.getScreenCTM().inverse());
+}
+
+async function sendFoot(leg, view, world) {
+  const data = await api("foot", {leg, view, a: world.a, b: world.b});
+  if (data.ok && $("mirror").checked && data.target)
+    await api("target", {leg: PAIR[leg], ...data.target});
+}
+
+for (const view of ["side", "top"]) {
+  const svg = $(view === "side" ? "svg-side" : "svg-top");
+  svg.addEventListener("pointerdown", (event) => {
+    const foot = event.target.closest ? event.target.closest(".foot") : null;
+    if (!foot) return;
+    drag = {leg: foot.dataset.leg, view, svg};
+    svg.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  });
+  svg.addEventListener("pointermove", (event) => {
+    if (!drag || drag.view !== view) return;
+    const p = svgPoint(svg, event);
+    // side: a = world x, b = world z-up = -svg y.  top: a = world x, b = world y-left = -svg y.
+    const world = {a: p.x, b: -p.y};
+    if (dragSendTimer) return;                    // throttle to ~16 posts/s
+    dragSendTimer = setTimeout(() => { dragSendTimer = null; }, 60);
+    sendFoot(drag.leg, view, world);
+  });
+  const stop = () => { drag = null; };
+  svg.addEventListener("pointerup", stop);
+  svg.addEventListener("pointercancel", stop);
+}
+
+document.addEventListener("click", (event) => {
+  const el = event.target;
+  if (el.matches ? el.matches("button.nudge") : false) {
+    api("jog", {legs: [el.dataset.leg], axis: el.dataset.axis,
+                delta: Number(el.dataset.delta)}).then((data) => {
+      if (data.ok && $("mirror").checked)
+        api("jog", {legs: [PAIR[el.dataset.leg]], axis: el.dataset.axis,
+                    delta: Number(el.dataset.delta)});
+    });
+  } else if (el.dataset && el.dataset.pose) {
+    api("pose", {pose: el.dataset.pose});
+  } else if (el.dataset && el.dataset.kfApply !== undefined) {
+    api("kf_apply", {index: Number(el.dataset.kfApply)});
+  } else if (el.dataset && el.dataset.kfDelete !== undefined) {
+    api("kf_delete", {index: Number(el.dataset.kfDelete)});
+  }
+});
+
+$("height").addEventListener("input", () => {
+  $("height-val").textContent = Number($("height").value).toFixed(1) + " mm";
+  if (dragSendTimer) return;
+  dragSendTimer = setTimeout(() => { dragSendTimer = null; }, 80);
+  api("set", {legs: "all", axis: "y", value: Number($("height").value)});
+});
+
+$("btn-capture").addEventListener("click", () =>
+  api("capture", {spacing: Number($("spacing").value) || null}));
+$("btn-undo").addEventListener("click", () => api("undo", {}));
+$("btn-preview").addEventListener("click", () => api("preview", {}));
+$("interp").addEventListener("change", () => api("interp", {mode: $("interp").value}));
+$("name").addEventListener("input", () => { nameTouched = true; });
+$("btn-save").addEventListener("click", () =>
+  api("save", {name: $("name").value, overwrite: $("overwrite").checked}));
+$("btn-quit").addEventListener("click", async () => {
+  if (state && state.dirty &&
+      !confirm("There are unsaved keyframes. Quit anyway?")) return;
+  await api("quit", {});
+  document.body.innerHTML =
+    "<p style='padding:2em;color:#8b98a7'>Session ended. You can close this tab.</p>";
+});
+</script>
+</body>
+</html>

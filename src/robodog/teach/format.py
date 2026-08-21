@@ -368,3 +368,106 @@ def load_routine(path: str | Path, *, limits: LimitConfig | None = None) -> Rout
     except yaml.YAMLError as exc:
         raise RoutineError(f"{path}: invalid YAML: {exc}") from exc
     return parse_routine(data, source=str(path), limits=limits)
+
+
+# --- serialization: the write side of the format --------------------------------
+
+
+def _tidy(value: float) -> float | int:
+    """Millimetre-level precision is all the robot has; keep the files readable."""
+    rounded = round(value, 3)
+    return int(rounded) if rounded == int(rounded) else rounded
+
+
+def _command_to_step(command: Command) -> tuple[str, dict[str, Any]]:
+    """Inverse of :func:`_step_to_command`; both sides round-trip in tests."""
+    match command:
+        case Drive(forward=forward, turn=turn):
+            return "drive", {"forward": forward, "turn": turn}
+        case SetFunction(mode=mode):
+            return "function", {"mode": mode.name.lower()}
+        case Gesture(axis=axis, direction=direction):
+            return "gesture", {"axis": axis.value, "direction": direction}
+        case SetBodyPose(pose=pose):
+            return "body_pose", {
+                "pitch": _tidy(pose.pitch),
+                "yaw": _tidy(pose.yaw),
+                "roll": _tidy(pose.roll),
+                "height_offset": _tidy(pose.height_offset),
+            }
+        case SetLegTarget(leg=leg, target=target):
+            return "leg_target", {
+                "leg": LEG_IDS_TO_NAMES[leg],
+                "x": _tidy(target.x),
+                "y": _tidy(target.y),
+                "z": _tidy(target.z),
+            }
+        case SetJointAngles(leg=leg, angles=angles):
+            return "joint_angles", {
+                "leg": LEG_IDS_TO_NAMES[leg],
+                "wiggle": _tidy(angles.wiggle),
+                "fore": _tidy(angles.fore),
+                "back": _tidy(angles.back),
+            }
+        case Led(color=color):
+            return "led", {"color": color}
+        case Buzzer(on=on):
+            return "buzzer", {"on": on}
+
+
+def routine_to_dict(routine: Routine) -> dict[str, Any]:
+    doc: dict[str, Any] = {"schema": SCHEMA_V1, "name": routine.name}
+    if routine.description:
+        doc["description"] = routine.description
+    doc["kind"] = routine.kind
+    doc["requires"] = sorted(c.name for c in routine.requires)
+    if routine.kind == "commands":
+        steps: list[dict[str, Any]] = []
+        for step in routine.steps:
+            do, args = _command_to_step(step.command)
+            steps.append({"at": _tidy(step.at), "do": do, "args": args})
+        doc["steps"] = steps
+        return doc
+    doc["interpolation"] = routine.interpolation
+    doc["keyframes"] = [
+        {
+            "at": _tidy(keyframe.at),
+            "legs": {
+                LEG_IDS_TO_NAMES[leg]: {
+                    "x": _tidy(target.x),
+                    "y": _tidy(target.y),
+                    "z": _tidy(target.z),
+                }
+                for leg, target in keyframe.legs.items()
+            },
+        }
+        for keyframe in routine.keyframes
+    ]
+    return doc
+
+
+def dump_routine(routine: Routine) -> str:
+    """Serialize a routine to the same YAML dialect :func:`load_routine` reads."""
+    body = yaml.safe_dump(routine_to_dict(routine), sort_keys=False, allow_unicode=True, width=100)
+    return "# Authored with `robodog teach` -- a plain routine file, edit freely.\n" + body
+
+
+def save_routine(
+    routine: Routine,
+    path: str | Path,
+    *,
+    overwrite: bool = False,
+    limits: LimitConfig | None = None,
+) -> Path:
+    """Write a routine file, refusing to clobber and re-validating what we wrote."""
+    destination = Path(path)
+    text = dump_routine(routine)
+    # Self-check: whatever we serialize must load back cleanly (schema, name,
+    # workspace limits) -- a teach session must not be able to produce a file
+    # the player would reject.
+    parse_routine(yaml.safe_load(text), source=str(destination), limits=limits)
+    if destination.exists() and not overwrite:
+        raise RoutineError(f"{destination} already exists (pass overwrite to replace it)")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(text, encoding="utf-8")
+    return destination

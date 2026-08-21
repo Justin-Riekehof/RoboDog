@@ -103,6 +103,69 @@ def test_viz_crouch_pose(tmp_path: Path) -> None:
     assert out.exists()
 
 
+def test_teach_repl_records_and_saves_a_routine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from robodog.teach.format import load_routine
+
+    out = tmp_path / "nod.yaml"
+    script = iter(["cap", "leg fl fr", "y -10", "cap 0.5", "pose stand", "cap 0.5", "save", "quit"])
+    monkeypatch.setattr("builtins.input", lambda *_a: next(script))
+    assert main(["teach", "nod", "--backend", "mock", "--out", str(out), "--repl"]) == 0
+    assert "saved" in capsys.readouterr().out
+
+    routine = load_routine(out)
+    assert routine.name == "nod"
+    assert len(routine.keyframes) == 3
+    assert routine.duration == pytest.approx(1.0)
+
+
+def test_teach_default_serves_the_web_ui_until_quit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default teach mode is the browser UI; quitting from the page ends it."""
+    import json
+    import threading
+    import time
+    import urllib.request
+    import webbrowser
+
+    opened: list[str] = []
+    monkeypatch.setattr(webbrowser, "open", lambda url: opened.append(url))
+
+    out = tmp_path / "ui-run.yaml"
+    result: list[int] = []
+    runner = threading.Thread(
+        target=lambda: result.append(
+            main(["teach", "ui-run", "--backend", "mock", "--out", str(out)])
+        ),
+        daemon=True,
+    )
+    runner.start()
+
+    deadline = time.monotonic() + 10
+    while not opened and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert opened, "the teach UI never announced its URL"
+    url = opened[0]
+
+    with urllib.request.urlopen(url, timeout=5) as page:
+        assert "RoboDog Teach" in page.read().decode("utf-8")
+
+    request = urllib.request.Request(
+        url.rstrip("/") + "/api/quit",
+        data=b"{}",
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        assert json.loads(response.read())["ok"]
+
+    runner.join(timeout=10)
+    assert not runner.is_alive()
+    assert result == [0]
+
+
 def test_no_subcommand_exits_with_usage_error() -> None:
     with pytest.raises(SystemExit) as excinfo:
         main([])

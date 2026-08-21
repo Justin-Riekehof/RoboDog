@@ -1,0 +1,246 @@
+"""TeachSession: posing through the safety layer, keyframe lifecycle, saving."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from robodog.api.client import RobotClient
+from robodog.api.types import LegId, SetLegTarget
+from robodog.backends.mock import MockBackend
+from robodog.errors import RoutineError
+from robodog.kinematics.constants import STAND_HEIGHT, WALK_HEIGHT_MIN
+from robodog.teach.format import load_routine
+from robodog.teach.player import play_routine
+from robodog.teach.session import TeachSession, parse_legs
+from tests.conftest import FakeClock
+
+
+@pytest.fixture
+def session(client: RobotClient, backend: MockBackend) -> TeachSession:
+    client.arm()
+    teach = TeachSession(client, name="test-move")
+    assert teach.start() == {}
+    backend.command_log.clear()
+    return teach
+
+
+# --- leg selection --------------------------------------------------------------
+
+
+def test_parse_legs_resolves_aliases() -> None:
+    assert parse_legs(["fl", "hr"]) == (LegId.FRONT_LEFT, LegId.HIND_RIGHT)
+    assert parse_legs(["front_left"]) == (LegId.FRONT_LEFT,)
+    assert len(parse_legs(["all"])) == 4
+    assert parse_legs(["fl", "fl"]) == (LegId.FRONT_LEFT,)  # deduplicated
+
+
+def test_parse_legs_rejects_unknown_names() -> None:
+    with pytest.raises(ValueError, match="unknown leg"):
+        parse_legs(["front"])
+    with pytest.raises(ValueError, match="at least one leg"):
+        parse_legs([])
+
+
+# --- posing through the supervisor ----------------------------------------------
+
+
+def test_jog_moves_only_the_selected_legs(session: TeachSession, backend: MockBackend) -> None:
+    session.select((LegId.FRONT_LEFT, LegId.FRONT_RIGHT))
+    assert session.jog("y", -10.0) == {}
+    targets = session.targets
+    assert targets[LegId.FRONT_LEFT].y == pytest.approx(STAND_HEIGHT - 10)
+    assert targets[LegId.FRONT_RIGHT].y == pytest.approx(STAND_HEIGHT - 10)
+    assert targets[LegId.HIND_LEFT].y == pytest.approx(STAND_HEIGHT)
+    sent = [c for _, c in backend.command_log if isinstance(c, SetLegTarget)]
+    assert {c.leg for c in sent} == {LegId.FRONT_LEFT, LegId.FRONT_RIGHT}
+
+
+def test_set_axis_is_absolute(session: TeachSession) -> None:
+    session.select((LegId.FRONT_LEFT,))
+    assert session.set_axis("x", 30.0) == {}
+    assert session.targets[LegId.FRONT_LEFT].x == pytest.approx(30.0)
+
+
+def test_rejected_jog_moves_nothing(session: TeachSession, backend: MockBackend) -> None:
+    session.select((LegId.FRONT_LEFT,))
+    errors = session.jog("y", -50.0)  # 95 - 50 = 45 mm, below the 75 mm floor
+    assert LegId.FRONT_LEFT in errors
+    assert "outside" in errors[LegId.FRONT_LEFT]
+    assert session.targets[LegId.FRONT_LEFT].y == pytest.approx(STAND_HEIGHT)
+    assert backend.command_log == []  # the supervisor blocked it before the backend
+
+
+def test_unreachable_but_in_box_target_is_rejected(session: TeachSession) -> None:
+    """The C10 guard works during teaching, not just during playback."""
+    session.select((LegId.FRONT_LEFT,))
+    assert session.set_axis("z", 50.0) == {}  # fine at stand height
+    errors = session.set_axis("y", 110.0)  # (16, 110, 50): in the box, out of reach
+    assert "unreachable" in errors[LegId.FRONT_LEFT]
+    assert session.targets[LegId.FRONT_LEFT].y == pytest.approx(95.0)
+
+
+def test_partial_failure_moves_the_valid_legs(session: TeachSession) -> None:
+    session.select((LegId.FRONT_LEFT,))
+    assert session.set_axis("x", 40.0) == {}
+    session.select(parse_legs(["all"]))
+    errors = session.jog("x", 6.0)  # front-left would exceed the +/-45 mm bound
+    assert set(errors) == {LegId.FRONT_LEFT}
+    assert session.targets[LegId.FRONT_LEFT].x == pytest.approx(40.0)
+    assert session.targets[LegId.HIND_LEFT].x == pytest.approx(-10.0)
+
+
+def test_apply_pose_crouch(session: TeachSession) -> None:
+    assert session.apply_pose("crouch") == {}
+    for target in session.targets.values():
+        assert target.y == pytest.approx(WALK_HEIGHT_MIN)
+    with pytest.raises(ValueError, match="unknown pose"):
+        session.apply_pose("headstand")
+
+
+def test_invalid_axis_raises(session: TeachSession) -> None:
+    with pytest.raises(ValueError, match="axis"):
+        session.jog("w", 1.0)
+
+
+# --- keyframes -------------------------------------------------------------------
+
+
+def test_capture_times_are_cumulative(session: TeachSession) -> None:
+    first = session.capture()
+    second = session.capture()
+    third = session.capture(0.25)
+    assert first.at == pytest.approx(0.0)
+    assert second.at == pytest.approx(1.0)  # default spacing
+    assert third.at == pytest.approx(1.25)
+    assert session.duration == pytest.approx(1.25)
+
+
+def test_capture_snapshots_are_isolated(session: TeachSession) -> None:
+    frame = session.capture()
+    session.select((LegId.FRONT_LEFT,))
+    session.jog("y", -10.0)
+    assert frame.legs[LegId.FRONT_LEFT].y == pytest.approx(STAND_HEIGHT)  # unchanged
+
+
+def test_capture_rejects_non_positive_spacing(session: TeachSession) -> None:
+    session.capture()
+    with pytest.raises(ValueError, match="> 0"):
+        session.capture(0.0)
+
+
+def test_undo_and_dirty_lifecycle(session: TeachSession) -> None:
+    assert not session.dirty
+    session.capture()
+    assert session.dirty
+    dropped = session.undo()
+    assert dropped is not None and dropped.at == pytest.approx(0.0)
+    assert not session.dirty  # nothing captured any more
+    assert session.undo() is None
+
+
+def test_set_target_and_explicit_legs_param(session: TeachSession) -> None:
+    from robodog.api.types import LegTarget
+
+    assert session.set_target(LegId.HIND_RIGHT, LegTarget(-20.0, 85.0, 30.0)) is None
+    assert session.targets[LegId.HIND_RIGHT] == LegTarget(-20.0, 85.0, 30.0)
+    # legs= overrides the selection without changing it.
+    session.select((LegId.FRONT_LEFT,))
+    assert session.jog("y", -5.0, legs=(LegId.HIND_LEFT,)) == {}
+    assert session.targets[LegId.HIND_LEFT].y == pytest.approx(90.0)
+    assert session.targets[LegId.FRONT_LEFT].y == pytest.approx(STAND_HEIGHT)
+    assert session.selected == (LegId.FRONT_LEFT,)
+
+
+def test_apply_keyframe_restores_a_pose(session: TeachSession) -> None:
+    session.capture()  # stand
+    session.select(parse_legs(["all"]))
+    session.jog("y", -15.0)
+    session.capture()
+    assert session.apply_keyframe(0) == {}
+    assert session.targets[LegId.FRONT_LEFT].y == pytest.approx(STAND_HEIGHT)
+    with pytest.raises(ValueError, match="no keyframe"):
+        session.apply_keyframe(2)
+
+
+def test_delete_keyframe_keeps_absolute_times(session: TeachSession) -> None:
+    session.capture()  # at 0.0
+    session.capture()  # at 1.0
+    session.capture()  # at 2.0
+    dropped = session.delete_keyframe(1)
+    assert dropped.at == pytest.approx(1.0)
+    assert [kf.at for kf in session.keyframes] == [0.0, 2.0]
+    with pytest.raises(ValueError, match="no keyframe"):
+        session.delete_keyframe(5)
+
+
+# --- output ----------------------------------------------------------------------
+
+
+def test_to_routine_needs_two_keyframes(session: TeachSession) -> None:
+    session.capture()
+    with pytest.raises(RoutineError, match="at least 2"):
+        session.to_routine()
+
+
+def test_save_and_reload_full_cycle(session: TeachSession, tmp_path: Path) -> None:
+    session.capture()
+    session.select(parse_legs(["fl", "fr"]))
+    session.jog("y", -15.0)
+    session.capture(0.8)
+    session.apply_pose("stand")
+    session.capture(0.8)
+
+    path = session.save(tmp_path / "test-move.yaml")
+    assert not session.dirty
+
+    reloaded = load_routine(path)
+    assert reloaded.name == "test-move"
+    assert len(reloaded.keyframes) == 3
+    assert reloaded.keyframes[1].legs[LegId.FRONT_LEFT].y == pytest.approx(80.0)
+    assert reloaded.keyframes[2].at == pytest.approx(1.6)
+
+
+def test_save_refuses_overwrite_and_keeps_dirty(session: TeachSession, tmp_path: Path) -> None:
+    session.capture()
+    session.capture()
+    path = session.save(tmp_path / "r.yaml")
+    session.capture()
+    with pytest.raises(RoutineError, match="already exists"):
+        session.save(path)
+    assert session.dirty  # the failed save must not mark the work as safe
+    session.save(path, overwrite=True)
+    assert not session.dirty
+
+
+def test_saved_routine_plays_back(
+    session: TeachSession, client: RobotClient, tmp_path: Path, backend: MockBackend
+) -> None:
+    session.capture()
+    session.select(parse_legs(["all"]))
+    session.jog("y", -12.0)
+    session.capture()
+    path = session.save(tmp_path / "cycle.yaml")
+
+    play_routine(load_routine(path), client, tick=0.05)
+    assert backend.state().leg_targets[LegId.HIND_RIGHT].y == pytest.approx(83.0, abs=1e-6)
+
+
+def test_default_path_derives_from_the_name(client: RobotClient) -> None:
+    client.arm()
+    teach = TeachSession(client, name="wave-hello")
+    assert teach.default_path == Path("routines") / "wave-hello.yaml"
+
+
+def test_reapply_targets_resends_the_working_pose(
+    session: TeachSession, backend: MockBackend, clock: FakeClock
+) -> None:
+    session.select((LegId.FRONT_LEFT,))
+    session.jog("y", -10.0)
+    backend.command_log.clear()
+    session.reapply_targets()
+    sent = [c for _, c in backend.command_log if isinstance(c, SetLegTarget)]
+    assert len(sent) == 4
+    by_leg = {c.leg: c.target for c in sent}
+    assert by_leg[LegId.FRONT_LEFT].y == pytest.approx(STAND_HEIGHT - 10)

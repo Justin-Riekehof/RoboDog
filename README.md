@@ -52,6 +52,19 @@ The twin's legs are a serial stand-in for the real five-bar linkage, but their
 geometry and stability transfer, while absolute servo loads do not yet
 (ASSUMPTIONS E4). Its state is measured from physics, not estimated.
 
+### Teach-in against the twin
+
+```console
+uv run robodog teach wave --backend sim --viewer
+```
+
+Opens a local web UI in the browser: **drag the feet** in side/top views,
+mirror left/right, capture keyframes, preview the motion in physics, save — and
+out comes an ordinary routine file under [routines/](routines/). Ghost markers
+show where physics actually put each foot, and every pose passes the safety
+supervisor while you teach it. A scriptable console is available via `--repl`.
+Full guide: [docs/teach-in.md](docs/teach-in.md).
+
 `--viewer` paces playback to wall time (the simulation is otherwise some thirty
 times faster than real time) and keeps the window open when the routine ends,
 until you close it. Without the viewer, an 8-second routine finishes in about a

@@ -37,7 +37,11 @@ class LimitConfig:
     x_abs_max: float = 45.0  # covers gait (±41) and handshake (36) reach
     z_min: float = -20.0
     z_max: float = 60.0
-    joint_angle_abs_max: float = 65.0  # conservative, see ASSUMPTIONS C2
+    # The firmware's own verified stay-low needs back=83.3 deg on the hind legs
+    # (485 PWM counts -- beyond the SERVOMIN/SERVOMAX "window", which is scale
+    # only, ASSUMPTIONS C2). 90 deg admits the firmware's own repertoire while
+    # still catching runaway values; true end stops are unmeasured.
+    joint_angle_abs_max: float = 90.0
     body_angle_abs_max: float = GESTURE_OFFSET_MAX
     min_command_interval: float = 0.0  # seconds; 0 disables rate limiting
     require_reachable: bool = True  # reject targets the leg linkage cannot reach

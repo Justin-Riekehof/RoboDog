@@ -140,10 +140,18 @@ on hardware; measured input→command latency documented.
 
 ## M6 — Teach-in v2 (record · name · replay · version)
 
+Motion authoring arrived early (2026-08-19): **`robodog teach`** serves a
+local web UI — drag feet in side/top views, mirror left/right, height slider,
+capture/preview/save against live MuJoCo physics, ghost markers for the
+measured foot positions. Every pose passes the safety supervisor, so invalid
+poses are rejected while teaching, and saved files are re-validated through the
+player's own parser. A scriptable console remains via `--repl`. See
+docs/teach-in.md.
+
+Still open for this milestone:
 - Recorder: capture a teleop session as a `commands` routine (timestamped,
   normalized, deduplicated).
 - Routine management CLI: list, describe, dry-run.
-- Motion-routine authoring aids: pose snapshot from the sim, keyframe editing.
 
 **Acceptance:** record a gamepad session → YAML file → replay on sim and
 hardware; git diff of an edited routine is human-readable.

@@ -190,7 +190,7 @@ class SimBackend:
         steps = max(1, round(dt / self._model.opt.timestep))
         for _ in range(steps):
             self._mujoco.mj_step(self._model, self._data)
-        if self._viewer is not None:  # pragma: no cover - interactive only
+        if self._viewer is not None and self._viewer.is_running():  # pragma: no cover
             self._viewer.sync()
 
     # --- measured state ---

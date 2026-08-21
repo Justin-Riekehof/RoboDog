@@ -41,7 +41,7 @@ research notes with full citations in
 | # | Claim | Source | Status |
 |---|-------|--------|--------|
 | C1 | Linkage constants: S=12.2, A=40.0, B=40.0, C=39.8153, D=31.7750, E=30.8076, W=19.15 (mm) | `ServoCtrl.h` L28–56 | unverified (assumed exact for sim) |
-| C2 | Angle→PWM: `round(200·deg/90)·direction + middle(300 default)`; window 263–463 counts ≈ ±45° usable | `ServoCtrl.h` goalPWMSet, defines | unverified |
+| C2 | Angle→PWM: `round(200·deg/90)·direction + middle(300 default)`. **Partly wrong as first read:** the original entry inferred "window 263–463 counts ≈ ±45° usable", but SERVOMIN/SERVOMAX are *scale only* — `goalPWMSet` never clamps, and the firmware's own stay-low commands back=83.3° on the hind legs (485 counts, beyond the window), which ran on our device on 2026-08-11. Our safety limit is therefore ±90° per joint (admits the firmware's own repertoire, catches runaways); the true mechanical end stops remain unmeasured | `ServoCtrl.h` goalPWMSet, defines; crouch geometry via our IK | mapping formula unverified on device; the ±45° inference is **wrong**, corrected 2026-08-19 |
 | C3 | Servo channel map: leg1 F/B/W=8/9/10, leg2=14/15/13, leg3=7/6/5, leg4=1/0/2; direction array as in firmware | `ServoCtrl.h` L89–129 | unverified |
 | C4 | Workspace limits: height 75–110 mm, lateral ±30 mm, gesture ±15, balance ±21 — safe envelope for the real mechanics | `ServoCtrl.h` constants | unverified — the mechanical envelope might be tighter |
 | C5 | Leg numbering 1=FL 2=HL 3=FR 4=HR; per-leg frame x forward, y down-positive, z outward; hind legs get mirrored x | Wiki API page + `standUp()` | unverified |
