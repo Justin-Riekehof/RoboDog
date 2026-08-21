@@ -26,3 +26,6 @@ Thumbs.db
 out/
 *.png
 !docs/**/*.png
+
+# Claude Code local settings (machine-specific paths)
+.claude/settings.local.json

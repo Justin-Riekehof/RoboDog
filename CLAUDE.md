@@ -50,9 +50,12 @@ Read in this order when context is needed:
 
 ## Current state
 
-- M0 (offline foundations) is the active milestone — see ROADMAP for its
-  acceptance list. Later milestones must not leak in (no pyserial, no MuJoCo
-  imports in M0 code paths).
+- M0 (offline foundations), M1 (Wi-Fi bring-up, run on the real robot on
+  2026-08-11) and the core of M2 (MuJoCo digital twin) are done. **M3**
+  (sim-to-real calibration) is next — see ROADMAP for its acceptance list.
+- Optional dependencies stay optional: `matplotlib` (`viz` extra) and `mujoco`
+  (`sim` extra) must never be imported from a mock/http code path, so the
+  no-extras install and CI stay green without them.
 - The owner's parametric CadQuery leg model (`wavego_leg.py`) is intentionally
   **out of scope for now** (custom part from a repair); `cad/` holds only the
   exported STL.

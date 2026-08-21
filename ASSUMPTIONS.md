@@ -12,7 +12,7 @@ with the correction).
 Primary sources: firmware pinned in [vendor/wavego-firmware/](vendor/wavego-firmware/)
 (from <https://github.com/waveshare/WAVEGO>, MIT, unchanged since 2022);
 research notes with full citations in
-[docs/research/phase0-quellenrecherche.md](docs/research/phase0-quellenrecherche.md).
+[docs/research/phase0-source-research.md](docs/research/phase0-source-research.md).
 
 ## A. Hardware variant
 

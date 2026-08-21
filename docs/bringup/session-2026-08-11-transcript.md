@@ -4,8 +4,10 @@ Raw terminal log of the first Wi-Fi bring-up attempt, kept for the record.
 The motion steps all failed on a bug in our own tooling (the safety
 watchdog counted the operator's reading time as a dead control loop), so
 the motion findings in this run are **void**. See the structured outcome in
-[bringup-2026-08-11.md](bringup-2026-08-11.md) and the corrected transfer in
-[../../ASSUMPTIONS.md](../../ASSUMPTIONS.md).
+[bringup-2026-08-11-run2.md](bringup-2026-08-11-run2.md) — the repeat run after
+the fix, which is the report that counts — and the corrected transfer in
+[../../ASSUMPTIONS.md](../../ASSUMPTIONS.md). (This run's own report file was
+discarded with its void findings; the terminal log below still names it.)
 
 ```text
 (robodog) PS C:\Users\Justin\Documents\stash\RoboDog> uv run robodog info --backend http

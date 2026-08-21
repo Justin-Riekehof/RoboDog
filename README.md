@@ -1,5 +1,9 @@
 # RoboDog
 
+[![CI](https://github.com/Justin-Riekehof/RoboDog/actions/workflows/ci.yml/badge.svg)](https://github.com/Justin-Riekehof/RoboDog/actions/workflows/ci.yml)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 Software platform for the [Waveshare WAVEGO](https://www.waveshare.com/wiki/WAVEGO)
 12-DOF quadruped (Standard BASIC, no Raspberry Pi), built on four pillars:
 
@@ -104,7 +108,33 @@ sim-to-real calibration, then **M4** custom firmware. See
 One open hardware issue: our robot walks skewed because its repaired hind-right
 leg deviates from the firmware's link geometry (ASSUMPTIONS F1/F3).
 
+## Documentation
+
+| Document | What it answers |
+|---|---|
+| [ARCHITECTURE.md](ARCHITECTURE.md) | How it fits together: one Robot API, the backend/capability model, the safety design, repository layout |
+| [ROADMAP.md](ROADMAP.md) | Milestones M0-M7, each with its acceptance criteria |
+| [ASSUMPTIONS.md](ASSUMPTIONS.md) | Every unverified claim about the hardware and firmware, with its source and current status |
+| [docs/bringup.md](docs/bringup.md) | Guided first contact with the real robot, and why each step is in that order |
+| [docs/teach-in.md](docs/teach-in.md) | Authoring routines: web UI, scriptable console, the routine file format |
+| [docs/research/](docs/research/) | Phase-0 source research on the WAVEGO and WAVEGO Pro, with citations |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Development setup and the project's non-negotiable rules |
+
+Why so much prose about assumptions: the robot has **no servo position
+feedback** and the stock firmware returns **no telemetry at all**. Everything
+this software believes about the machine is either read out of the vendor
+firmware source or verified by watching the robot move. ASSUMPTIONS.md is the
+ledger of which is which, and entries are updated rather than deleted — a guess
+that turned out wrong is worth keeping.
+
+## Contributing
+
+Issues and pull requests are welcome, particularly from anyone running the same
+hardware — much of ASSUMPTIONS.md currently rests on a sample size of one robot.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
-MIT. Contains a pinned reference copy of the MIT-licensed Waveshare WAVEGO
-firmware under [vendor/wavego-firmware/](vendor/wavego-firmware/).
+[MIT](LICENSE). Contains a pinned reference copy of the MIT-licensed Waveshare
+WAVEGO firmware under [vendor/wavego-firmware/](vendor/wavego-firmware/),
+Copyright (c) 2022 waveshare — read-only, never modified.

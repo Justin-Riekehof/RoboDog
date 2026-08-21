@@ -200,16 +200,17 @@ src/robodog/          Python package (src layout)
   backends/           base protocol + mock/ (M0), http/ (M1), sim/ (M2)
   kinematics/         linkage constants, IK/FK, servo map, gait, easing
   safety/             SafetySupervisor, limits, watchdog
-  teach/              routine schema, loader/validator, player, recorder (M6)
+  teach/              routine schema, loader/validator, player, teach-in
+                      session + web UI + scriptable console
   viz/                stick-figure rendering from FK (optional `viz` extra)
   bringup.py          guided hardware bring-up procedure (M1)
   cli.py              `robodog` entry point
 tests/                pytest suite (mirrors package layout)
 routines/             teach-in files (YAML, versioned in git)
-sim/                  MJCF/URDF models + meshes (M2)
+sim/                  exported models + meshes (the MJCF itself is generated)
 cad/                  CAD sources/exports (existing leg STL; CadQuery later)
 vendor/wavego-firmware/  pinned upstream firmware reference (MIT, read-only)
-docs/                 research notes, bring-up procedure, bring-up reports
+docs/                 research notes, bring-up procedure + reports, teach-in guide
 ```
 
 ## Firmware strategy
