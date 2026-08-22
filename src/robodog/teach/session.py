@@ -23,6 +23,7 @@ from robodog.errors import KinematicsError, LimitViolationError, RoutineError
 from robodog.kinematics.constants import STAND_HEIGHT
 from robodog.kinematics.leg import leg_roll_and_depth, leg_target_from_roll
 from robodog.kinematics.poses import crouch_pose, stand_pose
+from robodog.safety.limits import check_leg_target
 from robodog.teach.format import (
     Keyframe,
     Routine,
@@ -194,6 +195,52 @@ class TeachSession:
                 errors[leg] = str(exc)
                 continue
             message = self._apply(leg, moved)
+            if message is not None:
+                errors[leg] = message
+        return errors
+
+    def lean(self, delta: float) -> dict[LegId, str]:
+        """Roll the body sideways: positive ``delta`` mm leans to the robot's right.
+
+        A quadruped with no spine leans by standing differently on each side --
+        the legs on one side reach further down, so that side of the body rises.
+        This is deliberately *not* the roll axis: roll lives in each leg's own
+        frame, which mirrors left to right (`stick.to_world` flips z on the
+        right), so one roll value on all four legs splays the feet outward and
+        leaves the body perfectly level. That is a useful move, but it is not
+        leaning, and having one control for each is the only way to have both.
+
+        With the feet planted the body follows; with the robot on a stand it
+        just stands crooked, which is what makes it safe to try.
+
+        All four legs move or none do. Every other move here is per-leg, and
+        rightly so -- one foot refused leaves the other three where the operator
+        put them. A lean is one gesture: half of it applied is a robot standing
+        crooked in a way nobody asked for, and holding the key would deepen it
+        with every press while the refused side stayed put.
+        """
+        limits = self._client.limits
+        planned: dict[LegId, LegTarget] = {}
+        errors: dict[LegId, str] = {}
+        for leg in _ALL_LEGS:
+            # The right legs shorten as the left ones extend, and the body tips
+            # towards the short side.
+            side = 1.0 if leg in (LegId.FRONT_LEFT, LegId.HIND_LEFT) else -1.0
+            current = self._targets[leg]
+            try:
+                target = with_axis(current, "depth", axis_value(current, "depth") + side * delta)
+                # Asked before anything is sent, so the whole gesture can be
+                # abandoned. The supervisor still decides on the way out -- this
+                # only decides whether to ask it.
+                check_leg_target(target, limits)
+            except (KinematicsError, LimitViolationError) as exc:
+                errors[leg] = str(exc)
+                continue
+            planned[leg] = target
+        if errors:
+            return errors
+        for leg, target in planned.items():
+            message = self._apply(leg, target)
             if message is not None:
                 errors[leg] = message
         return errors

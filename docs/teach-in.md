@@ -130,6 +130,32 @@ firmware's canned animations. One click sends one move straight through the
 safety supervisor to the robot — the same command a sequence step would send,
 just without the timer.
 
+### Keyboard
+
+The console is driveable from the keyboard, in both tabs:
+
+| Key | Does |
+| --- | --- |
+| `W` `A` `S` `D` | walk forward / turn left / backward / turn right — **hold**, release stops |
+| numpad `8` / `2` | extend the legs / go down on all four (±5 mm of reach) |
+| numpad `4` / `6` | lean left / right (±5 mm, one side extends as the other shortens) |
+| numpad `5` | Home |
+| `Esc` | stop |
+
+Two things are deliberate. **WASD is hold-to-walk**, unlike the pad's
+click-to-latch: a latched direction bound to a key would be the worst of both,
+because you take your hand off the keyboard and the robot keeps going. Losing
+the window releases it too — a key held while the page loses focus never comes
+back up. And the keys do nothing while you are typing in a field, so naming a
+routine `wasd` is safe.
+
+**Leaning is not the roll slider.** Roll lives in each leg's own frame and those
+frames mirror left to right, so one roll value on all four legs swings both feet
+outward and leaves the body dead level — a splay, not a lean. A quadruped with
+no spine leans by standing differently on each side: the legs on one side reach
+further down, and with the feet planted the body follows. All four legs move or
+none do; half a lean is a robot standing crooked in a way nobody asked for.
+
 **Home** is the way back to the middle from wherever the robot ended up: it
 stops a latched move *first*, then stands in the pose the session opened in.
 The order is the point — a robot still walking walks straight out of the pose

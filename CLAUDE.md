@@ -35,7 +35,7 @@ Read in this order when context is needed:
 - Language: everything in the repo is **English** (code, comments, docs,
   commits). Conversation with the owner is German.
 - Python ≥ 3.12, `src/` layout, uv for everything:
-  `uv sync --all-groups`, `uv run pytest`, `uv run ruff check .`,
+  `uv sync --all-groups --all-extras`, `uv run pytest`, `uv run ruff check .`,
   `uv run ruff format .`, `uv run mypy`, `uv run robodog ...`.
 - Fully typed (`mypy` clean, no `# type: ignore` without a reason comment).
 - Units: millimeters and degrees at API boundaries (firmware convention);
@@ -47,6 +47,13 @@ Read in this order when context is needed:
   deterministic; I/O and clocks are injected — tests never sleep.
 - Commits: imperative subject, body explains why; reference milestone
   (`M0: ...`) when applicable. Do not commit/push unless the owner asks.
+- **`--all-extras` is not optional** in that sync, despite the name: without it
+  `matplotlib` and `mujoco` are uninstalled and the tests that assert the twin's
+  geometry fail on a tree that is perfectly fine.
+- CI (`.github/workflows/ci.yml`) runs ruff, ruff format, mypy and pytest on
+  **every branch**, so work in parallel gets its own verdict without waiting for
+  a merge. Run the same four locally before pushing -- they are what CI runs,
+  in the same order.
 
 ## Current state
 

@@ -419,6 +419,10 @@ class TeachUIServer:
             return self._save(body)
         if action == "preview":
             return self._start_preview()
+        if action == "lean":
+            # Not the roll axis: see TeachSession.lean for why one roll value on
+            # four legs splays the feet and leaves the body level.
+            return self._errors_result(session.lean(_num(body, "delta")))
         if action == "home":
             return self._home()
         if action == "drive":

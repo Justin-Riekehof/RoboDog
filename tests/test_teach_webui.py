@@ -1195,3 +1195,61 @@ def test_the_page_markup_is_balanced() -> None:
     assert not parser.problems, "; ".join(parser.problems)
     unclosed = ", ".join(f"<{tag}> line {line}" for tag, line in parser.stack)
     assert not parser.stack, f"never closed: {unclosed}"
+
+
+# --- keyboard control ---------------------------------------------------------------
+
+
+def test_the_page_binds_the_keys_it_advertises() -> None:
+    """The bindings and the line that documents them have to agree; a shortcut
+    nobody can see is not a control, and one documented wrongly is worse."""
+    page = resources.files("robodog.teach").joinpath("ui.html").read_text(encoding="utf-8")
+    for code, move in (
+        ("KeyW", "forward"),
+        ("KeyA", "left"),
+        ("KeyS", "backward"),
+        ("KeyD", "right"),
+    ):
+        assert f'{code}: "{move}"' in page
+    for code in ("Numpad8", "Numpad2", "Numpad6", "Numpad4"):
+        assert f"{code}:" in page
+    assert 'event.code === "Numpad5"' in page  # home, and it works without poses
+    assert "hold to walk" in page
+
+
+def test_walking_by_key_lets_go_when_the_key_or_the_window_does() -> None:
+    """A latched direction bound to a key would be the worst of both: take your
+    hand off the keyboard and the robot keeps walking. So the release is bound
+    too -- and to losing the window as well, because a key held while the page
+    loses focus never comes back up."""
+    page = resources.files("robodog.teach").joinpath("ui.html").read_text(encoding="utf-8")
+    assert 'document.addEventListener("keyup"' in page
+    assert 'window.addEventListener("blur", releaseHeldDrive)' in page
+    assert "if (event.repeat" in page, "auto-repeat would post the same move 30x a second"
+    # Typing a routine name must not drive the robot.
+    assert "typingInto(event)" in page
+
+
+def test_leaning_over_the_wire_tips_the_robot(rig: tuple[TeachUIServer, MockBackend, str]) -> None:
+    _server, _backend, url = rig
+    post(url, "pose", {"pose": "stand"})
+    before = state_of(url)["targets"]
+    status, data = post(url, "lean", {"delta": 6})
+    assert status == 200 and data["ok"], data
+
+    after = state_of(url)["targets"]
+    # Right leans: the left legs reach further, the right ones less.
+    assert after["front_left"]["depth"] > before["front_left"]["depth"]
+    assert after["hind_left"]["depth"] > before["hind_left"]["depth"]
+    assert after["front_right"]["depth"] < before["front_right"]["depth"]
+    assert after["hind_right"]["depth"] < before["hind_right"]["depth"]
+
+
+def test_a_refused_lean_answers_with_the_reason(
+    rig: tuple[TeachUIServer, MockBackend, str],
+) -> None:
+    _server, _backend, url = rig
+    post(url, "pose", {"pose": "stand"})
+    status, data = post(url, "lean", {"delta": 40})
+    assert status == 200 and not data["ok"]
+    assert "outside" in data["message"]

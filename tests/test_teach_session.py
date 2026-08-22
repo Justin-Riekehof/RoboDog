@@ -288,3 +288,79 @@ def test_reapply_targets_resends_the_working_pose(
     assert len(sent) == 4
     by_leg = {c.leg: c.target for c in sent}
     assert by_leg[LegId.FRONT_LEFT].y == pytest.approx(STAND_HEIGHT - 10)
+
+
+def test_leaning_is_not_the_roll_axis(session: TeachSession) -> None:
+    """Both move the legs sideways; only one tips the robot.
+
+    Roll lives in each leg's own frame and those frames mirror left to right
+    (`stick.to_world` flips z on the right side), so one roll value on all four
+    legs swings both feet outward and leaves the body dead level. Leaning is the
+    other one: the legs on one side reach further down than the other, and with
+    the feet planted the body follows.
+    """
+    from robodog.kinematics.leg import leg_ik, leg_points_3d
+    from robodog.viz.stick import to_world
+
+    session.apply_pose("stand")
+
+    def foot_height(leg: LegId) -> float:
+        return to_world(leg_points_3d(leg_ik(session.targets[leg]))[6], leg)[2]
+
+    level = foot_height(LegId.FRONT_LEFT) - foot_height(LegId.FRONT_RIGHT)
+    assert level == pytest.approx(0.0), "the stand pose is not level to begin with"
+
+    assert not session.set_axis("roll", 20.0, legs=tuple(LegId))
+    assert foot_height(LegId.FRONT_LEFT) - foot_height(LegId.FRONT_RIGHT) == pytest.approx(0.0), (
+        "rolling all four legs tipped the robot -- it should only splay the feet"
+    )
+
+    session.apply_pose("stand")
+    assert not session.lean(10.0)
+    # Positive leans right: the left legs reach further down, so that side rises.
+    assert foot_height(LegId.FRONT_LEFT) < foot_height(LegId.FRONT_RIGHT)
+    assert foot_height(LegId.HIND_LEFT) < foot_height(LegId.HIND_RIGHT)
+
+    session.apply_pose("stand")
+    assert not session.lean(-10.0)
+    assert foot_height(LegId.FRONT_LEFT) > foot_height(LegId.FRONT_RIGHT)
+
+
+def test_leaning_back_and_forth_returns_to_where_it_started(session: TeachSession) -> None:
+    """A key held and then held the other way has to be a round trip, or the
+    robot drifts a little further from level every time it is used."""
+    session.apply_pose("stand")
+    before = {leg: session.targets[leg] for leg in LegId}
+    for _ in range(3):
+        assert not session.lean(2.0)
+    for _ in range(3):
+        assert not session.lean(-2.0)
+    for leg in LegId:
+        for axis in ("x", "y", "z"):
+            assert getattr(session.targets[leg], axis) == pytest.approx(
+                getattr(before[leg], axis), abs=1e-9
+            )
+
+
+def test_a_lean_that_cannot_finish_does_not_start(session: TeachSession) -> None:
+    """Half a lean is worse than none.
+
+    Every other move here is per leg, and rightly so: one foot refused leaves
+    the other three where the operator put them. A lean is one gesture, and
+    applying the half that fits leaves the robot standing crooked in a way
+    nobody asked for -- with a key held down, deeper on every repeat while the
+    refused side stays put.
+    """
+    session.apply_pose("stand")
+    before = {leg: session.targets[leg] for leg in LegId}
+    # Chosen so that only one side runs out: the stand pose reaches 101.3 mm and
+    # the workspace is [75, 110], so +15 overruns the extending side while the
+    # shortening side is still comfortably inside.
+    errors = session.lean(15.0)
+    assert set(errors) == {LegId.FRONT_LEFT, LegId.HIND_LEFT}, errors
+
+    for leg in LegId:
+        for axis in ("x", "y", "z"):
+            assert getattr(session.targets[leg], axis) == pytest.approx(
+                getattr(before[leg], axis)
+            ), f"{leg.name} moved even though the lean as a whole was refused"

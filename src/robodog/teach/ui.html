@@ -101,6 +101,8 @@
   .pad button.active { background: var(--accent); border-color: var(--accent);
                        color: #0b1016; font-weight: 700; }
   .driving { color: var(--bad); font-weight: 600; }
+  .keys { margin-top: 10px; }
+  .keys b { color: var(--text); font-family: ui-monospace, Consolas, monospace; }
   .estop-note { color: var(--bad); font-weight: 600; font-size: 12px; margin-right: 6px; }
   #estop { display: inline-flex; align-items: center; }
   #estop[hidden] { display: none; }
@@ -272,6 +274,10 @@
       <button id="btn-home" class="primary disable-when-busy">Home</button>
       <span class="hint" id="home-note"></span>
     </div>
+    <div class="row keys"><span class="hint">Keyboard &mdash;
+      <b>W&nbsp;A&nbsp;S&nbsp;D</b> hold to walk;
+      numpad <b>8</b>/<b>2</b> extend/crouch, <b>4</b>/<b>6</b> lean left/right,
+      <b>5</b> home; <b>Esc</b> stops</span></div>
     <div class="row" style="margin-top:10px"><span class="hint">Standard moves
       &mdash; the firmware's own canned animations:</span></div>
     <div class="row disable-when-busy" id="functions"></div>
@@ -948,9 +954,77 @@ $("seq-run").addEventListener("click", () => {
 $("seq-stop").addEventListener("click", () => api("stop", {}));
 $("btn-reset").addEventListener("click", () => api("reset", {}));
 $("btn-home").addEventListener("click", () => api("home", {}));
+
+// --- keyboard control -------------------------------------------------------
+// WASD is HOLD-to-walk, unlike the pad's click-to-latch. A latched direction
+// bound to a key would be the worst of both: you take your hand off the
+// keyboard and the robot keeps going, with nothing on screen that looks like
+// the thing you pressed. Holding a key has an obvious way out -- let go -- so
+// the release is where the stop belongs.
+const DRIVE_KEYS = {KeyW: "forward", KeyA: "left", KeyS: "backward", KeyD: "right"};
+// Numpad poses. 8/2 move all four legs the same way, 4/6 move them in opposite
+// directions: the same axis, symmetric or not, which is how a quadruped with no
+// spine leans (see TeachSession.lean -- the roll axis splays, it does not lean).
+const REACH_STEP = 5, LEAN_STEP = 5;
+const POSE_KEYS = {
+  Numpad8: () => api("jog", {legs: "all", axis: "depth", delta: REACH_STEP}),
+  Numpad2: () => api("jog", {legs: "all", axis: "depth", delta: -REACH_STEP}),
+  Numpad6: () => api("lean", {delta: LEAN_STEP}),
+  Numpad4: () => api("lean", {delta: -LEAN_STEP}),
+};
+const KEY_REPEAT_MS = 150;
+let heldDrive = null, lastPoseKey = 0;
+
+function typingInto(event) {
+  const tag = event.target && event.target.tagName;
+  return tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA";
+}
+
+function releaseHeldDrive() {
+  if (!heldDrive) return;
+  heldDrive = null;
+  api("stop", {});
+}
+
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") api("stop", {});
+  if (event.key === "Escape") { api("stop", {}); return; }
+  // A shortcut must never fire while someone names a routine or types seconds,
+  // and a modifier means the browser's own command, not ours.
+  if (typingInto(event) || event.ctrlKey || event.altKey || event.metaKey) return;
+  if (!state) return;
+
+  const move = DRIVE_KEYS[event.code];
+  if (move) {
+    event.preventDefault();
+    // Auto-repeat would post the same move thirty times a second, and the move
+    // is latched after the first one anyway.
+    if (event.repeat || heldDrive === move || state.busy) return;
+    heldDrive = move;
+    api("drive", {move});
+    return;
+  }
+
+  // Home works on every robot -- on one that takes no leg targets it is the
+  // stop alone -- but there is nothing to pose there, so the rest stays off.
+  if (event.code === "Numpad5") { event.preventDefault(); api("home", {}); return; }
+  const pose = POSE_KEYS[event.code];
+  if (!pose || !state.pose_enabled) return;
+  event.preventDefault();
+  if (state.busy) return;
+  // Auto-repeat IS wanted here: holding 8 keeps extending. But the link carries
+  // about ten poses a second, so it is paced rather than flooded.
+  const now = performance.now();
+  if (now - lastPoseKey < KEY_REPEAT_MS) return;
+  lastPoseKey = now;
+  pose();
 });
+
+document.addEventListener("keyup", (event) => {
+  if (DRIVE_KEYS[event.code]) releaseHeldDrive();
+});
+// Alt-tab, click into another window, lock the screen: the key never comes back
+// up, so the release has to come from somewhere other than keyup.
+window.addEventListener("blur", releaseHeldDrive);
 
 $("seq-name").addEventListener("input", () => { seqNameTouched = true; });
 $("seq-save").addEventListener("click", async () => {
