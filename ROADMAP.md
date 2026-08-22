@@ -134,6 +134,13 @@ commands plus an on-device safety net.
   walking without tripping, then stopped and crouched by itself at the deadline.
   +384 B flash, +16 B RAM over the baseline; off by default, so the stock web UI
   is unaffected.
+  ✅ **and the host budget, confirmed on the robot 2026-08-22**: a teach
+  session over Wi-Fi opened and stayed up. It had been E-stopping itself on
+  open with `watchdog timeout (0.500s)` -- the supervisor's budget was read
+  from the backend *before* connect, and before connect a transport that probes
+  for its firmware can only answer with the pessimistic stock number. Sized at
+  connect now. Still unconfirmed on the device: the keep-alive that holds a
+  *walk* up, which needs someone to hold a direction for several seconds.
   ✅ **host side done 2026-08-22**: `HttpBackend` arms it at 1500 ms on connect
   and disarms it on disconnect -- leaving it armed would stop the robot for
   whoever drives it next from the vendor's own page, which sends nothing while
@@ -181,6 +188,25 @@ commands plus an on-device safety net.
   the drive pad -- with the only STOP button -- was locked inside the Sequence
   tab, so posing happened with no stop on screen. It is now a console beside
   both tabs, with a **Home** button that stops and re-centres.
+- Live camera and sensor tuning from the teach UI -> `CAMERA` (the stream, which
+  the vendor firmware serves too) and `CAMERA_TUNING` (the `cam_*` family, ours).
+  ✅ **done and confirmed on the robot 2026-08-22.** The operator watched the
+  MJPEG feed in the Camera tab and moved contrast, brightness and the rest with
+  the change visible in the picture. Three things had to be true at once and
+  each was wrong first:
+  * the robot ran a build from **before** the camera code, so every write
+    answered 500 and the page reported it in a line nobody looks at. Flashed;
+    the page now reverts a refused control and says why at the control.
+  * the frame-size list stopped at QVGA because `ROBODOG_CAM_MAX_SIZE` was read
+    as the constant it is *initialised* to. The fork overwrites it at boot from
+    what `esp_camera_init` accepted -- **VGA on this unit** -- so three usable
+    resolutions were missing. This is why the picture now "looks a lot sharper".
+  * ASSUMPTIONS F4 was open: `psram=0`, measured. No PSRAM, and VGA fits in
+    internal DRAM regardless, so the vendor's QVGA was a choice.
+  ⏳ **open:** no readback over Wi-Fi. `cam_report` answers on the serial
+  console, so the controls show what was asked for rather than what the sensor
+  holds, and nothing over Wi-Fi can ask a given robot what its frame buffer
+  ceiling actually is. A response body on `/control` would close both.
 - Active telemetry: battery voltage and the **full** IMU (the stock firmware
   reads only 2 of the ICM20948's 9 axes) → `TELEMETRY`.
 - Current-based stall detection from the INA219 as the open-loop safety net.
