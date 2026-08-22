@@ -113,6 +113,9 @@
   .cam-row input[type=range] { flex: 1; }
   .cam-row .val { flex: 0 0 52px; text-align: right; font-size: 12px; color: var(--dim); }
   .cam-note { font-size: 11px; color: var(--dim); margin: -2px 0 8px 128px; }
+  .cam-failed { color: var(--bad); font-size: 12px; font-weight: 600; }
+  .cam-failed[hidden] { display: none; }
+  .cam-row.failed label { color: var(--bad); }
   .keys { margin-top: 10px; }
   .keys b { color: var(--text); font-family: ui-monospace, Consolas, monospace; }
   .estop-note { color: var(--bad); font-weight: 600; font-size: 12px; margin-right: 6px; }
@@ -288,6 +291,7 @@
       <div class="row"><span class="hint">No robot answers with its current
         settings over Wi-Fi, so these show what was asked for, not what the
         sensor holds. <b>Reset</b> puts both back in step.</span></div>
+      <div class="row"><span class="cam-failed" id="cam-error" hidden></span></div>
       <div id="cam-controls"></div>
     </div>
   </div>
@@ -775,6 +779,24 @@ function startStream() {
   $("cam-toggle").textContent = "Stop";
 }
 
+// A control that failed must not look like one that worked. Without this a
+// refused write leaves the slider where it was dragged and the reason in the
+// small status line at the top of the window -- which is indistinguishable
+// from a sensor that ignored the setting, and sends you looking at the camera
+// instead of at the answer the robot gave.
+async function camSet(param, value, revert) {
+  const data = await api("camera", {name: param.name, value: value});
+  const failed = $("cam-error");
+  if (data.ok) {
+    failed.hidden = true;
+    return true;
+  }
+  failed.hidden = false;
+  failed.textContent = param.label + ": " + (data.message || "refused");
+  revert();
+  return false;
+}
+
 function camControl(param, values) {
   const row = document.createElement("div");
   row.className = "cam-row";
@@ -787,7 +809,7 @@ function camControl(param, values) {
     label.textContent = "";
     const button = document.createElement("button");
     button.textContent = param.label;
-    button.addEventListener("click", () => api("camera", {name: param.name, value: 0}));
+    button.addEventListener("click", () => camSet(param, 0, () => {}));
     row.appendChild(button);
     return row;
   }
@@ -795,8 +817,10 @@ function camControl(param, values) {
     const box = document.createElement("input");
     box.type = "checkbox";
     box.checked = !!value;
-    box.addEventListener("change", () =>
-      api("camera", {name: param.name, value: box.checked ? 1 : 0}));
+    box.addEventListener("change", () => {
+      const asked = box.checked;
+      camSet(param, asked ? 1 : 0, () => { box.checked = !asked; });
+    });
     row.appendChild(box);
     return row;
   }
@@ -810,8 +834,13 @@ function camControl(param, values) {
       select.appendChild(option);
     });
     select.value = String(value);
-    select.addEventListener("change", () =>
-      api("camera", {name: param.name, value: Number(select.value)}));
+    let accepted = String(value);
+    select.addEventListener("change", () => {
+      const asked = select.value;
+      camSet(param, Number(asked), () => { select.value = accepted; }).then((ok) => {
+        if (ok) accepted = asked;
+      });
+    });
     row.appendChild(select);
     return row;
   }
@@ -826,8 +855,14 @@ function camControl(param, values) {
   slider.addEventListener("input", () => { shown.textContent = slider.value; });
   // On release, not on every pixel of the drag: each one is a request to the
   // robot over the same link the control loop uses.
-  slider.addEventListener("change", () =>
-    api("camera", {name: param.name, value: Number(slider.value)}));
+  let accepted = String(value);
+  slider.addEventListener("change", () => {
+    const asked = slider.value;
+    camSet(param, Number(asked), () => {
+      slider.value = accepted;
+      shown.textContent = accepted;
+    }).then((ok) => { if (ok) accepted = asked; });
+  });
   row.appendChild(slider);
   row.appendChild(shown);
   return row;
