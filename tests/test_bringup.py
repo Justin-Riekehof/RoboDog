@@ -353,3 +353,101 @@ def test_an_unstarted_walk_makes_the_watchdog_answer_void() -> None:
     watchdog = next(r for r in report.results if r.step.key == "no_watchdog")
     assert watchdog.outcome == "skipped"
     assert "walk_for_watchdog" in watchdog.note
+
+
+# --- keeping a walking robot alive between prompts -----------------------------------
+
+
+class CountingBackend(MockBackend):
+    """A mock that says how often the control loop reached it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ticks = 0
+
+    def tick(self, dt: float) -> None:
+        self.ticks += 1
+        super().tick(dt)
+
+
+class ReadingAsker(ScriptedAsker):
+    """An operator who reads the prompt before answering.
+
+    Waits for the control loop rather than for a duration, so it is neither
+    slow nor timing-dependent: if the loop never runs, the timeout fails the
+    test, which is the thing worth catching.
+    """
+
+    def __init__(self, answers: list[str], backend: CountingBackend, ticks: int = 3) -> None:
+        super().__init__(answers)
+        self._backend = backend
+        self._ticks = ticks
+        self.starved = 0
+
+    def __call__(self, prompt: str) -> str:
+        import time
+
+        # The safety confirmation comes before the robot is even connected, so
+        # there is nothing to keep alive yet -- and nothing to wait for.
+        if not self.prompts:
+            return super().__call__(prompt)
+        seen = self._backend.ticks
+        # Three ticks take some 60 ms on the mock; this is fifteen times that, and
+        # it bounds how long the failing case takes to say so.
+        deadline = time.monotonic() + 1.0
+        while self._backend.ticks - seen < self._ticks:
+            if time.monotonic() > deadline:
+                self.starved += 1
+                break
+            time.sleep(0.005)
+        return super().__call__(prompt)
+
+
+def test_the_robot_is_kept_alive_while_the_operator_reads(transcript: list[str]) -> None:
+    """Regression: on our own firmware every motion step ended before it could
+    be answered.
+
+    The robot stops itself when the host goes quiet, and a latched move is
+    exactly when the host has nothing to say -- so the operator watched it
+    crouch a second and a half in and truthfully answered "no, it did not keep
+    walking", about us rather than about the firmware (ASSUMPTIONS D10).
+    """
+    backend = CountingBackend()
+    asker = ReadingAsker(answers_for(len(steps())), backend)
+
+    report = run_bringup(
+        "test-host",
+        ask=asker,
+        say=transcript.append,
+        client_factory=lambda _h: RobotClient(backend, clock=FakeClock()),
+    )
+    assert asker.starved == 0, "the control loop stopped while the operator was reading"
+    assert report.confirmed == len(steps())
+
+
+def test_the_keep_alive_survives_the_link_being_cut(transcript: list[str]) -> None:
+    """One step of this checklist asks the operator to switch the Wi-Fi off
+    mid-walk. Every feed then fails, and those failures are the observation --
+    a keep-alive that died of them would take the rest of the run with it."""
+
+    class DeadLinkBackend(MockBackend):
+        def tick(self, dt: float) -> None:
+            raise BackendError("cannot reach robot: the link is gone")
+
+    backend = DeadLinkBackend()
+    report, _asker = run(answers_for(len(steps())), transcript, backend=backend)
+    assert report.confirmed == len(steps()), "a failing feed derailed the checklist"
+
+
+def test_the_watchdog_step_expects_what_the_firmware_actually_does() -> None:
+    """On our firmware a robot that stops itself is the M4 feature working.
+    Asking whether it kept walking would file that success as a deviation."""
+    stock = {step.key: step for step in steps()}["no_watchdog"]
+    assert "keep walking" in stock.question
+    assert "no watchdog" in stock.instruction
+
+    ours = {step.key: step for step in steps(has_watchdog=True)}["no_watchdog"]
+    assert "stop and crouch by itself" in ours.question
+    assert "our firmware" in ours.instruction
+    # And it must not tell the operator to stop a robot that stopped itself.
+    assert "Stop it from the web UI" not in ours.instruction

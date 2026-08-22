@@ -12,13 +12,15 @@ cannot be recovered by any command we send (ASSUMPTIONS D10).
 
 from __future__ import annotations
 
+import contextlib
+import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
 from robodog.api.client import RobotClient
-from robodog.api.types import FunctionMode
+from robodog.api.types import Capability, FunctionMode
 from robodog.backends.http import AP_PASSWORD, AP_SSID, HttpBackend
 from robodog.errors import BackendError, EStopActiveError, RobodogError
 
@@ -130,8 +132,14 @@ def _middle_pos(client: RobotClient) -> None:
     client.set_function(FunctionMode.MIDDLE_POS)
 
 
-def steps() -> tuple[Step, ...]:
-    """The bring-up checklist, ordered from harmless to increasingly physical."""
+def steps(has_watchdog: bool = False) -> tuple[Step, ...]:
+    """The bring-up checklist, ordered from harmless to increasingly physical.
+
+    ``has_watchdog`` says the robot runs our firmware rather than the stock
+    one. Two steps then expect the opposite outcome: a robot that stops itself
+    when the link dies is the M4 feature working, and asking whether it kept
+    walking would file a success as a deviation.
+    """
     return (
         Step(
             key="reachable",
@@ -270,14 +278,24 @@ def steps() -> tuple[Step, ...]:
             instruction=(
                 "SAFETY TEST, read it fully first. The robot is walking now.\n"
                 "  1. Switch off your PC's Wi-Fi without stopping the robot.\n"
-                "  2. Watch what the robot does -- the stock firmware has no "
-                "watchdog, so it should just keep going.\n"
-                "  3. Stop it from the web UI (or cut its power), then switch "
-                "your Wi-Fi back ON and rejoin the robot's access point.\n"
+                "  2. Watch what the robot does -- "
+                + (
+                    "this robot runs our firmware, so it should stop and crouch "
+                    "by itself within about 1.5 s.\n"
+                    if has_watchdog
+                    else "the stock firmware has no watchdog, so it should just keep going.\n"
+                )
+                + "  3. "
+                + ("" if has_watchdog else "Stop it from the web UI (or cut its power), then ")
+                + "switch your Wi-Fi back ON and rejoin the robot's access point.\n"
                 "Answer only once you are reconnected: this tool needs the link "
                 "to put the robot into its safe state at the end."
             ),
-            question="Did the robot keep walking after the link was gone?",
+            question=(
+                "Did the robot stop and crouch by itself?"
+                if has_watchdog
+                else "Did the robot keep walking after the link was gone?"
+            ),
             interprets="walk_for_watchdog",
         ),
     )
@@ -303,8 +321,10 @@ def run_bringup(
     say("  * Put the robot ON A STAND with the legs hanging free, or keep a")
     say("    hand on the power switch. Over Wi-Fi a dropped link cannot be")
     say("    recovered: no stop command reaches the robot (ASSUMPTIONS D10).")
-    say("  * The firmware has no watchdog. Whatever it was last told to do, it")
-    say("    keeps doing.")
+    say("  * On the stock firmware, whatever the robot was last told to do it")
+    say("    keeps doing -- there is no watchdog. On ours there is one, and it")
+    say("    stops the robot if this tool goes away; neither is a substitute")
+    say("    for the stand.")
     say("  * Ctrl-C triggers an E-stop attempt, but it can only work while the")
     say("    connection is alive.")
     say("")
@@ -334,18 +354,30 @@ def run_bringup(
         )
         return report
 
+    # Our firmware stops a robot whose host has gone quiet, and a walking robot
+    # is exactly what we send nothing to -- so the thinking time between prompts
+    # has to be filled, or every motion step ends before it is answered.
+    lock = threading.Lock()
+    has_watchdog = Capability.LEG_TARGET in client.capabilities
+    keep_alive = _KeepAlive(client, lock)
+    keep_alive.start()
     try:
-        client.arm()
+        with lock:
+            client.arm()
         outcomes: dict[str, str] = {}
-        for step in _selected(steps(), include_motion):
-            result = _run_step(step, client, ask=ask, say=say, outcomes=outcomes)
+        for step in _selected(steps(has_watchdog), include_motion):
+            result = _run_step(step, client, ask=ask, say=say, outcomes=outcomes, lock=lock)
             outcomes[step.key] = result.outcome
             report.results.append(result)
     except KeyboardInterrupt:
         say("\nInterrupted -- attempting E-stop.")
+        keep_alive.stop()
         _try_estop(client, say)
         raise
     finally:
+        # Stopped first: a feeder still saying "keep going" while the E-stop
+        # goes out is a race with only one wrong outcome.
+        keep_alive.stop()
         _try_estop(client, say)
         client.disconnect()
 
@@ -366,6 +398,7 @@ def _run_step(
     ask: Asker,
     say: Printer,
     outcomes: dict[str, str],
+    lock: threading.Lock | None = None,
 ) -> StepResult:
     say("")
     say("-" * 72)
@@ -388,7 +421,8 @@ def _run_step(
             return StepResult(step=step, outcome="skipped", note="operator skipped")
     if step.action is not None:
         try:
-            _act(step, client, say=say)
+            with lock if lock is not None else contextlib.nullcontext():
+                _act(step, client, say=say)
         except RobodogError as exc:
             say(f"  command failed: {exc}")
             return StepResult(step=step, outcome="error", note=str(exc))
@@ -426,6 +460,40 @@ def _try_estop(client: RobotClient, say: Printer) -> None:
     except (RobodogError, BackendError) as exc:
         say(f"  WARNING: could not confirm the stop: {exc}")
         say("  If the robot is still moving, stop it from its web UI or cut its power.")
+
+
+class _KeepAlive(threading.Thread):
+    """Keeps a walking robot walking while the operator reads the prompt.
+
+    Our own firmware stops itself when the host goes quiet, and a latched move
+    is exactly when the host has nothing to say -- the firmware walks on by
+    itself (ASSUMPTIONS B3/D4). Without this the robot crouches a second and a
+    half into every motion step, and the operator ends up answering "no, it
+    stopped" about *us* while believing they answered about the firmware.
+
+    It feeds through `tick`, which sends only while a move is latched, so the
+    standing steps stay as silent as they were. Link failures are swallowed on
+    purpose: one step of this very checklist asks the operator to switch the
+    Wi-Fi off mid-walk, and the errors that follow are the observation, not a
+    fault to report.
+    """
+
+    def __init__(self, client: RobotClient, lock: threading.Lock) -> None:
+        super().__init__(daemon=True, name="bringup-keepalive")
+        self._client = client
+        self._lock = lock
+        self._tick = client.suggested_tick
+        self._stop_event = threading.Event()
+
+    def run(self) -> None:
+        while not self._stop_event.wait(self._tick):
+            with self._lock, contextlib.suppress(RobodogError, BackendError):
+                self._client.heartbeat()
+                self._client.tick(self._tick)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self.join(timeout=2.0)
 
 
 def _default_client_factory(host: str) -> RobotClient:
