@@ -649,3 +649,30 @@ def test_the_host_budget_outlasts_the_transport(firmware: tuple[FakeFirmware, st
     assert posing.suggested_watchdog == SUGGESTED_WATCHDOG
     assert SUGGESTED_WATCHDOG > 1.2  # the slowest pose measured on the device
     posing.disconnect()
+
+
+def test_every_paced_loop_can_ask_how_fast_to_run(
+    firmware: tuple[FakeFirmware, str],
+) -> None:
+    """`tick_for` is the one answer to "how fast may I drive this?".
+
+    Three loops pace themselves by it -- the player, the teach ticker and the
+    UI's preview -- and each used to carry its own hard-coded 50 Hz. A backend
+    with no opinion still gets one, so the seam works for mock and sim too.
+    """
+    from robodog.api.client import RobotClient
+    from robodog.backends.base import DEFAULT_TICK, tick_for
+    from robodog.backends.http import SUGGESTED_TICK
+    from robodog.backends.mock import MockBackend
+
+    assert tick_for(MockBackend()) == DEFAULT_TICK  # no transport, no opinion
+
+    state, host = firmware
+    state.robodog = True
+    backend = HttpBackend(host)
+    client = RobotClient(backend)
+    client.connect()
+    # Poses stream over the wire here, so the link -- not the loop -- sets the rate.
+    assert client.suggested_tick == SUGGESTED_TICK
+    assert SUGGESTED_TICK > DEFAULT_TICK
+    client.disconnect()

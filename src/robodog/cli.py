@@ -13,7 +13,7 @@ from pathlib import Path
 from robodog import __version__
 from robodog.api.client import RobotClient
 from robodog.api.types import LegId, RobotState
-from robodog.backends.base import Backend
+from robodog.backends.base import Backend, tick_for
 from robodog.backends.http import (
     DEFAULT_HOST,
     DEFAULT_TIMEOUT,
@@ -98,10 +98,7 @@ def _tick_for(backend: Backend, requested: float | None) -> float:
     the robot: a 3-second bow took fourteen. Matching the tick to the transport
     keeps a routine the length it was written to be.
     """
-    if requested is not None:
-        return requested
-    suggested = getattr(backend, "suggested_tick", None)
-    return float(suggested) if suggested is not None else 0.02
+    return requested if requested is not None else tick_for(backend)
 
 
 def _format_state(t: float, state: RobotState) -> str:
@@ -463,7 +460,10 @@ def cmd_teach(args: argparse.Namespace) -> int:
             print("      right/backward moves -- keep the Stop button in reach.")
 
         lock = threading.Lock()
-        ticker = RealtimeTicker(client, lock)
+        # The ticker both feeds the watchdog and flushes staged poses, so it is
+        # paced by the transport too: at 50 Hz over Wi-Fi it would spend nearly
+        # every millisecond inside a request, holding the lock the browser needs.
+        ticker = RealtimeTicker(client, lock, tick=client.suggested_tick)
         ticker.start()
         try:
             if args.repl:

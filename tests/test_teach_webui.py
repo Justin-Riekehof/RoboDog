@@ -33,6 +33,7 @@ from robodog.backends.mock import MockBackend
 from robodog.kinematics.constants import LINKAGE_W, STAND_HEIGHT
 from robodog.safety.limits import LimitConfig
 from robodog.teach.format import load_routine
+from robodog.teach.repl import RealtimeTicker
 from robodog.teach.session import TeachSession
 from robodog.teach.webui import TeachUIServer
 from robodog.viz.stick import HIPS
@@ -985,3 +986,104 @@ def test_the_per_leg_reach_field_reaches_the_session(
     targets = state_of(url)["targets"]
     assert targets["hind_right"]["depth"] == pytest.approx(88.0)
     assert targets["front_left"]["depth"] != pytest.approx(88.0)  # only that leg
+
+
+# --- the teach UI against a robot that can hold a pose ------------------------------
+
+
+@pytest.fixture
+def posing_rig(tmp_path: Path) -> Iterator[tuple[FakeFirmware, str]]:
+    """The teach UI in front of a robot running our firmware.
+
+    Assembled exactly as `cmd_teach` assembles it, ticker included -- the ticker
+    is what flushes staged poses, so a rig without one tests a UI that cannot
+    move anything.
+    """
+    firmware = FakeFirmware()
+    firmware.robodog = True  # speaks ping/watchdog/pose
+    httpd = HTTPServer(("127.0.0.1", 0), make_handler(firmware))
+    serving = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.02})
+    serving.daemon = True
+    serving.start()
+
+    client = RobotClient(HttpBackend(f"127.0.0.1:{httpd.server_address[1]}"))
+    client.connect()
+    client.arm()
+    session = TeachSession(client, name="posing", default_path=tmp_path / "posing.yaml")
+    session.start()
+    lock = threading.Lock()
+    ticker = RealtimeTicker(client, lock, tick=client.suggested_tick)
+    ticker.start()
+    server = TeachUIServer(session, client, lock=lock)
+    url = server.start()
+    try:
+        yield firmware, url
+    finally:
+        server.shutdown()
+        ticker.stop()
+        client.disarm()
+        client.disconnect()
+        httpd.shutdown()
+        httpd.server_close()
+        serving.join(timeout=5)
+
+
+def poses(firmware: FakeFirmware) -> list[str]:
+    return [query for query in firmware.queries if "var=pose" in query]
+
+
+def test_the_pose_tab_appears_when_the_robot_can_pose(
+    posing_rig: tuple[FakeFirmware, str],
+) -> None:
+    """Against stock firmware the Pose tab is off, because nothing can receive a
+    foot target. Against ours it has to come back, or the whole fork bought
+    nothing at the one place an operator would notice it."""
+    _firmware, url = posing_rig
+    state = state_of(url)
+    assert state["pose_enabled"] is True
+    assert state["backend"] == "http"
+
+
+def test_dragging_a_foot_reaches_the_robot(posing_rig: tuple[FakeFirmware, str]) -> None:
+    """The whole chain: browser drag -> session -> supervisor -> staged -> one
+    request carrying all twelve values."""
+    firmware, url = posing_rig
+    before = len(poses(firmware))
+    status, data = post(url, "set", {"legs": ["front_left"], "axis": "depth", "value": 88})
+    assert status == 200, data
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and len(poses(firmware)) == before:
+        time.sleep(0.02)
+    sent = poses(firmware)
+    assert len(sent) > before, "the drag never reached the robot"
+    assert "l1y=" in sent[-1] and "l4z=" in sent[-1]  # a whole pose, not one leg
+
+
+def test_the_preview_is_paced_by_the_transport(
+    posing_rig: tuple[FakeFirmware, str],
+) -> None:
+    """A keyframe preview must tick at the rate the link carries.
+
+    Every tick of a motion routine is a fresh pose and every pose is a round
+    trip, so previewing a 1-second routine at 50 Hz asks for 51 of them over a
+    link that carries ten a second: the preview then runs some five times longer
+    than the routine it is previewing. Ticking at `suggested_tick` is what keeps
+    a routine the length it was authored to be.
+    """
+    firmware, url = posing_rig
+    post(url, "capture", {})
+    post(url, "set", {"legs": ["front_left"], "axis": "depth", "value": 88})
+    post(url, "capture", {"spacing": 1.0})
+    before = len(poses(firmware))
+
+    status, data = post(url, "preview", {})
+    assert status == 200, data
+    deadline = time.monotonic() + 20.0
+    while time.monotonic() < deadline and state_of(url)["busy"]:
+        time.sleep(0.02)
+    assert not state_of(url)["busy"], "the preview never finished"
+
+    # One second of routine at ten poses a second, not fifty.
+    sent = len(poses(firmware)) - before
+    assert 8 <= sent <= 25, f"{sent} poses for a 1s preview -- expected about 11"

@@ -73,6 +73,13 @@ with `--viewer`, the MuJoCo window next to it showing live physics.
 The page has no external dependencies and the server binds to localhost only.
 While a preview runs, the page shows a busy state and rejects edits.
 
+**Pacing.** Every keyframe tick is a fresh pose, and over Wi-Fi every pose is a
+round trip of roughly 100 ms. The preview therefore ticks at whatever the
+backend says it can carry (`suggested_tick`): 50 Hz against mock and the twin,
+about 10 Hz on the real robot. A preview on hardware is *coarser* than the same
+routine in the twin, but it takes the same wall-clock time — pacing it faster
+than the link carries would not play it faster, only late.
+
 ## Sequence tab: programming move sequences
 
 ```console

@@ -42,6 +42,7 @@ from robodog.api.types import (
     SetLegTarget,
     TrimServo,
 )
+from robodog.backends.base import DEFAULT_TICK
 from robodog.backends.mock import MockBackend
 from robodog.errors import BackendError, CapabilityError
 from robodog.kinematics.constants import SERVO_CHANNELS, SERVO_MIDDLE
@@ -230,8 +231,12 @@ class HttpBackend:
 
     @property
     def suggested_tick(self) -> float:
-        """Seconds per player tick this transport can keep up with."""
-        return SUGGESTED_TICK if Capability.LEG_TARGET in self.capabilities else 0.02
+        """Seconds per player tick this transport can keep up with.
+
+        Only poses stream; stock firmware has no pose command, so nothing there
+        is paced by the transport and the ordinary default applies.
+        """
+        return SUGGESTED_TICK if Capability.LEG_TARGET in self.capabilities else DEFAULT_TICK
 
     @property
     def suggested_watchdog(self) -> float:

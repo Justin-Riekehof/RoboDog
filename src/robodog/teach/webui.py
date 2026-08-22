@@ -582,7 +582,11 @@ class TeachUIServer:
                     play_routine(
                         routine,
                         self._client,
-                        tick=0.02,
+                        # Not a fixed 50 Hz: every tick of a keyframe routine is
+                        # a new pose, and a pose over Wi-Fi is a round trip. Ask
+                        # the backend what it carries, or the preview plays
+                        # several times longer than the routine it previews.
+                        tick=self._client.suggested_tick,
                         realtime=self._realtime,
                         sleep=time.sleep,
                     )

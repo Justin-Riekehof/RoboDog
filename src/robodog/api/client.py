@@ -86,6 +86,18 @@ class RobotClient:
         return self._backend.capabilities
 
     @property
+    def suggested_tick(self) -> float:
+        """Seconds per tick this backend keeps up with (see `tick_for`).
+
+        Anything pacing a loop against the wall clock has to ask, or it writes
+        cheques the transport cannot cash. Imported here, not at module level,
+        for the same reason `Backend` is only imported for type checking.
+        """
+        from robodog.backends.base import tick_for
+
+        return tick_for(self._backend)
+
+    @property
     def safety_state(self) -> SafetyState:
         return self._supervisor.state
 
