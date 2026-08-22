@@ -36,10 +36,15 @@ def fields_equal(a: Routine, b: Routine) -> bool:
         and a.interpolation == b.interpolation
         and a.steps == b.steps
         and a.keyframes == b.keyframes
+        and a.moves == b.moves
+        and a.gap == b.gap
+        and a.repeat == b.repeat
     )
 
 
-@pytest.mark.parametrize("filename", ["bow.yaml", "patrol-demo.yaml", "patrol-wifi.yaml"], ids=str)
+@pytest.mark.parametrize(
+    "filename", ["bow.yaml", "patrol-demo.yaml", "patrol-wifi.yaml", "patrol-loop.yaml"], ids=str
+)
 def test_shipped_routines_survive_a_dump_parse_roundtrip(filename: str) -> None:
     original = load_routine(ROUTINES_DIR / filename)
     assert fields_equal(roundtrip(original), original)

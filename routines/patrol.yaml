@@ -1,0 +1,17 @@
+# Authored with `robodog teach` -- a plain routine file, edit freely.
+schema: robodog.routine/v1
+name: patrol
+kind: sequence
+requires:
+- LOCOMOTION
+gap: 0.5
+repeat: 0
+moves:
+- move: forward
+  seconds: 5
+- move: left
+  seconds: 2
+- move: forward
+  seconds: 5
+- move: right
+  seconds: 2

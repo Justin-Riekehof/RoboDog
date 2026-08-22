@@ -1,14 +1,19 @@
 """Teach-in routine format v1: one YAML file per routine, git-friendly.
 
-Envelope (see ARCHITECTURE.md): ``schema: robodog.routine/v1`` with two kinds:
-``commands`` (timeline of Robot API commands) and ``motion`` (keyframed
-leg-space trajectory). Loading validates aggressively so a hand-edited file
-fails at load time, not on the robot.
+Envelope (see ARCHITECTURE.md): ``schema: robodog.routine/v1`` with three
+kinds: ``commands`` (timeline of Robot API commands), ``motion`` (keyframed
+leg-space trajectory) and ``sequence`` (a named drive move per line, with its
+own duration -- the form an operator dictates a patrol in). A sequence is
+expanded into a command timeline at load time, so the player only ever sees the
+two timeline kinds. Loading validates aggressively so a hand-edited file fails
+at load time, not on the robot.
 """
 
 from __future__ import annotations
 
+import math
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -33,6 +38,7 @@ from robodog.api.types import (
     SetFunction,
     SetJointAngles,
     SetLegTarget,
+    TrimServo,
 )
 from robodog.errors import RoutineError
 from robodog.safety.limits import LimitConfig, check_leg_target
@@ -50,10 +56,47 @@ LEG_NAMES: dict[str, LegId] = {
 LEG_IDS_TO_NAMES: dict[LegId, str] = {v: k for k, v in LEG_NAMES.items()}
 
 
+# The drive vocabulary an operator actually thinks in, mapped onto the two
+# latched firmware axes (forward/back and turn, ASSUMPTIONS B3/D4). Values are
+# (forward, turn), each in {-1, 0, 1}; positive turn is to the robot's right.
+MOVES: dict[str, tuple[int, int]] = {
+    "forward": (1, 0),
+    "backward": (-1, 0),
+    "left": (0, -1),
+    "right": (0, 1),
+    "forward_left": (1, -1),
+    "forward_right": (1, 1),
+    "backward_left": (-1, -1),
+    "backward_right": (-1, 1),
+    "wait": (0, 0),
+}
+
+# Bounds for the numbers a sequence file may carry. They are not safety limits
+# -- the supervisor does that -- but a hand-edited 'seconds: 3600' is far more
+# likely a typo than an intent, and an unbounded one would only be discovered
+# by watching the robot walk into a wall.
+MAX_MOVE_SECONDS = 600.0
+MAX_GAP_SECONDS = 60.0
+MAX_REPEAT = 10_000
+
+
 @dataclass(frozen=True, slots=True)
 class CommandStep:
     at: float
     command: Command
+
+
+@dataclass(frozen=True, slots=True)
+class MoveStep:
+    """One line of a drive sequence: a named move held for ``seconds``."""
+
+    move: str
+    seconds: float
+
+    @property
+    def drive(self) -> Drive:
+        forward, turn = MOVES[self.move]
+        return Drive(forward=forward, turn=turn)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,19 +108,61 @@ class Keyframe:
 @dataclass(frozen=True, slots=True)
 class Routine:
     name: str
-    kind: Literal["commands", "motion"]
+    kind: Literal["commands", "motion", "sequence"]
     requires: frozenset[Capability]
     description: str = ""
     interpolation: Literal["linear", "cosine"] = "cosine"
     steps: tuple[CommandStep, ...] = ()
     keyframes: tuple[Keyframe, ...] = ()
+    # Sequences keep their authored form (the moves and the gap between them)
+    # *and* the timeline compiled from it: the editor round-trips the former,
+    # the player only ever reads the latter.
+    moves: tuple[MoveStep, ...] = ()
+    gap: float = 0.0
+    # How often the whole routine plays. 0 means "until stopped" -- only ever
+    # safe with a stop within reach; over Wi-Fi that is the power switch
+    # (ASSUMPTIONS D10).
+    repeat: int = 1
     source: str = "<memory>"
 
     @property
     def duration(self) -> float:
-        if self.kind == "commands":
-            return self.steps[-1].at if self.steps else 0.0
-        return self.keyframes[-1].at if self.keyframes else 0.0
+        """Length of ONE pass through the routine, in seconds."""
+        if self.kind == "motion":
+            return self.keyframes[-1].at if self.keyframes else 0.0
+        return self.steps[-1].at if self.steps else 0.0
+
+    @property
+    def total_duration(self) -> float:
+        """Length of a full playback; ``inf`` when the routine repeats forever."""
+        return math.inf if self.repeat == 0 else self.duration * self.repeat
+
+
+def compile_moves(moves: Sequence[MoveStep], gap: float = 0.0) -> tuple[CommandStep, ...]:
+    """Expand a drive sequence into the command timeline the player replays.
+
+    Every move drives for its own ``seconds``; ``gap`` seconds of standing
+    still are inserted between consecutive moves. A drive intent that is
+    already in effect is not re-sent -- on Wi-Fi each one costs two HTTP
+    requests (ASSUMPTIONS D4) -- but the closing stop is always emitted, so the
+    last step's time is the sequence's total duration.
+    """
+    steps: list[CommandStep] = []
+
+    def emit(at: float, drive: Drive) -> None:
+        if steps and steps[-1].command == drive:
+            return
+        steps.append(CommandStep(at=at, command=drive))
+
+    at = 0.0
+    for i, move in enumerate(moves):
+        emit(at, move.drive)
+        at += move.seconds
+        if gap > 0 and i < len(moves) - 1:
+            emit(at, Drive(0, 0))
+            at += gap
+    steps.append(CommandStep(at=at, command=Drive(0, 0)))
+    return tuple(steps)
 
 
 def _err(source: str, message: str) -> RoutineError:
@@ -227,6 +312,26 @@ def _parse_steps(raw: object, source: str) -> tuple[CommandStep, ...]:
     return tuple(steps)
 
 
+def _parse_moves(raw: object, source: str) -> tuple[MoveStep, ...]:
+    if not isinstance(raw, list) or not raw:
+        raise _err(source, "kind 'sequence' requires a non-empty 'moves' list")
+    moves: list[MoveStep] = []
+    for i, item in enumerate(raw):
+        where = f"{source} moves[{i}]"
+        mapping = _as_mapping(item, where, "move")
+        unknown = set(mapping) - {"move", "seconds"}
+        if unknown:
+            raise _err(where, f"unknown keys: {', '.join(sorted(unknown))}")
+        name = mapping.get("move")
+        if not isinstance(name, str) or name not in MOVES:
+            raise _err(where, f"unknown move {name!r} (valid: {', '.join(MOVES)})")
+        seconds = _as_float(mapping.get("seconds"), where, "'seconds'")
+        if not 0 < seconds <= MAX_MOVE_SECONDS:
+            raise _err(where, f"'seconds' must be > 0 and <= {MAX_MOVE_SECONDS}, got {seconds}")
+        moves.append(MoveStep(move=name, seconds=seconds))
+    return tuple(moves)
+
+
 def _parse_keyframes(raw: object, source: str, limits: LimitConfig) -> tuple[Keyframe, ...]:
     if not isinstance(raw, list) or len(raw) < 2:
         raise _err(source, "kind 'motion' requires a 'keyframes' list with >= 2 entries")
@@ -290,6 +395,9 @@ def parse_routine(
         "interpolation",
         "steps",
         "keyframes",
+        "moves",
+        "gap",
+        "repeat",
     }
     unknown = set(root) - allowed
     if unknown:
@@ -304,8 +412,8 @@ def parse_routine(
         raise _err(source, "'description' must be a string")
 
     kind = root.get("kind")
-    if kind not in ("commands", "motion"):
-        raise _err(source, f"'kind' must be 'commands' or 'motion', got {kind!r}")
+    if kind not in ("commands", "motion", "sequence"):
+        raise _err(source, f"'kind' must be 'commands', 'motion' or 'sequence', got {kind!r}")
 
     requires_raw = root.get("requires")
     if not isinstance(requires_raw, list) or not requires_raw:
@@ -318,6 +426,35 @@ def parse_routine(
     interpolation = root.get("interpolation", "cosine")
     if interpolation not in ("linear", "cosine"):
         raise _err(source, f"'interpolation' must be linear or cosine, got {interpolation!r}")
+
+    repeat = _as_int(root.get("repeat", 1), source, "'repeat'")
+    if not 0 <= repeat <= MAX_REPEAT:
+        raise _err(source, f"'repeat' must be 0 (endless) .. {MAX_REPEAT}, got {repeat}")
+
+    if kind == "sequence":
+        for forbidden in ("steps", "keyframes"):
+            if forbidden in root:
+                raise _err(source, f"kind 'sequence' must not have {forbidden!r}")
+        gap = _as_float(root.get("gap", 0.0), source, "'gap'")
+        if not 0 <= gap <= MAX_GAP_SECONDS:
+            raise _err(source, f"'gap' must be 0 .. {MAX_GAP_SECONDS} seconds, got {gap}")
+        moves = _parse_moves(root.get("moves"), source)
+        if Capability.LOCOMOTION not in requires:
+            raise _err(source, "kind 'sequence' must declare LOCOMOTION in 'requires'")
+        return Routine(
+            name=name,
+            kind="sequence",
+            requires=requires,
+            description=description,
+            steps=compile_moves(moves, gap),
+            moves=moves,
+            gap=gap,
+            repeat=repeat,
+            source=source,
+        )
+
+    if "moves" in root or "gap" in root:
+        raise _err(source, f"'moves'/'gap' belong to kind 'sequence', not {kind!r}")
 
     if kind == "commands":
         if "keyframes" in root:
@@ -338,6 +475,7 @@ def parse_routine(
             description=description,
             interpolation="cosine",
             steps=steps,
+            repeat=repeat,
             source=source,
         )
 
@@ -353,6 +491,7 @@ def parse_routine(
         description=description,
         interpolation="linear" if interpolation == "linear" else "cosine",
         keyframes=keyframes,
+        repeat=repeat,
         source=source,
     )
 
@@ -413,6 +552,15 @@ def _command_to_step(command: Command) -> tuple[str, dict[str, Any]]:
             return "led", {"color": color}
         case Buzzer(on=on):
             return "buzzer", {"on": on}
+        case TrimServo():
+            # Deliberately not serializable. Trim is a relative, cumulative
+            # calibration nudge: replaying it would add the offset again every
+            # time the routine runs, walking the servo away from its zero. It
+            # belongs to `robodog calibrate-roll`, not to a motion file.
+            raise RoutineError(
+                "servo trim is a calibration action and cannot be stored in a routine; "
+                "it is relative and would accumulate on every replay"
+            )
 
 
 def routine_to_dict(routine: Routine) -> dict[str, Any]:
@@ -421,6 +569,18 @@ def routine_to_dict(routine: Routine) -> dict[str, Any]:
         doc["description"] = routine.description
     doc["kind"] = routine.kind
     doc["requires"] = sorted(c.name for c in routine.requires)
+    if routine.kind == "sequence":
+        # Both knobs are written out even at their defaults: they are what the
+        # operator dialled in, and a sequence file is meant to be re-opened and
+        # edited, not just replayed.
+        doc["gap"] = _tidy(routine.gap)
+        doc["repeat"] = routine.repeat
+        doc["moves"] = [
+            {"move": move.move, "seconds": _tidy(move.seconds)} for move in routine.moves
+        ]
+        return doc
+    if routine.repeat != 1:
+        doc["repeat"] = routine.repeat
     if routine.kind == "commands":
         steps: list[dict[str, Any]] = []
         for step in routine.steps:

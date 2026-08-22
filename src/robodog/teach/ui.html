@@ -18,6 +18,9 @@
   header .title { font-weight: 600; margin-right: 8px; }
   header .backend { color: var(--dim); font-size: 12px; margin-right: auto; }
   main { display: flex; gap: 14px; padding: 14px; align-items: flex-start; flex-wrap: wrap; }
+  /* An author-stylesheet `display` beats the UA rule for [hidden], so without
+     this the inactive tab keeps its flex box and stays on screen. */
+  main[hidden] { display: none; }
   .col-views { flex: 1 1 560px; min-width: 480px; display: flex; flex-direction: column; gap: 14px; }
   .col-ctrl  { flex: 0 0 380px; display: flex; flex-direction: column; gap: 14px; }
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
@@ -30,6 +33,8 @@
   .chain { fill: none; stroke-width: 2.5; stroke-linecap: round; opacity: .9; }
   .foot { stroke: #fff; stroke-width: 1.2; cursor: grab; }
   .foot.dragging { cursor: grabbing; stroke-width: 2.5; }
+  .rollarc { fill: none; stroke-width: 1; stroke-dasharray: 3 4; opacity: .35; }
+  input.axisval { width: 68px; font: inherit; padding: 2px 4px; }
   .ghost { fill: none; stroke-width: 1.5; opacity: .55; stroke-dasharray: 2 2; }
   .trunk { fill: #2a323d; stroke: #3a4552; }
   button { background: #2a3542; color: var(--text); border: 1px solid #3a4character552;
@@ -49,6 +54,9 @@
   #status.bad { color: var(--bad); border-color: #5a3a3a; }
   #status.good { color: var(--good); }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  #leg-table { min-width: 640px; }
+  .panel > table { display: table; }
+  .scroll-x { overflow-x: auto; }
   td, th { padding: 4px 6px; text-align: left; border-bottom: 1px solid var(--line); }
   th { color: var(--dim); font-weight: 500; font-size: 12px; }
   .legname { font-weight: 600; }
@@ -61,41 +69,89 @@
   .busy-note { color: var(--accent); font-size: 12px; display: none; }
   body.busy .busy-note { display: inline; }
   body.busy .disable-when-busy { pointer-events: none; opacity: .5; }
+  nav.tabs { display: flex; gap: 4px; margin-right: auto; }
+  nav.tabs button { border-radius: 6px 6px 0 0; border-bottom-color: transparent; }
+  nav.tabs button.active { background: var(--bg); border-color: var(--line);
+                           border-bottom-color: var(--bg); color: var(--accent); font-weight: 600; }
+  button.stop { background: #7a2727; border-color: #a33; color: #ffe3e3;
+                font-weight: 700; letter-spacing: .05em; padding: 8px 18px; }
+  button.stop:hover { background: #963030; }
+  #seq-table td { vertical-align: middle; }
+  #seq-table tr.running td { background: #1b2b24; }
+  #seq-table input[type=number] { width: 72px; }
+  #seq-table select { padding: 3px 6px; }
+  #seq-table button { padding: 2px 8px; font-size: 12px; }
+  .palette button { font-size: 13px; }
+  .bars { display: block; width: 100%; height: auto; }
+  .bar { stroke: none; }
+  .bar-gap { fill: #2c3540; }
+  .bar-label { fill: #0b1016; font-size: 9px; font-weight: 600; }
+  .cursor { stroke: #fff; stroke-width: 1.5; }
+  .hint { color: var(--dim); font-size: 12px; }
+  .pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; max-width: 280px; }
+  .pad button { padding: 12px 0; font-size: 18px; line-height: 1; }
+  .pad button.stop { font-size: 13px; padding: 12px 0; }
+  .pad button.active { background: var(--accent); border-color: var(--accent);
+                       color: #0b1016; font-weight: 700; }
+  .driving { color: var(--bad); font-weight: 600; }
+  .estop-note { color: var(--bad); font-weight: 600; font-size: 12px; margin-right: 6px; }
+  #estop { display: inline-flex; align-items: center; }
+  #estop[hidden] { display: none; }
 </style>
 </head>
 <body>
 <header>
   <span class="title">RoboDog Teach</span>
   <span class="backend" id="backend-label"></span>
-  <span class="busy-note">preview running &hellip;</span>
+  <nav class="tabs">
+    <button class="tab" data-tab="pose" id="tab-pose">Pose</button>
+    <button class="tab" data-tab="sequence" id="tab-sequence">Sequence</button>
+  </nav>
+  <span class="busy-note" id="busy-note"></span>
+  <span id="estop" hidden>
+    <span class="estop-note" id="estop-note"></span>
+    <button id="btn-reset" class="stop">Reset E-stop</button>
+  </span>
   <span id="status">connecting &hellip;</span>
   <button id="btn-quit" class="danger">Quit</button>
 </header>
 
-<main>
+<main id="view-pose">
   <div class="col-views disable-when-busy">
     <div class="panel">
-      <h2>Side view &mdash; drag feet: x (forward) / height</h2>
+      <h2>Side view &mdash; drag feet: x (forward) / height <span class="hint">(Cartesian:
+        moves roll and reach together)</span></h2>
       <svg id="svg-side" viewBox="-160 -30 320 175"></svg>
     </div>
     <div class="panel">
-      <h2>Top view &mdash; drag feet: x (forward) / sideways</h2>
+      <h2>Top view &mdash; drag feet: x (forward) / sideways <span class="hint">(Cartesian:
+        moves roll and reach together)</span></h2>
       <svg id="svg-top" viewBox="-160 -125 320 250"></svg>
+    </div>
+    <div class="panel">
+      <h2>Front view &mdash; drag to roll the leg along its arc (reach stays put)</h2>
+      <svg id="svg-front" viewBox="-165 -125 330 280"></svg>
     </div>
   </div>
 
   <div class="col-ctrl">
     <div class="panel disable-when-busy">
-      <h2>Legs (mm) &mdash; drag in the views or nudge here</h2>
-      <table id="leg-table"></table>
+      <h2>Legs &mdash; x/y/z are Cartesian, roll/reach are the joints</h2>
+      <div class="scroll-x"><table id="leg-table"></table></div>
       <div class="row" style="margin-top:8px">
         <label class="small"><input type="checkbox" id="mirror"> mirror left&harr;right</label>
       </div>
       <div class="row">
-        <label class="small" style="flex:0 0 auto">body height</label>
-        <input type="range" id="height" min="75" max="110" step="0.5" style="flex:1">
-        <span class="coords" id="height-val"></span>
+        <label class="small" style="flex:0 0 auto">leg reach</label>
+        <input type="range" id="depth" min="75" max="110" step="0.5" style="flex:1">
+        <span class="coords" id="depth-val"></span>
       </div>
+      <div class="row">
+        <label class="small" style="flex:0 0 auto">roll (all legs)</label>
+        <input type="range" id="roll" min="-90" max="270" step="1" style="flex:1">
+        <input class="axisval" type="number" id="roll-num" step="1">
+      </div>
+      <div class="row"><span class="small" id="roll-note"></span></div>
       <div class="row">
         <button data-pose="stand">Stand</button>
         <button data-pose="crouch">Crouch</button>
@@ -131,6 +187,83 @@
   </div>
 </main>
 
+<main id="view-sequence" hidden>
+  <div class="col-views">
+    <div class="panel">
+      <h2>1. Build the sequence &mdash; click a move, then set its seconds</h2>
+      <div class="row palette disable-when-busy" id="palette"></div>
+      <table id="seq-table" style="margin-top:10px"></table>
+      <div class="row" style="margin-top:8px">
+        <button id="seq-clear" class="danger disable-when-busy">Clear all</button>
+        <span class="coords" id="seq-total"></span>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Timeline &mdash; one pass</h2>
+      <svg id="seq-bars" class="bars" viewBox="0 0 600 56"></svg>
+      <div class="row"><span class="hint" id="seq-progress">not running</span></div>
+    </div>
+  </div>
+
+  <div class="col-ctrl">
+    <div class="panel">
+      <h2>2. Run</h2>
+      <div class="row disable-when-busy">
+        <label class="small" style="flex:1">pause between moves</label>
+        <input type="number" id="seq-gap" step="0.1" min="0"> <span class="small">s</span>
+      </div>
+      <div class="row disable-when-busy">
+        <label class="small" style="flex:1">repeat</label>
+        <input type="number" id="seq-repeat" step="1" min="1"> <span class="small">x</span>
+      </div>
+      <div class="row disable-when-busy">
+        <label class="small"><input type="checkbox" id="seq-endless"> loop until stopped</label>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button id="seq-run" class="primary">Run on robot</button>
+        <button id="seq-stop" class="stop">STOP</button>
+      </div>
+      <div class="row"><span class="hint" id="seq-note"></span></div>
+    </div>
+
+    <div class="panel">
+      <h2>3. Drive by hand</h2>
+      <!-- The eight directions of the move vocabulary, laid out as the
+           controller they are; the centre is the stop. A move latches: the
+           robot keeps going until it is stopped (ASSUMPTIONS B3/D4). -->
+      <div class="pad" id="pad">
+        <button class="disable-when-busy" data-drive="forward_left">&#8598;</button>
+        <button class="disable-when-busy" data-drive="forward">&#8593;</button>
+        <button class="disable-when-busy" data-drive="forward_right">&#8599;</button>
+        <button class="disable-when-busy" data-drive="left">&#8592;</button>
+        <button class="stop" data-stop="1">STOP</button>
+        <button class="disable-when-busy" data-drive="right">&#8594;</button>
+        <button class="disable-when-busy" data-drive="backward_left">&#8601;</button>
+        <button class="disable-when-busy" data-drive="backward">&#8595;</button>
+        <button class="disable-when-busy" data-drive="backward_right">&#8600;</button>
+      </div>
+      <div class="row"><span class="hint" id="manual-note"></span></div>
+      <div class="row" style="margin-top:10px"><span class="hint">Standard moves
+        &mdash; the firmware's own canned animations:</span></div>
+      <div class="row disable-when-busy" id="functions"></div>
+    </div>
+
+    <div class="panel disable-when-busy">
+      <h2>Save / load sequence</h2>
+      <div class="row">
+        <input type="text" id="seq-name" style="flex:1" placeholder="sequence-name">
+        <label class="small"><input type="checkbox" id="seq-overwrite"> overwrite</label>
+        <button id="seq-save" class="primary">Save</button>
+      </div>
+      <div class="row">
+        <select id="seq-file" style="flex:1"></select>
+        <button id="seq-load">Load</button>
+      </div>
+      <div class="row"><span class="coords" id="seq-path"></span></div>
+    </div>
+  </div>
+</main>
+
 <script>
 "use strict";
 const LEGS = ["front_left", "hind_left", "front_right", "hind_right"];
@@ -146,6 +279,10 @@ let drag = null;            // {leg, view, svg}
 let dragSendTimer = null;
 let statusTimer = null;
 let nameTouched = false;
+let seqNameTouched = false;
+let paletteBuilt = false;
+let functionsBuilt = false;
+let tab = null;             // decided on the first state: pose if the backend can pose
 
 function $(id) { return document.getElementById(id); }
 
@@ -175,9 +312,48 @@ async function api(action, body) {
 
 /* ---------- rendering ---------- */
 
-// side view: sx = world x, sy = -world z (up).  top view: sx = world x, sy = -world y (left).
+// side:  sx = world x,   sy = -world z (up)   -- fore/aft against height
+// top:   sx = world x,   sy = -world y (left) -- fore/aft against sideways
+// front: sx = -world y,  sy = -world z (up)   -- sideways against height, i.e.
+//        the plane the wiggle servo rotates the leg in, so the roll arc is
+//        only visible (and only draggable) here.
 function project(view, p) {
-  return view === "side" ? [p[0], -p[2]] : [p[0], -p[1]];
+  if (view === "side") return [p[0], -p[2]];
+  if (view === "top") return [p[0], -p[1]];
+  return [-p[1], -p[2]];
+}
+
+const SVG_ID = {side: "svg-side", top: "svg-top", front: "svg-front"};
+
+// Roll may have no measured limit yet (roll_min/roll_max null). Sweep the full
+// circle of distinct leg orientations then, so nothing on screen implies a
+// bound we have not actually established.
+const ROLL_SWEEP = {min: -90, max: 270};
+function rollRange() {
+  const l = state.limits;
+  return {
+    min: l.roll_min === null || l.roll_min === undefined ? ROLL_SWEEP.min : l.roll_min,
+    max: l.roll_max === null || l.roll_max === undefined ? ROLL_SWEEP.max : l.roll_max,
+  };
+}
+
+// Foot positions across the whole permitted roll range, for one leg at its
+// current reach -- drawn as a guide so the available freedom is visible.
+function rollArc(leg) {
+  const t = state.targets[leg];
+  if (!t || t.depth === undefined) return null;
+  const [hipX, hipY] = state.hips[leg];
+  const side = hipY > 0 ? 1 : -1;
+  const w = state.linkage_w;
+  const r = rollRange();
+  const pts = [];
+  for (let a = r.min; a <= r.max + 0.001; a += 5) {
+    const phi = a * Math.PI / 180;
+    const ly = t.depth * Math.cos(phi) - w * Math.sin(phi);
+    const lz = t.depth * Math.sin(phi) + w * Math.cos(phi);
+    pts.push([-(hipY + side * lz), ly]);
+  }
+  return pts.map(q => q.join(",")).join(" ");
 }
 
 function svgEl(tag, attrs) {
@@ -187,19 +363,37 @@ function svgEl(tag, attrs) {
 }
 
 function renderView(view) {
-  const svg = $(view === "side" ? "svg-side" : "svg-top");
+  const svg = $(SVG_ID[view]);
   svg.replaceChildren();
 
   const grid = svgEl("g", {class: "grid"});
+  // The front view has to cover the whole roll arc, which reaches some 112 mm
+  // above the hip -- a foot that is not drawn cannot be dragged to.
+  const gridTop = view === "top" ? -120 : view === "front" ? -120 : -40;
+  const gridBottom = view === "top" ? 120 : 140;
   for (let x = -150; x <= 150; x += 50)
-    grid.appendChild(svgEl("line", {x1: x, y1: view === "side" ? -25 : -120,
-                                    x2: x, y2: view === "side" ? 140 : 120}));
-  const ys = view === "side" ? [0, 25, 50, 75, 100, 125] : [-100, -50, 0, 50, 100];
+    grid.appendChild(svgEl("line", {x1: x, y1: gridTop, x2: x, y2: gridBottom}));
+  const ys = view === "top" ? [-100, -50, 0, 50, 100]
+    : view === "front" ? [-100, -75, -50, -25, 0, 25, 50, 75, 100, 125]
+    : [-25, 0, 25, 50, 75, 100, 125];
   for (const y of ys)
     grid.appendChild(svgEl("line", {x1: -155, y1: y, x2: 155, y2: y}));
   svg.appendChild(grid);
 
-  if (view === "top") {
+  if (view === "front") {
+    for (const leg of LEGS) {
+      const arc = rollArc(leg);
+      if (arc) svg.appendChild(svgEl("polyline", {points: arc, class: "rollarc",
+                                                  stroke: COLOR[leg]}));
+    }
+    svg.appendChild(svgEl("rect", {x: -38, y: -12, width: 76, height: 14, rx: 5, class: "trunk"}));
+    svg.appendChild(Object.assign(svgEl("text", {x: -150, y: -108, class: "axis-label"}),
+                                  {textContent: "< robot right"}));
+    svg.appendChild(Object.assign(svgEl("text", {x: 96, y: -108, class: "axis-label"}),
+                                  {textContent: "robot left >"}));
+    svg.appendChild(Object.assign(svgEl("text", {x: -150, y: -95, class: "axis-label"}),
+                                  {textContent: "legs folded up over the body"}));
+  } else if (view === "top") {
     svg.appendChild(svgEl("rect", {x: -70, y: -38, width: 140, height: 76, rx: 8, class: "trunk"}));
     svg.appendChild(Object.assign(svgEl("text", {x: -150, y: -108, class: "axis-label"}),
                                   {textContent: "left"}));
@@ -210,9 +404,10 @@ function renderView(view) {
     svg.appendChild(Object.assign(svgEl("text", {x: -150, y: 133, class: "axis-label"}),
                                   {textContent: "ground direction v"}));
   }
-  svg.appendChild(Object.assign(svgEl("text", {x: 130, y: view === "side" ? -18 : -113,
-                                               class: "axis-label"}),
-                                {textContent: "x fwd >"}));
+  if (view !== "front")
+    svg.appendChild(Object.assign(svgEl("text", {x: 130, y: view === "side" ? -18 : -113,
+                                                 class: "axis-label"}),
+                                  {textContent: "x fwd >"}));
 
   for (const leg of LEGS) {
     const chain = state.chains[leg];
@@ -238,19 +433,30 @@ function renderView(view) {
 
 function renderLegTable() {
   const table = $("leg-table");
+  // The poll loop redraws ~6x/s; rebuilding the table while a value is being
+  // typed would destroy the field under the cursor. Hold still instead.
+  if (table.contains(document.activeElement)) return;
   table.replaceChildren();
   for (const leg of LEGS) {
     const t = state.targets[leg];
     const tr = document.createElement("tr");
-    const nudges = ["x", "y", "z"].map(axis =>
-      `<button class="nudge" data-leg="${leg}" data-axis="${axis}" data-delta="-5">-5</button>` +
-      `<button class="nudge" data-leg="${leg}" data-axis="${axis}" data-delta="5">+5</button>`
-    );
+    const nudge = (axis, delta, label) =>
+      `<button class="nudge" data-leg="${leg}" data-axis="${axis}" data-delta="${delta}">${label}</button>`;
+    const pair = (axis, delta) => nudge(axis, -delta, "-" + delta) + nudge(axis, delta, "+" + delta);
+    // Type an exact value and press Enter. Steps are deliberately fine on roll:
+    // the point is to creep up on the mechanical limit, not to jump past it.
+    const field = (axis, value, step) => value === undefined ? "--" :
+      `<input class="axisval" type="number" step="${step}" value="${value.toFixed(1)}" ` +
+      `data-leg="${leg}" data-axis="${axis}">`;
     tr.innerHTML =
       `<td class="legname"><span class="dot" style="background:${COLOR[leg]}"></span>${SHORT[leg]}</td>` +
-      `<td class="coords">x ${t.x.toFixed(1)}</td><td>${nudges[0]}</td>` +
-      `<td class="coords">y ${t.y.toFixed(1)}</td><td>${nudges[1]}</td>` +
-      `<td class="coords">z ${t.z.toFixed(1)}</td><td>${nudges[2]}</td>`;
+      `<td class="coords">x</td><td>${field("x", t.x, 1)}</td><td>${pair("x", 5)}</td>` +
+      `<td class="coords">y</td><td>${field("y", t.y, 1)}</td><td>${pair("y", 5)}</td>` +
+      `<td class="coords">z</td><td>${field("z", t.z, 1)}</td><td>${pair("z", 5)}</td>` +
+      `<td class="coords">roll</td><td>${field("roll", t.roll, 1)}</td>` +
+      `<td>${pair("roll", 1)}${pair("roll", 10)}</td>` +
+      `<td class="coords">reach</td><td>${field("depth", t.depth, 1)}</td>` +
+      `<td>${pair("depth", 5)}</td>`;
     table.appendChild(tr);
   }
 }
@@ -279,25 +485,265 @@ function renderKeyframes() {
   });
 }
 
+function selectTab(name) {
+  tab = name;
+  $("view-pose").hidden = name !== "pose";
+  $("view-sequence").hidden = name !== "sequence";
+  for (const button of document.querySelectorAll("nav.tabs button"))
+    button.classList.toggle("active", button.dataset.tab === name);
+  if (name === "sequence") refreshFiles();
+  render();
+}
+
 function render() {
   if (!state) return;
+  // A latched E-stop refuses every other action, so the way out of it has to be
+  // on screen -- "reset() first" with nothing to click is a dead end.
+  const safety = state.safety || {};
+  const latched = safety.state === "ESTOPPED";
+  $("estop").hidden = !latched;
+  if (latched) $("estop-note").textContent = "E-STOPPED: " + (safety.reason || "");
   document.body.classList.toggle("busy", !!state.busy);
+  $("busy-note").textContent = state.busy ? state.busy + " running ..." : "";
+  // Posing needs leg targets; over Wi-Fi there are none, so the robot itself
+  // decides which tabs exist. A poll answered while the session lock was held
+  // carries only the sequence overlay -- wait for a full snapshot to decide.
+  if (state.pose_enabled !== undefined) {
+    $("tab-pose").hidden = !state.pose_enabled;
+    if (tab === null) { selectTab(state.pose_enabled ? "pose" : "sequence"); return; }
+  }
+  if (tab === null) return;
+  const unsaved = [];
+  if (state.dirty) unsaved.push("keyframes");
+  if (state.sequence.dirty) unsaved.push("sequence");
   $("backend-label").textContent =
-    `backend: ${state.backend}` + (state.dirty ? " -- unsaved keyframes" : "");
+    `backend: ${state.backend}` + (unsaved.length ? ` -- unsaved ${unsaved.join(" + ")}` : "");
+  if (tab === "sequence") renderSequence();
+  else renderPose();
+}
+
+function renderPose() {
   renderView("side");
   renderView("top");
+  renderView("front");
   renderLegTable();
   renderKeyframes();
-  if (document.activeElement !== $("height")) {
-    const ys = LEGS.map(l => state.targets[l].y);
-    $("height").min = state.limits.height_min;
-    $("height").max = state.limits.height_max;
-    $("height").value = ys.reduce((a, b) => a + b, 0) / ys.length;
+  const mean = (vals) => vals.reduce((a, b) => a + b, 0) / vals.length;
+  if (document.activeElement !== $("depth")) {
+    $("depth").min = state.limits.depth_min;
+    $("depth").max = state.limits.depth_max;
+    const depths = LEGS.map(l => state.targets[l].depth).filter(v => v !== undefined);
+    if (depths.length) $("depth").value = mean(depths);
   }
-  $("height-val").textContent = Number($("height").value).toFixed(1) + " mm";
+  $("depth-val").textContent = Number($("depth").value).toFixed(1) + " mm";
+  const rr = rollRange();
+  if (document.activeElement !== $("roll")) {
+    $("roll").min = rr.min;
+    $("roll").max = rr.max;
+    const rolls = LEGS.map(l => state.targets[l].roll).filter(v => v !== undefined);
+    if (rolls.length) $("roll").value = mean(rolls);
+  }
+  if (document.activeElement !== $("roll-num")) $("roll-num").value = Number($("roll").value).toFixed(0);
+  const unbounded = state.limits.roll_min === null && state.limits.roll_max === null;
+  $("roll-note").textContent = unbounded
+    ? "no measured limit yet -- feeling for it is the point"
+    : `limit ${rr.min}${String.fromCharCode(176)} .. ${rr.max}${String.fromCharCode(176)}`;
   if (!nameTouched && document.activeElement !== $("name")) $("name").value = state.name;
-  $("save-path").textContent = state.save_path;
+  // Same rule as the sequence Run button: a control that cannot work must say
+  // why, not fail into the status bar after the click.
+  const frames = state.keyframes.length;
+  const enough = frames >= 2;
+  $("btn-save").disabled = !enough;
+  $("btn-preview").disabled = !enough || !!state.busy;
+  $("save-path").textContent = enough
+    ? state.save_path
+    : `${frames} of 2 keyframes -- a motion routine needs a pose to move FROM and `
+      + `one to move TO. Pose the robot and hit Capture again.`;
   $("interp").value = state.interpolation;
+}
+
+/* ---------- sequence tab ---------- */
+
+function fmt(seconds) {
+  return seconds >= 60
+    ? `${Math.floor(seconds / 60)}m ${(seconds % 60).toFixed(0)}s`
+    : `${seconds.toFixed(1)}s`;
+}
+
+// Colour by what a move does rather than by its name, so a new combination
+// move lands in the right family on its own.
+function barColor(move) {
+  if (move === "wait") return "#55616e";
+  if (move.indexOf("forward") === 0) return "var(--fl)";
+  if (move.indexOf("backward") === 0) return "var(--hl)";
+  return "var(--fr)";
+}
+
+function renderPalette(seq) {
+  if (paletteBuilt || !seq.vocabulary.length) return;
+  $("palette").replaceChildren(...seq.vocabulary.map((entry) => {
+    const button = document.createElement("button");
+    button.textContent = entry.label;
+    button.dataset.move = entry.move;
+    return button;
+  }));
+  paletteBuilt = true;
+}
+
+function runningStep() {
+  const run = state.run;
+  return run && run.active && run.step !== null && run.step !== undefined ? run.step : null;
+}
+
+function highlightRunning() {
+  const active = runningStep();
+  const rows = $("seq-table").querySelectorAll("tr");
+  rows.forEach((tr, i) => tr.classList.toggle("running", active !== null && i === active + 1));
+}
+
+function renderSeqTable(seq) {
+  const table = $("seq-table");
+  // Same rule as the leg table: never rebuild the row a value is being typed into.
+  if (table.contains(document.activeElement)) { highlightRunning(); return; }
+  table.replaceChildren();
+  if (!seq.steps.length) {
+    table.innerHTML =
+      "<tr><td class='hint'>no moves yet -- click a move above to append it</td></tr>";
+    return;
+  }
+  const head = document.createElement("tr");
+  head.innerHTML = "<th>#</th><th>move</th><th>seconds</th><th></th>";
+  table.appendChild(head);
+  seq.steps.forEach((step, i) => {
+    const options = seq.vocabulary.map((entry) =>
+      `<option value="${entry.move}"${entry.move === step.move ? " selected" : ""}>` +
+      `${entry.label}</option>`).join("");
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      `<td class="coords">${i + 1}</td>` +
+      `<td><select class="disable-when-busy" data-seq-move="${i}">${options}</select></td>` +
+      `<td><input class="disable-when-busy" type="number" step="0.5" min="0.1" ` +
+      `max="${seq.limits.max_seconds}" value="${step.seconds}" data-seq-seconds="${i}"></td>` +
+      `<td class="disable-when-busy">` +
+      `<button data-seq-up="${i}" title="move up">&uarr;</button>` +
+      `<button data-seq-down="${i}" title="move down">&darr;</button>` +
+      `<button data-seq-del="${i}" class="danger" title="remove">&times;</button></td>`;
+    table.appendChild(tr);
+  });
+  highlightRunning();
+}
+
+function renderBars(seq) {
+  const svg = $("seq-bars");
+  svg.replaceChildren();
+  const total = seq.duration || 1;
+  const scale = (seconds) => seconds / total * 600;
+  let at = 0;
+  seq.steps.forEach((step, i) => {
+    const width = Math.max(1, scale(step.seconds));
+    svg.appendChild(svgEl("rect", {x: scale(at), y: 8, width, height: 28, rx: 3,
+                                   class: "bar", fill: barColor(step.move)}));
+    if (width > 30) {
+      const label = svgEl("text", {x: scale(at) + 5, y: 26, class: "bar-label"});
+      label.textContent = `${step.seconds}s`;
+      svg.appendChild(label);
+    }
+    at += step.seconds;
+    if (seq.gap > 0 && i < seq.steps.length - 1) {
+      svg.appendChild(svgEl("rect", {x: scale(at), y: 16, width: Math.max(1, scale(seq.gap)),
+                                     height: 12, class: "bar bar-gap"}));
+      at += seq.gap;
+    }
+  });
+  const zero = svgEl("text", {x: 2, y: 50, class: "axis-label"});
+  zero.textContent = "0s";
+  svg.appendChild(zero);
+  const end = svgEl("text", {x: 598, y: 50, class: "axis-label", "text-anchor": "end"});
+  end.textContent = seq.steps.length ? fmt(seq.duration) : "";
+  svg.appendChild(end);
+  if (state.run && state.run.active) {
+    const x = Math.max(0, Math.min(600, scale(state.run.t)));
+    svg.appendChild(svgEl("line", {x1: x, y1: 4, x2: x, y2: 40, class: "cursor"}));
+  }
+}
+
+function moveLabel(seq, move) {
+  const entry = seq.vocabulary.filter((v) => v.move === move)[0];
+  return entry ? entry.label : move;
+}
+
+function renderFunctions() {
+  if (functionsBuilt || !state.functions || !state.functions.length) return;
+  $("functions").replaceChildren(...state.functions.map((entry) => {
+    const button = document.createElement("button");
+    button.textContent = entry.label;
+    button.dataset.function = entry.mode;
+    return button;
+  }));
+  functionsBuilt = true;
+}
+
+function renderPad(seq) {
+  const manual = state.manual || {};
+  for (const button of document.querySelectorAll("#pad button[data-drive]"))
+    button.classList.toggle("active", button.dataset.drive === manual.move);
+  const note = $("manual-note");
+  if (manual.move) {
+    note.className = "driving";
+    note.textContent = "driving: " + moveLabel(seq, manual.move) +
+                       " -- latched, it runs until you press STOP";
+  } else {
+    note.className = "hint";
+    note.textContent = manual.note ||
+      "click a direction and the robot starts walking; it does not stop by itself";
+  }
+}
+
+function renderSequence() {
+  const seq = state.sequence, run = state.run || {};
+  const endless = seq.repeat === 0;
+  renderPalette(seq);
+  renderSeqTable(seq);
+  renderBars(seq);
+  renderPad(seq);
+  renderFunctions();
+  if (document.activeElement !== $("seq-gap")) $("seq-gap").value = seq.gap;
+  if (document.activeElement !== $("seq-repeat") && !endless) $("seq-repeat").value = seq.repeat;
+  $("seq-repeat").disabled = endless;
+  if (document.activeElement !== $("seq-endless")) $("seq-endless").checked = endless;
+  $("seq-run").disabled = !!state.busy || !seq.steps.length;
+  $("seq-total").textContent = seq.steps.length
+    ? `${seq.steps.length} moves, ${fmt(seq.duration)} per pass` +
+      (endless ? ", endless" : ` x ${seq.repeat} = ${fmt(seq.duration * seq.repeat)}`)
+    : "no moves yet";
+  const step = runningStep();
+  $("seq-progress").textContent = run.active
+    ? `cycle ${run.cycle}${endless ? "" : " of " + seq.repeat}, ` +
+      `t = ${run.t.toFixed(1)}s / ${fmt(seq.duration)}, ` +
+      (step === null ? "pause between moves" : `move ${step + 1}`)
+    : (run.message || "not running");
+  // A greyed-out button that does not say why is a puzzle, not a safeguard.
+  $("seq-note").textContent = (state.manual || {}).move
+    ? "The robot is being driven by hand -- STOP it before running a sequence."
+    : !seq.steps.length
+    ? "Run needs at least one move -- click one of the buttons on the left."
+    : state.busy
+    ? "A run is in progress. STOP (or Esc) ends it; the editor unlocks after that."
+    : state.backend === "http"
+    ? "Wi-Fi: if the link drops, no stop reaches the robot (D10) -- keep it on a stand, "
+      + "power switch in reach. Esc stops; closing this page stops too."
+    : `Runs on the ${state.backend} backend. Esc stops; closing this page stops too.`;
+  if (!seqNameTouched && document.activeElement !== $("seq-name")) $("seq-name").value = seq.name;
+  $("seq-path").textContent = seq.save_path;
+}
+
+async function refreshFiles() {
+  const data = await api("seq_files", {});
+  if (!data.ok || !data.files) return;
+  const select = $("seq-file");
+  const current = select.value;
+  select.replaceChildren(...data.files.map((file) => new Option(file, file)));
+  if (data.files.indexOf(current) >= 0) select.value = current;
 }
 
 async function poll() {
@@ -323,8 +769,16 @@ async function sendFoot(leg, view, world) {
     await api("target", {leg: PAIR[leg], ...data.target});
 }
 
-for (const view of ["side", "top"]) {
-  const svg = $(view === "side" ? "svg-side" : "svg-top");
+// side/top send (world x, world z-up) resp. (world x, world y-left); front
+// sends (world y-left, world z-up). See _foot() on the server.
+const VIEW_WORLD = {
+  side:  (p) => ({a: p.x, b: -p.y}),
+  top:   (p) => ({a: p.x, b: -p.y}),
+  front: (p) => ({a: -p.x, b: -p.y}),
+};
+
+for (const view of ["side", "top", "front"]) {
+  const svg = $(SVG_ID[view]);
   svg.addEventListener("pointerdown", (event) => {
     const foot = event.target.closest ? event.target.closest(".foot") : null;
     if (!foot) return;
@@ -335,8 +789,7 @@ for (const view of ["side", "top"]) {
   svg.addEventListener("pointermove", (event) => {
     if (!drag || drag.view !== view) return;
     const p = svgPoint(svg, event);
-    // side: a = world x, b = world z-up = -svg y.  top: a = world x, b = world y-left = -svg y.
-    const world = {a: p.x, b: -p.y};
+    const world = VIEW_WORLD[view](p);
     if (dragSendTimer) return;                    // throttle to ~16 posts/s
     dragSendTimer = setTimeout(() => { dragSendTimer = null; }, 60);
     sendFoot(drag.leg, view, world);
@@ -345,6 +798,17 @@ for (const view of ["side", "top"]) {
   svg.addEventListener("pointerup", stop);
   svg.addEventListener("pointercancel", stop);
 }
+
+document.addEventListener("change", (event) => {
+  const el = event.target;
+  if (!el.matches || !el.matches("input.axisval")) return;
+  const value = Number(el.value);
+  if (!Number.isFinite(value)) return;
+  const {leg, axis} = el.dataset;
+  api("set", {legs: [leg], axis, value}).then((data) => {
+    if (data.ok && $("mirror").checked) api("set", {legs: [PAIR[leg]], axis, value});
+  });
+});
 
 document.addEventListener("click", (event) => {
   const el = event.target;
@@ -364,11 +828,26 @@ document.addEventListener("click", (event) => {
   }
 });
 
-$("height").addEventListener("input", () => {
-  $("height-val").textContent = Number($("height").value).toFixed(1) + " mm";
+$("depth").addEventListener("input", () => {
+  $("depth-val").textContent = Number($("depth").value).toFixed(1) + " mm";
   if (dragSendTimer) return;
   dragSendTimer = setTimeout(() => { dragSendTimer = null; }, 80);
-  api("set", {legs: "all", axis: "y", value: Number($("height").value)});
+  api("set", {legs: "all", axis: "depth", value: Number($("depth").value)});
+});
+
+$("roll").addEventListener("input", () => {
+  $("roll-num").value = Number($("roll").value).toFixed(0);
+  if (dragSendTimer) return;
+  dragSendTimer = setTimeout(() => { dragSendTimer = null; }, 80);
+  api("set", {legs: "all", axis: "roll", value: Number($("roll").value)});
+});
+
+// Exact angle for all four legs at once -- type it, press Enter.
+$("roll-num").addEventListener("change", () => {
+  const value = Number($("roll-num").value);
+  if (!Number.isFinite(value)) return;
+  $("roll").value = value;
+  api("set", {legs: "all", axis: "roll", value});
 });
 
 $("btn-capture").addEventListener("click", () =>
@@ -380,11 +859,86 @@ $("name").addEventListener("input", () => { nameTouched = true; });
 $("btn-save").addEventListener("click", () =>
   api("save", {name: $("name").value, overwrite: $("overwrite").checked}));
 $("btn-quit").addEventListener("click", async () => {
-  if (state && state.dirty &&
-      !confirm("There are unsaved keyframes. Quit anyway?")) return;
+  const unsaved = state && (state.dirty || state.sequence.dirty);
+  if (unsaved && !confirm("There is unsaved work. Quit anyway?")) return;
   await api("quit", {});
   document.body.innerHTML =
     "<p style='padding:2em;color:#8b98a7'>Session ended. You can close this tab.</p>";
+});
+
+/* ---------- sequence interactions ---------- */
+
+document.addEventListener("click", (event) => {
+  const el = event.target;
+  if (!el.dataset) return;
+  if (el.dataset.tab) selectTab(el.dataset.tab);
+  else if (el.dataset.move) api("seq_add", {move: el.dataset.move});
+  else if (el.dataset.seqUp !== undefined)
+    api("seq_reorder", {index: Number(el.dataset.seqUp), delta: -1});
+  else if (el.dataset.seqDown !== undefined)
+    api("seq_reorder", {index: Number(el.dataset.seqDown), delta: 1});
+  else if (el.dataset.seqDel !== undefined)
+    api("seq_delete", {index: Number(el.dataset.seqDel)});
+  else if (el.dataset.drive) api("drive", {move: el.dataset.drive});
+  else if (el.dataset.stop) api("stop", {});
+  else if (el.dataset.function) api("function", {mode: el.dataset.function});
+});
+
+document.addEventListener("change", (event) => {
+  const el = event.target;
+  if (!el.dataset) return;
+  if (el.dataset.seqMove !== undefined)
+    api("seq_update", {index: Number(el.dataset.seqMove), move: el.value});
+  else if (el.dataset.seqSeconds !== undefined) {
+    const seconds = Number(el.value);
+    if (Number.isFinite(seconds)) api("seq_update", {index: Number(el.dataset.seqSeconds), seconds});
+  }
+});
+
+$("seq-gap").addEventListener("change", () =>
+  api("seq_config", {gap: Number($("seq-gap").value)}));
+$("seq-repeat").addEventListener("change", () =>
+  api("seq_config", {repeat: Number($("seq-repeat").value)}));
+$("seq-endless").addEventListener("change", () =>
+  api("seq_config", {repeat: $("seq-endless").checked
+    ? 0 : Math.max(1, Number($("seq-repeat").value) || 1)}));
+
+$("seq-clear").addEventListener("click", () => {
+  if (state.sequence.steps.length && confirm("Remove all moves?")) api("seq_clear", {});
+});
+
+$("seq-run").addEventListener("click", () => {
+  const seq = state.sequence;
+  const how = seq.repeat === 0
+    ? `${fmt(seq.duration)} per pass, LOOPING UNTIL YOU STOP IT`
+    : `${fmt(seq.duration * seq.repeat)} (${seq.repeat} x ${fmt(seq.duration)})`;
+  if (!confirm(`Run ${seq.steps.length} moves on the ${state.backend} backend?\n\n${how}`)) return;
+  api("seq_run", {});
+});
+
+// Stop is deliberately reachable four ways: this button, the one in the middle
+// of the drive pad, the Escape key, and closing the page (the server stops
+// anything nobody is watching). All four post the same action, which ends a
+// running sequence and a hand-driven move alike.
+$("seq-stop").addEventListener("click", () => api("stop", {}));
+$("btn-reset").addEventListener("click", () => api("reset", {}));
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") api("stop", {});
+});
+
+$("seq-name").addEventListener("input", () => { seqNameTouched = true; });
+$("seq-save").addEventListener("click", async () => {
+  const data = await api("seq_save", {name: $("seq-name").value,
+                                      overwrite: $("seq-overwrite").checked});
+  if (data.ok) { seqNameTouched = false; refreshFiles(); }
+});
+$("seq-load").addEventListener("click", async () => {
+  const file = $("seq-file").value;
+  if (!file) return;
+  if (state.sequence.dirty &&
+      !confirm(`Discard the unsaved sequence and load ${file}?`)) return;
+  const data = await api("seq_load", {file});
+  if (data.ok) seqNameTouched = false;
 });
 </script>
 </body>

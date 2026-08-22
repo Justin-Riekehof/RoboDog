@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,7 @@ from robodog.api.types import Capability, Drive, LegId, SafetyState, SetLegTarge
 from robodog.backends.mock import MockBackend
 from robodog.errors import CapabilityError, EStopActiveError
 from robodog.teach.format import SCHEMA_V1, load_routine, parse_routine
-from robodog.teach.player import play_routine
+from robodog.teach.player import MAX_EVENTS, play_routine
 from tests.conftest import FakeClock
 
 ROUTINES_DIR = Path(__file__).resolve().parent.parent / "routines"
@@ -166,12 +167,118 @@ def test_estop_during_playback_aborts(clock: FakeClock) -> None:
 
 def test_realtime_playback_uses_the_injected_sleep(clock: FakeClock) -> None:
     client = make_client(clock)
-    slept: list[float] = []
+    wall, slept = FakeClock(), []
+
+    def fake_sleep(dt: float) -> None:
+        slept.append(dt)
+        wall.advance(dt)
+
     routine = commands_routine(
-        [{"at": 0.0, "do": "led", "args": {"color": 1}}], requires=["PERIPHERALS"]
+        [
+            {"at": 0.0, "do": "drive", "args": {"forward": 1}},
+            {"at": 0.3, "do": "drive", "args": {}},
+        ]
     )
-    play_routine(routine, client, tick=0.1, realtime=True, sleep=slept.append)
+    play_routine(routine, client, tick=0.1, realtime=True, sleep=fake_sleep, now=wall)
     assert all(dt == pytest.approx(0.1) for dt in slept)
+
+
+def test_realtime_pacing_absorbs_the_time_the_work_took(clock: FakeClock) -> None:
+    """Sending over Wi-Fi costs real milliseconds; they must not add up."""
+    client = make_client(clock)
+    wall, slept = FakeClock(), []
+
+    def fake_sleep(dt: float) -> None:
+        slept.append(dt)
+        wall.advance(dt)
+
+    def slow_work(_t: float, _state: Any) -> None:
+        wall.advance(0.03)  # a command that took 30 ms to send
+
+    routine = commands_routine([{"at": 0.0, "do": "drive", "args": {"forward": 1}}])
+    play_routine(
+        routine,
+        client,
+        tick=0.1,
+        realtime=True,
+        sleep=fake_sleep,
+        now=wall,
+        on_sample=slow_work,
+        sample_interval=0.0,
+    )
+    # Each sleep is shortened by what the tick itself consumed, so the timeline
+    # keeps its pace instead of drifting 30 ms per tick.
+    assert all(dt == pytest.approx(0.07) for dt in slept)
+
+
+# --- repeating and stopping -----------------------------------------------------
+
+
+def repeating_routine(repeat: int) -> Any:
+    return parse_routine(
+        {
+            "schema": SCHEMA_V1,
+            "name": "loop",
+            "kind": "sequence",
+            "requires": ["LOCOMOTION"],
+            "gap": 0.0,
+            "repeat": repeat,
+            "moves": [{"move": "forward", "seconds": 0.2}, {"move": "left", "seconds": 0.2}],
+        }
+    )
+
+
+def test_repeat_plays_the_whole_timeline_again(clock: FakeClock) -> None:
+    backend = MockBackend()
+    client = make_client(clock, backend)
+    report = play_routine(repeating_routine(3), client, tick=0.05)
+    sent = [c for _, c in backend.command_log]
+    assert sent == [Drive(1, 0), Drive(0, -1), Drive(0, 0)] * 3
+    assert report.cycles == 3
+    assert not report.stopped_early
+    assert [e.cycle for e in report.events][-1] == 3
+
+
+def test_an_endless_routine_runs_until_it_is_told_to_stop(clock: FakeClock) -> None:
+    backend = MockBackend()
+    client = make_client(clock, backend)
+    cycles: list[int] = []
+
+    routine = repeating_routine(0)
+    report = play_routine(
+        routine,
+        client,
+        tick=0.05,
+        on_event=lambda event: cycles.append(event.cycle),
+        should_stop=lambda: len(cycles) > 6,
+    )
+    assert report.stopped_early
+    assert report.cycles > 1  # it really did loop
+    # However it ended, the robot is left stopped.
+    assert backend.command_log[-1][1] == Drive(0, 0)
+    assert client.state().drive == Drive(0, 0)
+
+
+def test_stopping_is_reported_and_leaves_the_supervisor_armed(clock: FakeClock) -> None:
+    client = make_client(clock)
+    report = play_routine(repeating_routine(0), client, tick=0.05, should_stop=lambda: True)
+    assert report.stopped_early
+    assert report.events[-1].description.endswith("cycle(s)")
+    assert client.safety_state is SafetyState.ARMED
+
+
+def test_an_endless_report_does_not_grow_without_bound(clock: FakeClock) -> None:
+    client = make_client(clock)
+    ticks = itertools.count()
+    report = play_routine(
+        repeating_routine(0),
+        client,
+        tick=0.05,
+        should_stop=lambda: next(ticks) > 20_000,
+    )
+    assert len(report.events) == MAX_EVENTS
+    assert report.events_dropped > 0
+    assert report.events[-1].cycle > 1  # the tail is what is kept
 
 
 def test_samples_are_reported(clock: FakeClock) -> None:

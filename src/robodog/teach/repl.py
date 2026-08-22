@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 from robodog.api.types import LegId
 from robodog.errors import RoutineError
 from robodog.teach.player import play_routine
-from robodog.teach.session import AXES, TeachSession, parse_legs
+from robodog.teach.session import POSE_AXES, TeachSession, parse_legs
 
 if TYPE_CHECKING:  # avoids a circular import at runtime
     from robodog.api.client import RobotClient
@@ -32,7 +32,8 @@ Printer = Callable[[str], None]
 HELP = """commands (units: mm, seconds):
   leg fl|hl|fr|hr|all ...   select the legs to move (e.g. 'leg fl fr')
   x +5 / y -2.5 / z +10     jog the selected feet (sign = relative move)
-  x = 20                    set a coordinate absolutely ('=' = absolute)
+  roll +10 / depth -5       jog the leg's roll [deg] or its reach [mm]
+  x = 20 / roll = 60        set an axis absolutely ('=' = absolute)
   pose stand [height]       all legs to the stand pose (default 95)
   pose crouch               all legs to the crouch/safe pose
   cap [dt]                  capture a keyframe, dt seconds after the previous
@@ -42,7 +43,27 @@ HELP = """commands (units: mm, seconds):
   show                      current pose, selection, keyframes
   save [path] / save! ...   write the routine ('!' overwrites)
   quit / quit!              exit ('!' discards unsaved keyframes)
-axes per leg: x forward, y down toward the ground, z outward."""
+axes per leg: x forward, y down toward the ground, z outward.
+roll/depth describe the same foot in the terms the leg actually moves in: the
+linkage is planar and the wiggle servo rolls that plane, so roll trades y
+against z along an arc. The range is asymmetric: 0 is hanging straight down
+and large positive angles fold the leg up over the body. depth is the reach
+within the plane."""
+
+
+# How long the teach session's control loop may go silent before the watchdog
+# trips. The budget follows the *consequence* of a stall, not a fixed number:
+#
+#  * With the MuJoCo viewer the ticker's own tick contains `viewer.sync()`,
+#    which blocks for as long as the operator holds the window -- on Windows,
+#    dragging it stops the message pump entirely. Nothing can run away in a
+#    simulation, so a dragged window must not latch an E-stop.
+#  * Headless sim/mock has no window but is still paced by a Python loop that
+#    shares the GIL with an HTTP server; a couple of seconds is honest.
+#  * On hardware the loop has no window in it and a stall means a robot that
+#    keeps walking, so that path keeps the strict default (0.5 s).
+TEACH_WATCHDOG = 2.0
+TEACH_VIEWER_WATCHDOG = 10.0
 
 
 class RealtimeTicker(threading.Thread):
@@ -133,7 +154,7 @@ class TeachRepl:
             with self.lock:
                 self._session.select(parse_legs(tokens[1:]))
             self._say("selected: " + ", ".join(leg.name for leg in self._session.selected))
-        elif command in AXES:
+        elif command in POSE_AXES:
             self._move(command, tokens[1:])
         elif command == "pose":
             self._pose(tokens[1:])

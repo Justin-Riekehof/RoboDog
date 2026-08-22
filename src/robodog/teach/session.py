@@ -19,8 +19,9 @@ from typing import TYPE_CHECKING, Literal
 import yaml
 
 from robodog.api.types import Capability, LegId, LegTarget
-from robodog.errors import LimitViolationError, RoutineError
+from robodog.errors import KinematicsError, LimitViolationError, RoutineError
 from robodog.kinematics.constants import STAND_HEIGHT
+from robodog.kinematics.leg import leg_roll_and_depth, leg_target_from_roll
 from robodog.kinematics.poses import crouch_pose, stand_pose
 from robodog.teach.format import (
     Keyframe,
@@ -34,6 +35,37 @@ if TYPE_CHECKING:  # avoids a circular import at runtime
     from robodog.api.client import RobotClient
 
 AXES: tuple[str, ...] = ("x", "y", "z")
+# Derived axes. The leg is a planar linkage rotated by the wiggle servo, so
+# "roll the leg" and "extend the leg" are the moves an operator actually wants;
+# in Cartesian terms each of them changes y and z together (ASSUMPTIONS C13).
+DERIVED_AXES: tuple[str, ...] = ("roll", "depth")
+POSE_AXES: tuple[str, ...] = AXES + DERIVED_AXES
+
+
+def axis_value(target: LegTarget, axis: str) -> float:
+    """Current value of one pose axis, Cartesian or derived."""
+    if axis in AXES:
+        value: float = getattr(target, axis)
+        return value
+    roll, depth = leg_roll_and_depth(target)
+    if axis == "roll":
+        return roll
+    if axis == "depth":
+        return depth
+    raise ValueError(f"axis must be one of {', '.join(POSE_AXES)}")
+
+
+def with_axis(target: LegTarget, axis: str, value: float) -> LegTarget:
+    """Copy of ``target`` with one pose axis set, Cartesian or derived."""
+    if axis in AXES:
+        return replace(target, **{axis: value})
+    roll, depth = leg_roll_and_depth(target)
+    if axis == "roll":
+        return leg_target_from_roll(target.x, depth, value)
+    if axis == "depth":
+        return leg_target_from_roll(target.x, value, roll)
+    raise ValueError(f"axis must be one of {', '.join(POSE_AXES)}")
+
 
 LEG_ALIASES: dict[str, LegId] = {
     "fl": LegId.FRONT_LEFT,
@@ -151,12 +183,16 @@ class TeachSession:
         Returns rejection messages per leg; legs that pass the safety checks
         move, legs that do not stay exactly where they were.
         """
-        if axis not in AXES:
-            raise ValueError(f"axis must be one of {', '.join(AXES)}")
+        if axis not in POSE_AXES:
+            raise ValueError(f"axis must be one of {', '.join(POSE_AXES)}")
         errors: dict[LegId, str] = {}
         for leg in legs if legs is not None else self._selected:
             current = self._targets[leg]
-            moved = replace(current, **{axis: getattr(current, axis) + delta})
+            try:
+                moved = with_axis(current, axis, axis_value(current, axis) + delta)
+            except KinematicsError as exc:
+                errors[leg] = str(exc)
+                continue
             message = self._apply(leg, moved)
             if message is not None:
                 errors[leg] = message
@@ -166,11 +202,15 @@ class TeachSession:
         self, axis: str, value: float, *, legs: tuple[LegId, ...] | None = None
     ) -> dict[LegId, str]:
         """Set one coordinate to an absolute value (default: the selected legs)."""
-        if axis not in AXES:
-            raise ValueError(f"axis must be one of {', '.join(AXES)}")
+        if axis not in POSE_AXES:
+            raise ValueError(f"axis must be one of {', '.join(POSE_AXES)}")
         errors: dict[LegId, str] = {}
         for leg in legs if legs is not None else self._selected:
-            moved = replace(self._targets[leg], **{axis: value})
+            try:
+                moved = with_axis(self._targets[leg], axis, value)
+            except KinematicsError as exc:
+                errors[leg] = str(exc)
+                continue
             message = self._apply(leg, moved)
             if message is not None:
                 errors[leg] = message

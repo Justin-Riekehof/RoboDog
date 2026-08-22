@@ -1,0 +1,19 @@
+# A drive sequence: named moves with their own durations, the way the Sequence
+# tab of `robodog teach` writes them. The player expands this into a drive
+# timeline (10 s forward, stop, 0.5 s pause, 2 s turning left, ...) and repeats
+# the whole pass three times.
+#
+# Locomotion only, so it runs over Wi-Fi on the stock firmware -- with the robot
+# on a stand. Set `repeat: 0` for an endless loop; then a stop must stay in
+# reach at all times (ASSUMPTIONS D10).
+schema: robodog.routine/v1
+name: patrol-loop
+description: Forward, turn left, back off -- three times, with a pause between moves.
+kind: sequence
+requires: [LOCOMOTION]
+gap: 0.5
+repeat: 3
+moves:
+  - {move: forward, seconds: 10}
+  - {move: left, seconds: 2}
+  - {move: backward, seconds: 5}
