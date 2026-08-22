@@ -11,7 +11,7 @@ import json
 import threading
 import urllib.parse
 from collections.abc import Iterator
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -67,12 +67,29 @@ class FakeFirmware:
         # one value no host can work out for itself (ASSUMPTIONS F4).
         self.camera: dict[str, int] = {**CAMERA_DEFAULTS, "size_max": 8, "psram": 0}
         self.camera_answers = True  # False = firmware too old to reply with a body
+        self.connections = 0  # TCP connections accepted, not requests served
+        self.drop_next = False  # hang up after the next response, as an ESP32 does
 
 
 def make_handler(state: FakeFirmware) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
+        # The robot's httpd speaks 1.1 and holds connections open; the default
+        # here is 1.0, which closes after every response and would make a test
+        # of connection reuse impossible to fail.
+        protocol_version = "HTTP/1.1"
+
         def log_message(self, *args: object) -> None:  # keep test output clean
             pass
+
+        def setup(self) -> None:
+            state.connections += 1
+            super().setup()
+
+        def end_headers(self) -> None:
+            if state.drop_next:
+                state.drop_next = False
+                self.close_connection = True
+            super().end_headers()
 
         def do_GET(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
@@ -138,7 +155,10 @@ def make_handler(state: FakeFirmware) -> type[BaseHTTPRequestHandler]:
 @pytest.fixture
 def firmware() -> Iterator[tuple[FakeFirmware, str]]:
     state = FakeFirmware()
-    server = HTTPServer(("127.0.0.1", 0), make_handler(state))
+    # Threaded, because the robot's httpd holds connections open and so do we:
+    # a single-threaded server sits inside one persistent connection and never
+    # accepts another, which hangs the suite rather than failing it.
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
     thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02})
     thread.daemon = True
     thread.start()
@@ -859,3 +879,96 @@ def test_a_stock_robot_keeps_the_strict_budget(firmware: tuple[FakeFirmware, str
     client.connect()
     assert client.watchdog_timeout == STOCK_WATCHDOG
     client.disconnect()
+
+
+# --- making the motion smooth, and the link cheap ------------------------------------
+
+
+def test_a_pose_says_how_long_it_may_take(firmware: tuple[FakeFirmware, str]) -> None:
+    """The robot refreshes its servos every 4 ms and hears from us ten times a
+    second, so 24 of every 25 writes repeat a value and each pose that does
+    arrive lands as a jump. Naming a duration lets it fill those in."""
+    from robodog.backends.http import MAX_RAMP_MS, MIN_RAMP_MS
+
+    state, host = firmware
+    state.robodog = True
+    clock = FakeClock()
+    backend = HttpBackend(host, clock=clock)
+    backend.connect()
+
+    for _ in range(3):
+        for leg in LegId:
+            backend.send(SetLegTarget(leg, LegTarget(16.0, 95.0, 25.0)))
+        clock.advance(0.12)
+        backend.tick(0.12)
+
+    spans = [val for var, val, _cmd in state.calls if var == "pose"]
+    assert spans, "no pose reached the robot"
+    for span in spans:
+        assert MIN_RAMP_MS <= span <= MAX_RAMP_MS
+    # Measured, not assumed: the second pose knows the first one's interval.
+    assert spans[-1] == 120
+    backend.disconnect()
+
+
+def test_the_ramp_follows_a_link_that_slows_down(firmware: tuple[FakeFirmware, str]) -> None:
+    """A longer gap means a longer ramp, so the robot is still travelling when
+    the next pose lands instead of arriving and waiting -- which is the step
+    this whole thing removes."""
+    state, host = firmware
+    state.robodog = True
+    clock = FakeClock()
+    backend = HttpBackend(host, clock=clock)
+    backend.connect()
+
+    for gap in (0.05, 0.30):
+        for leg in LegId:
+            backend.send(SetLegTarget(leg, LegTarget(16.0, 95.0, 25.0)))
+        clock.advance(gap)
+        backend.tick(gap)
+        for leg in LegId:
+            backend.send(SetLegTarget(leg, LegTarget(16.0, 96.0, 25.0)))
+        clock.advance(gap)
+        backend.tick(gap)
+
+    spans = [val for var, val, _cmd in state.calls if var == "pose"]
+    assert spans[1] == 50
+    assert spans[-1] == 300
+    backend.disconnect()
+
+
+def test_the_connection_is_held_open(firmware: tuple[FakeFirmware, str]) -> None:
+    """A pose is a request, and a request used to be a fresh TCP connection --
+    a handshake to an ESP32 over Wi-Fi is a real part of what a pose costs, and
+    it was paid on every single one."""
+    state, host = firmware
+    state.robodog = True
+    backend = HttpBackend(host)
+    backend.connect()
+    before = state.connections
+
+    for _ in range(12):
+        backend.send(Drive(forward=1, turn=0))
+
+    assert state.connections == before, "a new connection was opened per request"
+    assert len([call for call in state.calls if call[0] == "move"]) >= 12
+    backend.disconnect()
+
+
+def test_a_closed_connection_is_reopened_once(firmware: tuple[FakeFirmware, str]) -> None:
+    """An idle connection is the server's to close, and an ESP32 does. Finding
+    that out is not a failure -- but a refusal is an answer and must not be
+    retried, or a robot saying no would be told twice."""
+    state, host = firmware
+    backend = HttpBackend(host)
+    backend.connect()
+    backend.send(Drive(forward=1, turn=0))
+
+    state.drop_next = True  # the robot hangs up between requests
+    backend.send(Drive(forward=0, turn=0))  # must still get through
+
+    state.fail_next = 1
+    with pytest.raises(BackendError, match="HTTP 500"):
+        backend.send(Drive(forward=1, turn=0))
+    assert state.fail_next == 0, "a refusal was retried"
+    backend.disconnect()

@@ -13,7 +13,7 @@ import threading
 import time
 import urllib.request
 from collections.abc import Iterator
-from http.server import HTTPServer
+from http.server import ThreadingHTTPServer
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -624,7 +624,7 @@ def test_loading_a_pose_routine_is_refused(
 def wifi_rig(tmp_path: Path) -> Iterator[tuple[FakeFirmware, str]]:
     """The web UI in front of the stock firmware (a local stand-in for it)."""
     firmware = FakeFirmware()
-    httpd = HTTPServer(("127.0.0.1", 0), make_handler(firmware))
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(firmware))
     thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.02})
     thread.daemon = True
     thread.start()
@@ -1001,7 +1001,7 @@ def posing_rig(tmp_path: Path) -> Iterator[tuple[FakeFirmware, str]]:
     """
     firmware = FakeFirmware()
     firmware.robodog = True  # speaks ping/watchdog/pose
-    httpd = HTTPServer(("127.0.0.1", 0), make_handler(firmware))
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(firmware))
     serving = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.02})
     serving.daemon = True
     serving.start()

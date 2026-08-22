@@ -60,6 +60,10 @@ extern int ROBODOG_WATCHDOG_TRIPPED = 0;
 
 // RoboDog: defined in app_httpd.cpp, which has the camera headers.
 extern void robodogSnap(int withImage);
+// RoboDog: defined further down, next to the ramp itself. Declared here
+// because the watchdog below has to be able to end a ramp in flight.
+extern void robodogRampCancel();
+extern void robodogApplyMs(int val);
 // RoboDog: camera tuning, also defined in app_httpd.cpp.
 extern int robodogCameraSet(const char *name, int val);
 
@@ -79,6 +83,7 @@ extern void robodogWatchdogCheck(){
   moveFB = 0;
   moveLR = 0;
   funcMode = 2;                    // stayLow: down, low and stable
+  robodogRampCancel();             // stayLow owns the servos now, not a ramp
   ROBODOG_WATCHDOG_TRIPPED = 1;
   Serial.println("WATCHDOG: link lost, stopping and crouching");
 }
@@ -172,6 +177,65 @@ extern void robodogLegTarget(int leg, double x, double y, double z){
   Serial.print(" z=");Serial.println(z);
 }
 
+// --- moving to the staged pose over time, rather than in one step --------
+// GoalPosAll() writes GoalPWM straight to the servo driver with no ramp of its
+// own, and the loop does that every STEP_DELAY (4 ms) whether anything changed
+// or not. So the robot already refreshes its servos some 250 times a second
+// while a host over Wi-Fi manages ten poses -- 24 of every 25 writes repeat a
+// value, and each pose that does arrive lands as a jump.
+//
+// Filling those writes in is what this does: `apply` may name a duration, and
+// GoalPWM then travels to the staged pose across it, one step per loop pass.
+// Smoothness stops depending on the link -- five poses a second from the host
+// become hundreds on the robot.
+//
+// Interpolation is LINEAR on purpose. The host already eases whole routines
+// (the teach session's cosine), and easing each segment on top of that would
+// decelerate into every one of them -- a pulse at 10 Hz, which is worse than
+// the steps it replaces.
+// How long the next apply should take, in ms. 0 = jump, which is what every
+// caller got before this existed. Clamped: a ramp nobody ends is a robot
+// that ignores its own controls for as long as the number says.
+unsigned long ROBODOG_APPLY_MS = 0;
+const unsigned long ROBODOG_APPLY_MS_MAX = 5000;
+
+int ROBODOG_RAMP_FROM[16];
+int ROBODOG_RAMP_TO[16];
+unsigned long ROBODOG_RAMP_START = 0;
+unsigned long ROBODOG_RAMP_MS = 0;   // 0 = no ramp in flight
+
+extern void robodogRampStep(){
+  if(ROBODOG_RAMP_MS == 0){return;}
+  unsigned long gone = millis() - ROBODOG_RAMP_START;
+  if(gone >= ROBODOG_RAMP_MS){
+    for(int i = 0; i < 16; i++){GoalPWM[i] = ROBODOG_RAMP_TO[i];}
+    ROBODOG_RAMP_MS = 0;   // arrived; stop stepping until the next apply
+    return;
+  }
+  // Integer maths, and the multiply before the divide: at 4 ms per pass a
+  // float here would be free, but the rounding of `from + (to-from)*gone/ms`
+  // is what keeps the last step landing exactly on the target above.
+  for(int i = 0; i < 16; i++){
+    long span = (long)ROBODOG_RAMP_TO[i] - (long)ROBODOG_RAMP_FROM[i];
+    GoalPWM[i] = ROBODOG_RAMP_FROM[i] + (int)((span * (long)gone) / (long)ROBODOG_RAMP_MS);
+  }
+}
+
+// Abandon a ramp in flight. Anything that takes the servos over -- a gait, a
+// canned animation, the watchdog -- must, or the ramp keeps writing GoalPWM
+// underneath it.
+// `val` on apply/pose is how long the move should take, in ms. 0 keeps the
+// old behaviour exactly -- a jump -- so nothing that predates this changes.
+extern void robodogApplyMs(int val){
+  if(val <= 0){ROBODOG_APPLY_MS = 0; return;}
+  ROBODOG_APPLY_MS = (unsigned long)val;
+  if(ROBODOG_APPLY_MS > ROBODOG_APPLY_MS_MAX){ROBODOG_APPLY_MS = ROBODOG_APPLY_MS_MAX;}
+}
+
+extern void robodogRampCancel(){
+  ROBODOG_RAMP_MS = 0;
+}
+
 extern void robodogApply(){
   if(!ROBODOG_HAS_STAGED){
     Serial.println("ROBODOG: nothing staged");
@@ -187,7 +251,20 @@ extern void robodogApply(){
   funcMode = 0;
   debugMode = 0;
   STAND_STILL = 1;
-  for(int i = 0; i < 16; i++){GoalPWM[i] = ROBODOG_STAGED[i];}
+  if(ROBODOG_APPLY_MS > 0){
+    // Travel there instead of arriving there. From wherever GoalPWM is now,
+    // which may itself be mid-ramp -- that is what makes a stream of poses
+    // continuous rather than a sequence of restarts.
+    for(int i = 0; i < 16; i++){
+      ROBODOG_RAMP_FROM[i] = GoalPWM[i];
+      ROBODOG_RAMP_TO[i]   = ROBODOG_STAGED[i];
+    }
+    ROBODOG_RAMP_START = millis();
+    ROBODOG_RAMP_MS    = ROBODOG_APPLY_MS;
+  } else {
+    robodogRampCancel();
+    for(int i = 0; i < 16; i++){GoalPWM[i] = ROBODOG_STAGED[i];}
+  }
   ROBODOG_HAS_STAGED = 0;
   // No GoalPosAll() here, on purpose -- see rule 1. The loop applies this
   // within STEP_DELAY, and it is the only thing allowed to drive the bus.
@@ -225,6 +302,7 @@ void serialCtrl(){
         debugMode = 0;
         gestureUD = 0;
         gestureLR = 0;
+        robodogRampCancel();   // RoboDog: an animation owns the servos from here
         if(val == 1){
           if(funcMode == 1){funcMode = 0;Serial.println("Steady OFF");}
           else if(funcMode == 0){funcMode = 1;Serial.println("Steady ON");}
@@ -238,6 +316,7 @@ void serialCtrl(){
       else if(docReceive["var"] == "move"){
         debugMode = 0;
         funcMode  = 0;
+        robodogRampCancel();   // RoboDog: a gait owns the servos from here
         digitalWrite(BUZZER, HIGH);
         switch(val){
           case 1: moveFB = 1; Serial.println("Forward");break;
@@ -313,6 +392,7 @@ void serialCtrl(){
 
       // Move every staged leg at once.
       else if(docReceive["var"] == "apply"){
+        robodogApplyMs(val);
         robodogApply();
       }
       // === end RoboDog ======================================================
@@ -413,6 +493,7 @@ void loop() {
   robotCtrl();
   allDataUpdate();
   wireDebugDetect();
+  robodogRampStep();        // RoboDog: carry GoalPWM towards the staged pose
   robodogWatchdogCheck();   // RoboDog: stop by ourselves if the host went away
 }
 

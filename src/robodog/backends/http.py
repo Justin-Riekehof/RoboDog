@@ -25,7 +25,9 @@ worth being able to overrule by hand.
 from __future__ import annotations
 
 import contextlib
+import http.client
 import json
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -112,6 +114,13 @@ STOCK_WATCHDOG: Final = 0.5
 # motion the length it was authored to be; it is coarser, not slower.
 SUGGESTED_TICK: Final = 0.1
 
+# Bounds on the ramp a pose asks the robot for. The floor keeps a burst of
+# poses from asking for a ramp so short it is a jump again; the ceiling keeps a
+# stalled sender from leaving the robot creeping towards a pose nobody wants
+# any more -- the firmware clamps too, further out.
+MIN_RAMP_MS: Final = 40
+MAX_RAMP_MS: Final = 400
+
 _STOP_RETRIES: Final = 2
 # A stop attempt over a link that is already gone must fail fast: the operator is
 # standing next to a moving robot, and a tool that hangs for half a minute
@@ -158,6 +167,8 @@ class HttpBackend:
         # What the robot last said its camera holds. None until asked, and on
         # firmware too old to answer.
         self.camera_state: dict[str, int] | None = None
+        # When the last pose went out, so the next one can say how long it has.
+        self._last_flush: float | None = None
         self._clock = clock
         # When the robot last heard anything from us, and whether it is counting.
         self._last_sent = clock()
@@ -165,11 +176,12 @@ class HttpBackend:
         # Bypass any system proxy: the robot is a link-local device on its own
         # access point, and routing 192.168.4.1 through a configured corporate
         # or VPN proxy would simply fail.
-        self._opener = (
-            opener
-            if opener is not None
-            else urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        )
+        # None means the pooled connection below. An opener is the escape
+        # hatch for anything needing urllib's semantics -- a proxy, a recorder
+        # -- and it gives up the held-open connection in exchange.
+        self._opener = opener
+        self._live: http.client.HTTPConnection | None = None
+        self._wire = threading.Lock()
         self._connected = False
         # True once a stop has been acknowledged and nothing has moved since.
         self._stop_confirmed = False
@@ -188,14 +200,64 @@ class HttpBackend:
         # Any accepted command feeds the firmware watchdog, so this is also the
         # moment the robot last heard from us -- see _feed_firmware_watchdog.
         self._last_sent = self._clock()
-        try:
-            with self._opener.open(url, timeout=timeout or self.timeout) as response:
-                body: bytes = response.read()
-                return body
-        except urllib.error.HTTPError as exc:
-            raise BackendError(f"{url} returned HTTP {exc.code}") from exc
-        except (urllib.error.URLError, OSError, TimeoutError) as exc:
-            raise BackendError(f"cannot reach robot at {url}: {exc}") from exc
+        if self._opener is not None:
+            try:
+                with self._opener.open(url, timeout=timeout or self.timeout) as response:
+                    body: bytes = response.read()
+                    return body
+            except urllib.error.HTTPError as exc:
+                raise BackendError(f"{url} returned HTTP {exc.code}") from exc
+            except (urllib.error.URLError, OSError, TimeoutError) as exc:
+                raise BackendError(f"cannot reach robot at {url}: {exc}") from exc
+        return self._get_pooled(url, path, timeout or self.timeout)
+
+    def _get_pooled(self, url: str, path: str, timeout: float) -> bytes:
+        """One connection, held open across requests.
+
+        A pose is a request, and a request used to be a fresh TCP connection: a
+        handshake to an ESP32 over Wi-Fi is a real part of the 94-140 ms a pose
+        costs, paid again on every one. Holding the connection open removes it
+        from all but the first.
+
+        Serialised deliberately. The robot answers one request at a time
+        whatever we do, and a shared connection is not thread-safe -- the teach
+        UI drives this from its ticker and its request handlers at once.
+
+        Retried once, and only on a connection error: an idle connection is the
+        server's to close, and finding out that it did is not a failure. A 500
+        is an answer and is never retried -- the robot refusing a command twice
+        would be the robot doing what it was told, twice.
+        """
+        with self._wire:
+            for attempt in (1, 2):
+                try:
+                    connection = self._connection(timeout)
+                    connection.request("GET", path)
+                    response = connection.getresponse()
+                    body = response.read()  # always, or the connection is unusable
+                    if response.status >= 400:
+                        raise BackendError(f"{url} returned HTTP {response.status}")
+                    return body
+                except (OSError, http.client.HTTPException) as exc:
+                    self._drop_connection()
+                    if attempt == 2:
+                        raise BackendError(f"cannot reach robot at {url}: {exc}") from exc
+            raise AssertionError("unreachable")  # pragma: no cover
+
+    def _connection(self, timeout: float) -> http.client.HTTPConnection:
+        if self._live is None or self._live.timeout != timeout:
+            self._drop_connection()
+            parsed = urllib.parse.urlsplit(self._base_url())
+            self._live = http.client.HTTPConnection(
+                parsed.hostname or self.host, parsed.port or 80, timeout=timeout
+            )
+        return self._live
+
+    def _drop_connection(self) -> None:
+        if self._live is not None:
+            with contextlib.suppress(OSError):
+                self._live.close()
+            self._live = None
 
     def _control(
         self,
@@ -347,6 +409,7 @@ class HttpBackend:
             with contextlib.suppress(BackendError):
                 self._control("watchdog", 0)
             self._watchdog_armed = False
+        self._drop_connection()
         # Skip the stop when we already know the robot is stopped: repeating it
         # over a dead link only doubles the time spent failing.
         if self._connected and not self._stop_confirmed:
@@ -520,7 +583,23 @@ class HttpBackend:
                 f"l{int(leg)}y={target.y:.2f}",
                 f"l{int(leg)}z={target.z:.2f}",
             ]
-        self._control("pose", 0, extra="&".join(query))
+        # `val` is how long the robot should take to get there. It ramps
+        # GoalPWM across that inside its own 4 ms loop, so a pose stops being a
+        # step: five poses a second from here become hundreds on the robot.
+        #
+        # The duration is the interval we are actually achieving, measured
+        # rather than assumed -- a link that slows down gets longer ramps by
+        # itself, and the robot is still travelling when the next pose lands,
+        # which is what keeps a stream continuous instead of a series of
+        # arrivals. First flush has nothing to measure and uses the nominal.
+        now = self._clock()
+        gap = now - self._last_flush if self._last_flush is not None else self.suggested_tick
+        self._last_flush = now
+        # Rounded, not truncated: truncation biases every ramp short, so the
+        # robot arrives a fraction early on each pose and stands still for the
+        # remainder -- which is the step, reintroduced a millisecond at a time.
+        span = min(max(round(gap * 1000), MIN_RAMP_MS), MAX_RAMP_MS)
+        self._control("pose", span, extra="&".join(query))
         # A pose ends a latched move, and the model has to know. The firmware
         # clears moveFB/moveLR when it applies one (`robodogApply`), because a
         # gait rewrites the servos every pass and would walk straight out of the

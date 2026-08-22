@@ -70,6 +70,8 @@ extern void robodogWatchdogFeed();
 extern int robodogCameraSet(const char *name, int val);
 extern void robodogCameraReport();
 extern int robodogCameraJson(char *out, size_t n);
+// RoboDog: how long the next pose should take, defined in WAVEGO.ino.
+extern void robodogApplyMs(int val);
 
 
 extern void getMAC(){
@@ -386,6 +388,7 @@ static esp_err_t cmd_handler(httpd_req_t *req){
   // 500 when any of the twelve values was missing -- a half-parsed pose must
   // not move anything.
   else if (!strcmp(variable, "pose")){
+    robodogApplyMs(val);
     if (!robodogPoseApplyParsed()){
       Serial.println("ROBODOG: pose rejected, need l1x..l4z");
       res = -1;

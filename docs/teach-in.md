@@ -77,9 +77,24 @@ While a preview runs, the page shows a busy state and rejects edits.
 **Pacing.** Every keyframe tick is a fresh pose, and over Wi-Fi every pose is a
 round trip of roughly 100 ms. The preview therefore ticks at whatever the
 backend says it can carry (`suggested_tick`): 50 Hz against mock and the twin,
-about 10 Hz on the real robot. A preview on hardware is *coarser* than the same
-routine in the twin, but it takes the same wall-clock time — pacing it faster
-than the link carries would not play it faster, only late.
+about 10 Hz on the real robot. A preview on hardware sends *fewer* poses than
+the same routine in the twin, but it takes the same wall-clock time — pacing it
+faster than the link carries would not play it faster, only late.
+
+**Smoothness does not come from the link.** Ten poses a second would be visibly
+stepped if each one were a jump, and they used to be: `GoalPosAll()` writes
+straight to the servo driver with no ramp, and the robot's own loop repeats that
+write every 4 ms — some 250 times a second, 24 of which carry nothing new. So a
+pose now names how long it may take, and the firmware travels there across that
+window instead of arriving at once. Five poses a second from the host become
+hundreds of servo positions on the robot.
+
+The duration is the interval actually being achieved, measured rather than
+assumed, so a link that slows down gets longer ramps by itself and the robot is
+still moving when the next pose lands. Interpolation is linear on purpose: the
+teach session already eases whole routines, and easing each segment on top of
+that would decelerate into every one — a pulse at 10 Hz, worse than the steps it
+replaces. Older firmware ignores the duration and jumps, exactly as before.
 
 ## Sequence tab: programming move sequences
 
