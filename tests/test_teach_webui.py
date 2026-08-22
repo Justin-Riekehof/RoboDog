@@ -1253,3 +1253,28 @@ def test_a_refused_lean_answers_with_the_reason(
     status, data = post(url, "lean", {"delta": 40})
     assert status == 200 and not data["ok"]
     assert "outside" in data["message"]
+
+
+def test_the_page_script_parses(tmp_path: Path) -> None:
+    """A syntax error in the page's JavaScript breaks the entire UI silently.
+
+    Every test here talks to the server, and the server serves the page happily
+    whatever is inside its <script> tag -- so a stray brace ships a teach-in
+    session where nothing at all responds, and the suite stays green. Skipped
+    where node is missing; CI runners have it.
+    """
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed; the page's script cannot be parsed here")
+
+    page = resources.files("robodog.teach").joinpath("ui.html").read_text(encoding="utf-8")
+    opening = page.index("<script>") + len("<script>")
+    script = page[opening : page.index("</script>", opening)]
+    path = tmp_path / "ui.js"
+    path.write_text(script, encoding="utf-8")
+
+    done = subprocess.run([node, "--check", str(path)], capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
