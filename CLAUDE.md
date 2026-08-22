@@ -47,6 +47,12 @@ Read in this order when context is needed:
   deterministic; I/O and clocks are injected — tests never sleep.
 - Commits: imperative subject, body explains why; reference milestone
   (`M0: ...`) when applicable. Do not commit/push unless the owner asks.
+- **Branch per task, land through a PR.** Several agents work this repo at
+  once, so `main` is not a workspace: when the owner asks for a commit, it
+  goes on its own branch and lands through a pull request, never straight
+  onto `main`. CI runs on every branch, so a push is how you find out within
+  minutes whether you broke something another agent depends on. Rebase on
+  `main` before asking for a merge.
 - **`--all-extras` is not optional** in that sync, despite the name: without it
   `matplotlib` and `mujoco` are uninstalled and the tests that assert the twin's
   geometry fail on a tree that is perfectly fine.
