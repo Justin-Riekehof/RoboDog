@@ -25,6 +25,7 @@ from robodog.errors import (
     RateLimitError,
 )
 from robodog.kinematics.constants import WALK_HEIGHT_MIN
+from robodog.kinematics.leg import leg_target_from_roll
 from robodog.safety.limits import LimitConfig
 from robodog.safety.supervisor import SafetySupervisor
 from tests.conftest import FakeClock
@@ -157,20 +158,29 @@ def test_limits_reject_out_of_range_leg_target(backend: MockBackend, clock: Fake
 def test_limits_reject_unreachable_but_in_box_target(
     backend: MockBackend, clock: FakeClock
 ) -> None:
-    """ASSUMPTIONS C10: inside the clamp box, outside the linkage's reach."""
+    """ASSUMPTIONS C10: inside every bound, outside the linkage's reach.
+
+    Roll is 0 and the in-plane reach is exactly at the maximum, so nothing here
+    is about the roll envelope (C13) -- the target clears all the box bounds and
+    is still rejected, which is what the reachability guard is for.
+    """
     supervisor = make_supervisor(backend, clock)
     supervisor.arm()
     with pytest.raises(LimitViolationError, match="unreachable"):
-        supervisor.dispatch(SetLegTarget(LegId.FRONT_LEFT, LegTarget(x=30.0, y=110.0, z=50.0)))
+        supervisor.dispatch(SetLegTarget(LegId.FRONT_LEFT, LegTarget(x=-45.0, y=110.0, z=19.15)))
     assert backend.command_log == []
 
 
 def test_limits_reject_self_inconsistent_target(backend: MockBackend, clock: FakeClock) -> None:
-    """ASSUMPTIONS C11: reachable, in-box, but the linkage would fight itself."""
+    """ASSUMPTIONS C11: reachable, in bounds, but the linkage would fight itself.
+
+    Roll 0, in-plane reach 88.5 mm -- comfortably inside every limit, so the
+    only thing rejecting this is the FK cross-check.
+    """
     supervisor = make_supervisor(backend, clock)
     supervisor.arm()
     with pytest.raises(LimitViolationError, match="self-inconsistent"):
-        supervisor.dispatch(SetLegTarget(LegId.FRONT_LEFT, LegTarget(x=-40.0, y=109.0, z=28.0)))
+        supervisor.dispatch(SetLegTarget(LegId.FRONT_LEFT, LegTarget(x=-45.0, y=88.5, z=19.15)))
     assert backend.command_log == []
 
 
@@ -240,3 +250,92 @@ def test_disarm_does_not_run_safe_sequence(backend: MockBackend, clock: FakeCloc
     supervisor.disarm()
     assert supervisor.state is SafetyState.DISARMED
     assert backend.state().drive == Drive(1, 0)  # untouched, unlike E-stop
+
+
+# --- Roll envelope (ASSUMPTIONS C13) -----------------------------------------
+
+
+@pytest.mark.parametrize("roll", [-27.0, -10.0, 0.0, 45.0, 90.0, 135.0])
+def test_limits_admit_the_measured_roll_range(
+    backend: MockBackend, clock: FakeClock, roll: float
+) -> None:
+    """The supervisor must admit everything the servo actually reaches.
+
+    Measured on the robot 2026-08-21: -27.0 to +135.0 deg (ASSUMPTIONS C13).
+    The original Cartesian (y, z) box cut this off at roughly +/-22 deg, because
+    rolling trades height against lateral offset along an arc and a box has the
+    wrong shape for an arc.
+    """
+    supervisor = make_supervisor(backend, clock)
+    supervisor.arm()
+    supervisor.dispatch(SetLegTarget(LegId.FRONT_LEFT, leg_target_from_roll(0.0, 95.0, roll)))
+    assert len(backend.command_log) == 1
+
+
+@pytest.mark.parametrize("roll", [-27.5, -40.0, 135.5, 170.0, 200.0])
+def test_limits_reject_roll_the_servo_cannot_reach(
+    backend: MockBackend, clock: FakeClock, roll: float
+) -> None:
+    """Beyond the measured stops, both ends.
+
+    170 deg is deliberately in this list: the leg reaches it when pushed by
+    hand, and the servo does not drive it. Back-driving a gearbox is not the
+    commandable range -- which is why C13 was measured rather than assumed.
+    """
+    supervisor = make_supervisor(backend, clock)
+    supervisor.arm()
+    with pytest.raises(LimitViolationError, match="roll"):
+        supervisor.dispatch(SetLegTarget(LegId.FRONT_LEFT, leg_target_from_roll(0.0, 95.0, roll)))
+    assert backend.command_log == []
+
+
+def test_roll_bounds_can_be_left_unmeasured(backend: MockBackend, clock: FakeClock) -> None:
+    """`None` means "not established" and enforces nothing -- for a second robot."""
+    cfg = LimitConfig(roll_min=None, roll_max=None)
+    supervisor = make_supervisor(backend, clock, limits=cfg)
+    supervisor.arm()
+    supervisor.dispatch(SetLegTarget(LegId.FRONT_LEFT, leg_target_from_roll(0.0, 95.0, 200.0)))
+    assert len(backend.command_log) == 1
+
+
+@pytest.mark.parametrize("roll", [-40.0, 180.0])
+def test_a_measured_roll_envelope_is_enforced(
+    backend: MockBackend, clock: FakeClock, roll: float
+) -> None:
+    """Once calibration fills the bounds in, they bite -- both ends."""
+    cfg = LimitConfig(roll_min=-30.0, roll_max=170.0)
+    supervisor = make_supervisor(backend, clock, limits=cfg)
+    supervisor.arm()
+    with pytest.raises(LimitViolationError, match="roll"):
+        supervisor.dispatch(SetLegTarget(LegId.FRONT_LEFT, leg_target_from_roll(0.0, 95.0, roll)))
+    assert backend.command_log == []
+
+
+def test_limits_reject_the_y_zero_firmware_defect(backend: MockBackend, clock: FakeClock) -> None:
+    """ASSUMPTIONS C6, newly reachable now that the roll range is open.
+
+    At exactly y == 0 -- roughly 78.6 deg of roll -- the firmware's wigglePlaneIK
+    takes a branch that omits the LINKAGE_W correction and returns a wildly
+    wrong angle; the commanded pose lands ~108 mm from the target. The old
+    height floor of 75 mm hid this by making y == 0 unreachable. Nothing but the
+    FK cross-check stands in front of it now, so pin it.
+    """
+    supervisor = make_supervisor(backend, clock)
+    supervisor.arm()
+    with pytest.raises(LimitViolationError, match="self-inconsistent"):
+        supervisor.dispatch(SetLegTarget(LegId.FRONT_LEFT, LegTarget(x=0.0, y=0.0, z=96.88)))
+    assert backend.command_log == []
+
+
+def test_limits_reject_over_and_under_reach_at_any_roll(
+    backend: MockBackend, clock: FakeClock
+) -> None:
+    """Reach is bounded in the leg plane, independently of how far it is rolled."""
+    supervisor = make_supervisor(backend, clock)
+    supervisor.arm()
+    for depth in (70.0, 120.0):
+        with pytest.raises(LimitViolationError, match="leg plane"):
+            supervisor.dispatch(
+                SetLegTarget(LegId.FRONT_LEFT, leg_target_from_roll(0.0, depth, 45.0))
+            )
+    assert backend.command_log == []

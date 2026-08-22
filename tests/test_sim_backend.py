@@ -8,6 +8,7 @@ makes the twin comparable to the real robot.
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -28,9 +29,11 @@ from robodog.api.types import (  # noqa: E402
     SetFunction,
 )
 from robodog.backends.sim import SimBackend  # noqa: E402
-from robodog.errors import BackendError  # noqa: E402
+from robodog.errors import BackendError, LimitViolationError  # noqa: E402
 from robodog.kinematics.constants import WALK_HEIGHT_MIN  # noqa: E402
+from robodog.kinematics.leg import leg_target_from_roll  # noqa: E402
 from robodog.kinematics.poses import stand_pose  # noqa: E402
+from robodog.safety.limits import LimitConfig, check_leg_target  # noqa: E402
 from robodog.sim.model import (  # noqa: E402
     _HIPS,
     JOINT_SUFFIXES,
@@ -273,3 +276,71 @@ def test_gestures_reach_the_twin(sim: SimBackend, clock: FakeClock) -> None:
     for _ in range(50):
         sim.tick(0.02)
     assert sim.state().leg_targets[LegId.FRONT_LEFT].y != pytest.approx(95.0, abs=0.5)
+
+
+# --- the model must be able to hold every pose the safety layer permits -------------
+
+
+def declared_ranges() -> dict[str, tuple[float, float]]:
+    """Joint ranges as the generated MJCF actually declares them."""
+    xml = build_mjcf()
+    return {
+        match.group(1): (float(match.group(2)), float(match.group(3)))
+        for match in re.finditer(
+            r'<joint name="([^"]+)"[^>]*range="(-?[\d.]+) (-?[\d.]+)"', xml, re.S
+        )
+    }
+
+
+def test_the_model_admits_the_whole_measured_roll_envelope() -> None:
+    """The MJCF once carried a hard-coded +/-60 deg roll stop while the measured
+    envelope was -27..+135 (ASSUMPTIONS C13). Poses beyond 60 deg were commanded,
+    accepted by the supervisor, and then silently clamped by the simulation --
+    the twin quietly disagreed with the robot about what the machine can do.
+    """
+    ranges = declared_ranges()
+    limits = LimitConfig()
+    assert limits.roll_min is not None and limits.roll_max is not None
+    for leg in LegId:
+        low, high = ranges[joint_name(leg, "roll")]
+        for roll in (limits.roll_min, 0.0, 60.0, 90.0, limits.roll_max):
+            target = leg_target_from_roll(16.0, 95.0, roll)
+            angle = leg_joint_angles(leg, target).roll
+            assert low <= angle <= high, (
+                f"{leg.name}: commanded roll {roll} deg needs {math.degrees(angle):.1f} deg, "
+                f"outside the model's {math.degrees(low):.1f}..{math.degrees(high):.1f}"
+            )
+
+
+def test_every_permitted_pose_fits_the_declared_joint_ranges() -> None:
+    """Sweep the permitted workspace: reach, roll and fore/aft, all four legs."""
+    ranges = declared_ranges()
+    limits = LimitConfig()
+    assert limits.roll_min is not None and limits.roll_max is not None
+    rolls = [limits.roll_min + i * (limits.roll_max - limits.roll_min) / 12 for i in range(13)]
+    depths = [limits.plane_depth_min, 90.0, limits.plane_depth_max]
+    xs = [-limits.x_abs_max, 0.0, limits.x_abs_max]
+    checked = 0
+    for leg in LegId:
+        for roll in rolls:
+            for depth in depths:
+                for x in xs:
+                    target = leg_target_from_roll(x, depth, roll)
+                    try:
+                        check_leg_target(target, limits)
+                    except LimitViolationError:
+                        continue  # the supervisor would refuse it; the model need not hold it
+                    angles = leg_joint_angles(leg, target)
+                    for suffix, angle in (
+                        ("roll", angles.roll),
+                        ("pitch", angles.pitch),
+                        ("knee", angles.knee),
+                    ):
+                        low, high = ranges[joint_name(leg, suffix)]
+                        assert low <= angle <= high, (
+                            f"{leg.name} {suffix}: {math.degrees(angle):.1f} deg outside "
+                            f"{math.degrees(low):.1f}..{math.degrees(high):.1f} for "
+                            f"x={x} depth={depth} roll={roll:.1f}"
+                        )
+                    checked += 1
+    assert checked > 100, "the sweep degenerated -- it is not checking anything"

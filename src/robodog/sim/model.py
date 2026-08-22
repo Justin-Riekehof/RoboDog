@@ -23,7 +23,7 @@ from pathlib import Path
 
 from robodog.api.types import LegId, LegTarget
 from robodog.errors import KinematicsError
-from robodog.kinematics.constants import LINKAGE_W
+from robodog.kinematics.constants import LINKAGE_W, ROLL_MAX_DEG, ROLL_MIN_DEG
 from robodog.kinematics.leg import wiggle_plane_ik
 
 MM = 0.001  # the model is metric; our constants are millimetres
@@ -125,17 +125,38 @@ def leg_joint_angles(leg: LegId, target: LegTarget) -> LegJointAngles:
     )
 
 
+# Slack on the simulated joint stops. The supervisor is what bounds a pose; the
+# model only has to be able to *hold* one, and a target sitting exactly on a
+# hinge limit fights it.
+_JOINT_RANGE_MARGIN_DEG = 2.0
+
+
+def roll_joint_range(leg: LegId) -> tuple[float, float]:
+    """Hinge range in radians for one leg's roll joint.
+
+    Derived from the measured envelope, not declared: `leg_joint_angles` mirrors
+    the roll for the right-hand legs, so their hinge range is the mirror image
+    of the left one. The envelope is asymmetric (ASSUMPTIONS C13), which is
+    exactly why a symmetric literal could hide two thirds of one end.
+    """
+    side = 1.0 if _HIPS[leg][1] > 0 else -1.0
+    low = math.radians(ROLL_MIN_DEG - _JOINT_RANGE_MARGIN_DEG) * side
+    high = math.radians(ROLL_MAX_DEG + _JOINT_RANGE_MARGIN_DEG) * side
+    return (low, high) if low < high else (high, low)
+
+
 def _leg_body(leg: LegId) -> str:
     hip_x, hip_y = _HIPS[leg]
     name = leg_name(leg)
     side = 1.0 if hip_y > 0 else -1.0
+    roll_low, roll_high = roll_joint_range(leg)
     # The leg plane sits LINKAGE_W outboard of the roll axis, exactly as in the
     # firmware's wiggle geometry -- without it the foot's lateral position is wrong.
     plane_offset = side * LINKAGE_W * MM
     return f"""
       <body name="{name}_hip" pos="{hip_x * MM:.5f} {hip_y * MM:.5f} 0">
         <joint name="{joint_name(leg, "roll")}" type="hinge" axis="1 0 0"
-               range="-1.05 1.05"/>
+               range="{roll_low:.5f} {roll_high:.5f}"/>
         <geom type="sphere" size="{8 * MM:.5f}" mass="0.005" rgba="0.3 0.3 0.35 1"/>
         <body name="{name}_thigh" pos="0 {plane_offset:.5f} 0">
           <joint name="{joint_name(leg, "pitch")}" type="hinge" axis="0 1 0"

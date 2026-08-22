@@ -29,6 +29,7 @@ from robodog.api.types import (
     SetFunction,
     SetJointAngles,
     SetLegTarget,
+    TrimServo,
 )
 from robodog.safety.limits import LimitConfig
 from robodog.safety.supervisor import DEFAULT_WATCHDOG_TIMEOUT, SafetySupervisor
@@ -151,6 +152,14 @@ class RobotClient:
 
     def led(self, color: int) -> None:
         self.send(Led(color))
+
+    def trim_servo(self, channel: int, offset: int) -> None:
+        """Nudge one servo by a relative PWM count (calibration only).
+
+        Goes through the supervisor like everything else, so the capability
+        gate and the per-command offset bound both apply. See `TrimServo`.
+        """
+        self.send(TrimServo(channel, offset))
 
     def buzzer(self, on: bool) -> None:
         self.send(Buzzer(on))

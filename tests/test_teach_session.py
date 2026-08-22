@@ -11,9 +11,10 @@ from robodog.api.types import LegId, SetLegTarget
 from robodog.backends.mock import MockBackend
 from robodog.errors import RoutineError
 from robodog.kinematics.constants import STAND_HEIGHT, WALK_HEIGHT_MIN
+from robodog.safety.limits import LimitConfig
 from robodog.teach.format import load_routine
 from robodog.teach.player import play_routine
-from robodog.teach.session import TeachSession, parse_legs
+from robodog.teach.session import TeachSession, axis_value, parse_legs
 from tests.conftest import FakeClock
 
 
@@ -75,10 +76,53 @@ def test_rejected_jog_moves_nothing(session: TeachSession, backend: MockBackend)
 def test_unreachable_but_in_box_target_is_rejected(session: TeachSession) -> None:
     """The C10 guard works during teaching, not just during playback."""
     session.select((LegId.FRONT_LEFT,))
-    assert session.set_axis("z", 50.0) == {}  # fine at stand height
-    errors = session.set_axis("y", 110.0)  # (16, 110, 50): in the box, out of reach
+    assert session.set_axis("roll", 0.0) == {}  # both fine on their own
+    assert session.set_axis("depth", 110.0) == {}
+    # Reaching full depth straight down is fine; doing it far to the rear is
+    # past the linkage. Every bound still passes, so only the reachability
+    # guard can refuse it.
+    errors = session.set_axis("x", -45.0)
     assert "unreachable" in errors[LegId.FRONT_LEFT]
-    assert session.targets[LegId.FRONT_LEFT].y == pytest.approx(95.0)
+    assert session.targets[LegId.FRONT_LEFT].x == pytest.approx(16.0)
+
+
+def test_roll_axis_sweeps_the_full_envelope(session: TeachSession) -> None:
+    """Teaching can use the leg's measured roll freedom (ASSUMPTIONS C13)."""
+    session.select((LegId.FRONT_LEFT,))
+    for roll in (-27.0, 0.0, 45.0, 90.0, 135.0):
+        assert session.set_axis("roll", roll) == {}
+        assert axis_value(session.targets[LegId.FRONT_LEFT], "roll") == pytest.approx(roll)
+
+
+def test_roll_beyond_a_measured_envelope_is_refused_and_leaves_the_leg_put(
+    backend: MockBackend, clock: FakeClock
+) -> None:
+    """With bounds filled in by calibration, teaching honours them.
+
+    The default config leaves roll unbounded on purpose (ASSUMPTIONS C13), so
+    this test supplies an envelope to check the enforcement path itself.
+    """
+    client = RobotClient(backend, limits=LimitConfig(roll_min=-30.0, roll_max=170.0), clock=clock)
+    client.connect()
+    client.arm()
+    session = TeachSession(client, name="test-roll")
+    assert session.start() == {}
+    session.select((LegId.FRONT_LEFT,))
+    assert session.set_axis("roll", 60.0) == {}
+    errors = session.set_axis("roll", 175.0)
+    assert "roll" in errors[LegId.FRONT_LEFT]
+    assert axis_value(session.targets[LegId.FRONT_LEFT], "roll") == pytest.approx(60.0)
+
+
+def test_rolling_preserves_reach_and_fore_aft(session: TeachSession) -> None:
+    """Roll is one joint: it must not quietly change how far the leg reaches."""
+    session.select((LegId.FRONT_LEFT,))
+    before = session.targets[LegId.FRONT_LEFT]
+    depth_before = axis_value(before, "depth")
+    assert session.set_axis("roll", 70.0) == {}
+    after = session.targets[LegId.FRONT_LEFT]
+    assert axis_value(after, "depth") == pytest.approx(depth_before)
+    assert after.x == pytest.approx(before.x)
 
 
 def test_partial_failure_moves_the_valid_legs(session: TeachSession) -> None:

@@ -29,6 +29,7 @@ from robodog.api.types import (
     SetJointAngles,
     SetLegTarget,
     Telemetry,
+    TrimServo,
 )
 from robodog.errors import BackendError
 from robodog.kinematics.constants import GESTURE_OFFSET_MAX, GESTURE_SPEED
@@ -55,6 +56,7 @@ class MockBackend:
             Capability.BODY_POSE,
             Capability.LEG_TARGET,
             Capability.JOINT_ANGLES,
+            Capability.SERVO_TRIM,
             Capability.TELEMETRY,
         }
     )
@@ -68,6 +70,9 @@ class MockBackend:
         self._gait_cycle_duration = gait_cycle_duration
         self._gait_type = gait_type
         self._connected = False
+        # Cumulative relative PWM per channel, so a calibration sweep can be
+        # rehearsed against the mock before it is run on the robot.
+        self.servo_trim: dict[int, int] = {}
         self._t = 0.0
         self._drive = Drive(0, 0)
         self._gait_phase = 0.0
@@ -114,6 +119,11 @@ class MockBackend:
             case SetJointAngles(leg=leg, angles=angles):
                 self._leg_targets[leg] = leg_fk(angles)
                 self._joint_overrides[leg] = angles
+            case TrimServo(channel=channel, offset=offset):
+                # No angle semantics here: the firmware's trim is relative PWM,
+                # and the mock only accumulates it so a calibration run can be
+                # rehearsed without the robot.
+                self.servo_trim[channel] = self.servo_trim.get(channel, 0) + offset
             case Led() | Buzzer():
                 pass  # recorded in command_log only
 

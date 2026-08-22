@@ -13,6 +13,7 @@ from robodog.api.types import (
     SetFunction,
     SetJointAngles,
     SetLegTarget,
+    TrimServo,
 )
 
 
@@ -30,6 +31,8 @@ def required_capability(command: Command) -> Capability:
             return Capability.LEG_TARGET
         case SetJointAngles():
             return Capability.JOINT_ANGLES
+        case TrimServo():
+            return Capability.SERVO_TRIM
 
 
 def parse_capability(name: str) -> Capability:

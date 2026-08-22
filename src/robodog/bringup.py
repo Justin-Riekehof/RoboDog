@@ -248,22 +248,37 @@ def steps() -> tuple[Step, ...]:
             motion=True,
         ),
         Step(
+            key="walk_for_watchdog",
+            assumption="B9/D10",
+            title="Start the walk the watchdog test observes",
+            instruction=(
+                "A forward walk is started from HERE, not from the web UI. Two "
+                "reasons: `move` also clears any latched funcMode, and the next "
+                "step must not be answered about a robot that never walked.\n"
+                "The step before this one left the firmware repeating "
+                "middlePos (ASSUMPTIONS D11), which looks like straight legs "
+                "and stays that way -- exactly what a stopped robot looks like."
+            ),
+            question="Is the robot WALKING right now?",
+            action=_drive_forward_briefly,
+            motion=True,
+        ),
+        Step(
             key="no_watchdog",
             assumption="B9/D10",
             title="No link watchdog in the firmware",
             instruction=(
-                "SAFETY TEST, do this with the robot lifted or on a stand, and "
-                "read it fully first:\n"
-                "  1. Start a forward walk from the robot's own web UI.\n"
-                "  2. Switch off your PC's Wi-Fi without stopping the robot.\n"
-                "  3. Watch what the robot does -- it has no watchdog, so it "
-                "should just keep going.\n"
-                "  4. Stop it from the web UI (or cut its power), then switch "
+                "SAFETY TEST, read it fully first. The robot is walking now.\n"
+                "  1. Switch off your PC's Wi-Fi without stopping the robot.\n"
+                "  2. Watch what the robot does -- the stock firmware has no "
+                "watchdog, so it should just keep going.\n"
+                "  3. Stop it from the web UI (or cut its power), then switch "
                 "your Wi-Fi back ON and rejoin the robot's access point.\n"
                 "Answer only once you are reconnected: this tool needs the link "
                 "to put the robot into its safe state at the end."
             ),
             question="Did the robot keep walking after the link was gone?",
+            interprets="walk_for_watchdog",
         ),
     )
 

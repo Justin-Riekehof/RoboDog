@@ -183,8 +183,11 @@ def wiggle_point_to_3d(point: tuple[float, float], wiggle_deg: float) -> tuple[f
     """Map a leg-plane point (x, depth) into the 3-D leg frame.
 
     The leg plane sits LINKAGE_W outboard of the hip wiggle axis and is
-    rotated around it by the wiggle angle. Valid for the y > 0 half-space
-    (the only one the firmware's IK branch covers in practice).
+    rotated around it by the wiggle angle. Valid across the full roll range,
+    including the y < 0 half-space that large roll angles reach: the firmware's
+    IK has a branch for it and fk(ik(p)) round-trips exactly there
+    (ASSUMPTIONS C13). The one exception is y == 0 exactly, where the firmware
+    takes a defective branch -- see :func:`wiggle_plane_ik` and ASSUMPTIONS C6.
     """
     phi = math.radians(wiggle_deg)
     px, depth = point
@@ -213,3 +216,34 @@ def leg_points_3d(angles: LegServoAngles) -> list[tuple[float, float, float]]:
         points.foot,
     )
     return [wiggle_point_to_3d(p, angles.wiggle) for p in chain]
+
+
+# --- Roll decomposition (ours, not in the firmware) ---------------------------
+
+
+def leg_roll_and_depth(target: LegTarget) -> tuple[float, float]:
+    """Split a foot target into (roll angle in degrees, reach in the leg plane).
+
+    The leg linkage is planar and the wiggle servo rotates that whole plane
+    about the fore-aft axis -- which is what an operator sees as the leg's roll.
+    Height and lateral offset are therefore *not* independent: rolling trades
+    one for the other along an arc. Limits and UI controls work on this
+    decomposition instead of on the Cartesian pair, because a box in (y, z) has
+    the wrong shape for an arc (ASSUMPTIONS C13).
+
+    Inverse of :func:`leg_target_from_roll`.
+    """
+    try:
+        roll, depth = wiggle_plane_ik(LINKAGE_W, target.z, target.y)
+    except (ValueError, ZeroDivisionError) as exc:
+        raise KinematicsError(f"leg target {target} has no roll decomposition: {exc}") from exc
+    return roll, depth
+
+
+def leg_target_from_roll(x: float, depth: float, roll_deg: float) -> LegTarget:
+    """Foot target from fore-aft position, in-plane reach and roll angle.
+
+    Inverse of :func:`leg_roll_and_depth`.
+    """
+    _px, y, z = wiggle_point_to_3d((x, depth), roll_deg)
+    return LegTarget(x=x, y=y, z=z)

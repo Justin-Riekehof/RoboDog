@@ -21,6 +21,17 @@ LINKAGE_W = 19.15  # wiggle servo to leg-linkage plane
 # Workspace / gait tuning (ServoCtrl.h L58-L72, ASSUMPTIONS C4).
 WALK_HEIGHT_MAX = 110.0
 WALK_HEIGHT_MIN = 75.0
+
+# Roll (wiggle) envelope of the mechanism, MEASURED on the robot 2026-08-21
+# with `robodog calibrate-roll` (ASSUMPTIONS C13). This is a property of the
+# machine, so everything that has to agree about how far a leg can swing reads
+# it from here: the safety limits (policy, which may be tightened at runtime)
+# and the MJCF model (the simulated machine, which must be able to express
+# every pose the policy permits). A literal in either of those is how the two
+# drift apart -- and they did, until the model's hard-coded +/-60 deg silently
+# swallowed a third of the measured range.
+ROLL_MIN_DEG = -27.0
+ROLL_MAX_DEG = 135.0
 WALK_HEIGHT = 95.0
 WALK_LIFT = 9.0
 WALK_RANGE = 40.0

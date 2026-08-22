@@ -1,0 +1,25 @@
+# Measured with `robodog calibrate-servos`. Offsets are PWM counts from
+# the firmware's middle position to the joint's zero angle; see
+# docs/calibration.md and ASSUMPTIONS D8.
+schema: robodog.calibration/v1
+robot: wavego-standard-basic
+measured: 2026-08-21
+reference: upper arms vertical, leg plane vertical
+resolution: 5
+offsets:
+  front_left:
+    fore: 0
+    back: 0
+    wiggle: 15
+  hind_left:
+    fore: 20
+    back: 0
+    wiggle: 0
+  front_right:
+    fore: 10
+    back: 0
+    wiggle: -10
+  hind_right:
+    fore: 10
+    back: 0
+    wiggle: 0

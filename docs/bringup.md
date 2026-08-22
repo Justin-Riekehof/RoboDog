@@ -96,6 +96,69 @@ The firmware's trim facility is reachable over Wi-Fi and needs **no G12 jumper**
 Trimming puts the firmware into debug mode, which suspends gait control; any
 `move` or `funcMode` command returns it to normal operation.
 
+## Measuring a leg's roll range
+
+```console
+uv run robodog calibrate-roll --backend mock --legs front_left   # rehearse first
+uv run robodog calibrate-roll --legs front_left                  # then the robot
+uv run robodog calibrate-roll --legs front_left --direction down # one end only
+```
+
+How far the wiggle servo can actually swing a leg under power is unknown
+(ASSUMPTIONS C13). Moving an unpowered leg by hand back-drives the gearbox and
+proves nothing about the commandable range, so this asks the robot: it nudges
+the wiggle servo in small PWM steps and after each one you say whether the leg
+still followed. Coarse steps (20 counts, ~9°) find the neighbourhood, fine steps
+(2 counts, ~0.9°) find the edge, and the servo is backed off the instant it
+stops following so it never sits stalled. The result is a dated report under
+`docs/bringup/` with the measured counts, the angles they imply, and a
+`LimitConfig(...)` line to carry into the code.
+
+**The run opens by straightening every leg.** `funcMode 9` puts each *servo* at
+its middle PWM count, which geometrically is a nearly vertical, fully extended
+leg reaching ~115 mm — about 5 mm past the walking envelope, with the body
+sitting higher than usual (ASSUMPTIONS C12). It looks alarming and it is
+correct; the two coaxial cranks at angle 0 are extended, not straining. Confirm
+it and carry on. It is also the pose with the longest lever arm on the wiggle
+servo, so whatever range you measure is a conservative lower bound.
+
+**Rehearse it against the mock first.** `--backend mock` walks the identical
+procedure with no robot attached, so the first time you meet the prompts is not
+also the first time a servo is moving.
+
+Three properties worth knowing:
+
+- **The firmware is taken out of its middle-position loop first.** `funcMode 9`
+  never clears itself (ASSUMPTIONS D11), so the control loop keeps rewriting
+  every servo; a trim sent into that is overwritten and the leg does not move.
+  A zero-offset trim suspends the loop without moving anything, and the sweep
+  only starts after it.
+- **Stopping keeps what was measured.** Pressing `s` ends the sweep and then
+  asks the one thing only you know: was the leg against its limit? Either way
+  the counts travelled so far go into the report — an interrupted sweep is
+  still evidence, and re-driving a servo into a stop to re-learn a known number
+  is pure wear. Use `--direction up`/`down` to measure the other end afterwards.
+- **A first step that does not move is flagged, not believed.** From the middle
+  position that cannot be an end stop, so the direction is recorded with a note
+  and excluded from the suggested limits.
+
+
+- **`sset` is never sent.** Your stored servo calibration is untouched; the run
+  always ends by returning every servo to its middle position.
+- **Keep the fine step visible.** 2 counts is 0.9°, roughly 1.8 mm at the foot
+  — below what you can reliably see, and answers at that scale are guesses that
+  produce a confidently wrong range. The default is 5 counts (2.25°) and
+  anything smaller prints a warning.
+- **The per-command trim bound is the brake.** One command can move a servo at
+  most `LimitConfig.servo_trim_offset_max` counts, so a sweep steps toward a
+  limit rather than jumping at it. Raising `--coarse-step` above that bound does
+  not widen it — the supervisor refuses the command.
+
+What the measured numbers are *not*: they are the free-air range on a stand.
+Under the robot's own weight, and with legs able to reach the body and each
+other, the usable range is smaller — and **self-collision is not checked
+anywhere** (C13).
+
 ## Troubleshooting
 
 - **`cannot reach robot`** — the tooling diagnoses this itself: it reports which

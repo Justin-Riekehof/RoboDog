@@ -18,7 +18,7 @@ class Capability(Enum):
 
     The split follows what the stock firmware actually offers per transport:
     Wi-Fi/HTTP has locomotion only, while serial adds gestures and peripherals
-    (ASSUMPTIONS D2). Everything below LOCOMOTION needs custom firmware (M5).
+    (ASSUMPTIONS D2). Everything below LOCOMOTION needs custom firmware (M4).
     """
 
     LOCOMOTION = auto()  # drive + function modes; the common core of both transports
@@ -146,7 +146,36 @@ class Buzzer:
     on: bool
 
 
-Command = Drive | SetFunction | Gesture | SetBodyPose | SetLegTarget | SetJointAngles | Led | Buzzer
+@dataclass(frozen=True, slots=True)
+class TrimServo:
+    """Nudge one servo by a relative PWM count (firmware `sconfig`).
+
+    This is the stock firmware's *calibration* facility, not a control channel:
+    it is the only way to move a single joint over Wi-Fi, and it speaks PWM
+    counts rather than angles (ASSUMPTIONS D5). It exists as a command so that
+    it passes the safety supervisor like everything else -- the per-command
+    offset bound is what keeps a calibration sweep from slamming a servo into
+    its end stop in one go.
+
+    Deliberately absent: the firmware's `sset`, which writes a servo's middle
+    position to NVS permanently. Nothing in this codebase routes it.
+    """
+
+    channel: int
+    offset: int
+
+
+Command = (
+    Drive
+    | SetFunction
+    | Gesture
+    | SetBodyPose
+    | SetLegTarget
+    | SetJointAngles
+    | Led
+    | Buzzer
+    | TrimServo
+)
 
 
 # --- State -------------------------------------------------------------------

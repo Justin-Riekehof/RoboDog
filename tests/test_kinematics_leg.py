@@ -20,6 +20,8 @@ from robodog.kinematics.leg import (
     leg_fk,
     leg_ik,
     leg_points_3d,
+    leg_roll_and_depth,
+    leg_target_from_roll,
     planar_fk,
     simple_linkage_ik,
     single_leg_plane_ik,
@@ -180,3 +182,41 @@ def test_leg_servo_pwm_covers_three_channels() -> None:
     pwm = leg_servo_pwm(LegId.FRONT_LEFT, LegServoAngles(0.0, 10.0, -10.0))
     assert set(pwm) == {8, 9, 10}
     assert all(200 < value < 500 for value in pwm.values())
+
+
+# --- Roll decomposition (ASSUMPTIONS C13) ------------------------------------
+
+
+@pytest.mark.parametrize("roll", [-30.0, 0.0, 45.0, 90.0, 135.0, 170.0])
+@pytest.mark.parametrize("depth", [WALK_HEIGHT_MIN, 95.0, WALK_HEIGHT_MAX])
+def test_roll_decomposition_round_trips(roll: float, depth: float) -> None:
+    """(roll, depth) -> target -> (roll, depth) is exact across the range."""
+    target = leg_target_from_roll(0.0, depth, roll)
+    back_roll, back_depth = leg_roll_and_depth(target)
+    assert back_roll == pytest.approx(roll, abs=1e-9)
+    assert back_depth == pytest.approx(depth, abs=1e-9)
+
+
+@pytest.mark.parametrize("roll", [-30.0, 0.0, 90.0, 170.0])
+def test_ik_is_exact_across_the_whole_roll_range(roll: float) -> None:
+    """Rolling the leg plane does not disturb the in-plane solution.
+
+    The wiggle servo takes the whole roll; the two coaxial servos hold still.
+    This is what makes the wide roll envelope safe to allow: it is the one
+    joint moving, and fk(ik(target)) reproduces the foot exactly.
+    """
+    target = leg_target_from_roll(WALK_EXTENDED_X, 95.0, roll)
+    angles = leg_ik(target)
+    assert angles.wiggle == pytest.approx(roll, abs=1e-9)
+    upright = leg_ik(leg_target_from_roll(WALK_EXTENDED_X, 95.0, 0.0))
+    assert angles.fore == pytest.approx(upright.fore)
+    assert angles.back == pytest.approx(upright.back)
+    actual = leg_fk(angles)
+    assert (actual.x, actual.y, actual.z) == pytest.approx((target.x, target.y, target.z))
+
+
+def test_roll_zero_puts_the_foot_one_wiggle_arm_outboard() -> None:
+    """At roll 0 the leg plane hangs straight down, LINKAGE_W outboard."""
+    target = leg_target_from_roll(0.0, 95.0, 0.0)
+    assert target.y == pytest.approx(95.0)
+    assert target.z == pytest.approx(LINKAGE_W)

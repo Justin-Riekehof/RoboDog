@@ -320,3 +320,36 @@ def test_every_step_references_an_assumption() -> None:
 def test_step_keys_are_unique() -> None:
     keys = [s.key for s in steps()]
     assert len(keys) == len(set(keys))
+
+
+def test_the_watchdog_test_observes_a_walk_that_provably_started() -> None:
+    """The 2026-08-22 run answered "no, it stopped" about a robot that had never
+    started: the preceding funcMode=9 step leaves the firmware repeating
+    middlePos (ASSUMPTIONS D11), which looks exactly like a stopped robot. An
+    answer like that would refute D10 -- the assumption the whole safety posture
+    rests on -- on the strength of a test that did not run.
+    """
+    by_key = {step.key: step for step in steps()}
+    walk, watchdog = by_key["walk_for_watchdog"], by_key["no_watchdog"]
+
+    # The walk is commanded by us, so "it was walking" is not hearsay.
+    assert walk.action is not None and walk.motion
+    assert "WALKING" in walk.question
+
+    # And the observation is void if that walk did not happen.
+    assert watchdog.interprets == "walk_for_watchdog"
+    order = [step.key for step in steps()]
+    assert order.index("walk_for_watchdog") < order.index("no_watchdog")
+    assert order.index("middle_pos") < order.index("walk_for_watchdog")
+
+
+def test_an_unstarted_walk_makes_the_watchdog_answer_void() -> None:
+    """Skipping the walk must yield 'skipped', never 'differs' -- an answer
+    about a robot that never moved must not be able to refute D10."""
+    transcript: list[str] = []
+    # Skip every step, then answer the watchdog question as if the robot had
+    # stopped by itself: the answer that would otherwise read as a refutation.
+    report, _asker = run(["yes"] + ["s"] * 40, transcript)
+    watchdog = next(r for r in report.results if r.step.key == "no_watchdog")
+    assert watchdog.outcome == "skipped"
+    assert "walk_for_watchdog" in watchdog.note
