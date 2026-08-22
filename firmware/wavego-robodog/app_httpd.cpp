@@ -66,6 +66,9 @@ extern int CurrentPWM[16];
 // RoboDog: link watchdog, defined in WAVEGO.ino.
 extern unsigned long ROBODOG_WATCHDOG_MS;
 extern void robodogWatchdogFeed();
+// RoboDog: camera image quality, defined further down in this file.
+extern int robodogCameraSet(const char *name, int val);
+extern void robodogCameraReport();
 
 
 extern void getMAC(){
@@ -352,6 +355,19 @@ static esp_err_t cmd_handler(httpd_req_t *req){
   else if (!strcmp(variable, "ping")){
   }
 
+  // === RoboDog: camera parameters, cam_<name> ==============================
+  // The same names the serial transport takes -- robodogCameraSet has the
+  // list. 404 rather than a silent success for a name that does not exist:
+  // a typo in a tuning session should say so, not look like a sensor that
+  // ignores the setting.
+  else if (!strncmp(variable, "cam_", 4)){
+    if (!robodogCameraSet(variable + 4, val)){
+      httpd_resp_send_404(req);
+      return ESP_FAIL;
+    }
+  }
+  // === end RoboDog =========================================================
+
   // === RoboDog: a whole pose, staged and applied in one request ============
   // 500 when any of the twelve values was missing -- a half-parsed pose must
   // not move anything.
@@ -455,6 +471,245 @@ void startCameraServer(){
 
 
 
+// === RoboDog: camera image quality =========================================
+// What upstream leaves on the table. The camera is set up once, at
+// FRAMESIZE_QVGA with `jpeg_quality = 63` -- the *worst* value on the 0-63
+// scale, where lower is better -- and the sensor itself is then touched
+// exactly once, for `set_saturation(s, 2)`. Everything else keeps the driver's
+// defaults. F2's two reference frames show what that produces: 320x240 with
+// visible block artefacts, oversaturated in light, green and noisy in the dark.
+//
+// Three different things limit that picture, and they are worth keeping apart,
+// because only the first one is what "exposure" means:
+//
+//   Exposure  the OV2640's auto-exposure aims low and its gain ceiling is
+//             conservative, so an indoor scene comes out dark. `ae_level`
+//             shifts what the AEC aims for, `aec2` adds the DSP's own longer
+//             integration, `gainceiling` allows more analogue gain.
+//   Detail    `jpeg_quality` is compression, not exposure. At 63 the sensor's
+//             output is thrown away after being exposed and before it reaches
+//             the network, and no amount of exposure tuning brings it back.
+//   Colour    white balance, gamma and lens correction are all off by default
+//             in this driver generation, and cost nothing to switch on.
+//
+// None of it is free. Longer integration is motion blur on a robot that walks,
+// more gain is more noise, and a bigger frame is a bigger JPEG -- which the
+// serial `snap` path pays for in seconds at 115200 baud. So the values below
+// aim at "clearly better indoors", not at the sensor's maximum, and every one
+// of them moves at runtime: see robodogCameraSet, reachable as `cam_<name>`
+// over both transports. See ASSUMPTIONS F4, F5 and F6.
+
+// How far up `cam_size` may go. The frame buffer is allocated once, by
+// esp_camera_init, for the frame size it is given -- and set_framesize only
+// writes sensor registers afterwards, it never grows that buffer. Asking for
+// more than we booted with is how you end up with no image at all, which would
+// look exactly like the camera fault F2 turned out not to be. Recorded at
+// bring-up, enforced in robodogCameraSet.
+static framesize_t ROBODOG_CAM_MAX_SIZE = FRAMESIZE_QVGA;
+
+// The sensor does not act on a register write immediately: the frame already
+// in flight was exposed under the old settings, and the AEC needs a few more
+// to converge. Whoever changes a value and grabs a picture right away would
+// otherwise measure the setting *before* it and conclude nothing happened. So
+// a change is remembered here, and the next snap drops that many frames first.
+// Only after a change -- an unchanged camera costs nothing.
+static int ROBODOG_CAM_SETTLE = 4;
+static bool ROBODOG_CAM_CHANGED = false;
+
+// Not every setter exists. The OV2640 driver of this core generation leaves
+// some of these function pointers null -- sharpness and denoise are the known
+// ones -- and calling through a null pointer reboots the ESP32. It would do it
+// inside webServerInit, before Wi-Fi is up, with nothing left to report it
+// with. So every sensor write in this file goes through here.
+#define ROBODOG_CAM_SET(cam, setter, value)                                   \
+  do {                                                                        \
+    if ((cam) && (cam)->setter) { (cam)->setter((cam), (value)); }             \
+  } while (0)
+
+// Our defaults, applied after a successful init and by `cam_reset`.
+static void robodogCameraTune(sensor_t *s){
+  if (!s) { return; }
+
+  // Exposure: keep it automatic -- a robot that walks from a window into a
+  // corridor cannot hold one fixed exposure -- but aim it higher, and let the
+  // AEC use more gain and the DSP's longer integration to get there.
+  ROBODOG_CAM_SET(s, set_exposure_ctrl, 1);   // AEC on
+  ROBODOG_CAM_SET(s, set_aec2,          1);   // plus the DSP's own AEC
+  ROBODOG_CAM_SET(s, set_ae_level,      2);   // aim at the top of -2..+2
+  ROBODOG_CAM_SET(s, set_gain_ctrl,     1);   // AGC on
+  // 16X, not the driver's 2X and not the sensor's 128X: the ceiling only
+  // matters in the dark, where 128X trades the noise floor for brightness.
+  if (s->set_gainceiling) { s->set_gainceiling(s, GAINCEILING_16X); }
+
+  // Colour and correction. All of these are what the vendor's own web UI
+  // switches on, and none of them costs frame rate.
+  ROBODOG_CAM_SET(s, set_whitebal, 1);        // AWB
+  ROBODOG_CAM_SET(s, set_awb_gain, 1);        // AWB gain: the green cast
+  ROBODOG_CAM_SET(s, set_wb_mode,  0);        // auto, not a lighting preset
+  ROBODOG_CAM_SET(s, set_raw_gma,  1);        // gamma: the shadows
+  ROBODOG_CAM_SET(s, set_lenc,     1);        // lens correction: the corners
+  ROBODOG_CAM_SET(s, set_bpc,      1);        // bad pixel correction
+  ROBODOG_CAM_SET(s, set_wpc,      1);        // white pixel correction
+  ROBODOG_CAM_SET(s, set_dcw,      1);        // downsize with interpolation
+
+  // Upstream's `set_saturation(s, 2)` is the top of the scale, and it is why
+  // the reference frame's blues bloom. Neutral, and let the AWB do the work.
+  ROBODOG_CAM_SET(s, set_saturation, 0);
+  ROBODOG_CAM_SET(s, set_contrast,   0);
+  ROBODOG_CAM_SET(s, set_brightness, 0);      // real exposure first, lift later
+
+  // Compression. 63 is the worst the scale has; 10 is what Espressif's own
+  // camera example uses whenever there is memory for it.
+  ROBODOG_CAM_SET(s, set_quality, 10);
+
+  ROBODOG_CAM_CHANGED = true;
+}
+
+// Called on the config *before* esp_camera_init: that is the only moment the
+// frame buffer size can still be chosen. PSRAM decides how much there is to
+// choose from, and whether this unit has any is not documented anywhere we
+// trust -- so it is asked, not assumed. See ASSUMPTIONS F4.
+extern void robodogCameraConfig(camera_config_t *config){
+  if (psramFound()) {
+    // Room for a second frame buffer, so a browser holding the stream no
+    // longer blocks snap the way fb_count = 1 does.
+    config->frame_size   = FRAMESIZE_SVGA;    // 800x600
+    config->jpeg_quality = 10;
+    config->fb_count     = 2;
+  } else {
+    // Internal DRAM only, shared with Wi-Fi, the OLED buffer and the servo
+    // tables. VGA is four times the vendor's QVGA and still fits; going
+    // higher here is what makes init fail with ESP_ERR_NO_MEM.
+    config->frame_size   = FRAMESIZE_VGA;     // 640x480
+    config->jpeg_quality = 12;
+    config->fb_count     = 1;
+  }
+  ROBODOG_CAM_MAX_SIZE = config->frame_size;
+}
+
+// Called with whatever esp_camera_init returned. A bigger frame is a want; a
+// working camera is a need -- so if the buffer did not fit, fall back to the
+// vendor's own frame size rather than leave the robot blind. Returns the error
+// the caller should go on reporting.
+extern esp_err_t robodogCameraStart(camera_config_t *config, esp_err_t err){
+  if (err != ESP_OK) {
+    Serial.print("ROBODOG: camera init 0x");
+    Serial.print(err, HEX);
+    Serial.println(" at our frame size -- retrying at the vendor's QVGA");
+    // The init failed, so the driver holds nothing; deinit answers
+    // ESP_ERR_INVALID_STATE in that case and changes nothing.
+    esp_camera_deinit();
+    config->frame_size   = FRAMESIZE_QVGA;
+    config->jpeg_quality = 12;
+    config->fb_count     = 1;
+    ROBODOG_CAM_MAX_SIZE = config->frame_size;
+    err = esp_camera_init(config);
+  }
+  if (err == ESP_OK) {
+    robodogCameraTune(esp_camera_sensor_get());
+  }
+  return err;
+}
+
+// Drop the frames that were still exposed under the previous settings.
+extern void robodogCameraSettle(){
+  if (!ROBODOG_CAM_CHANGED) { return; }
+  ROBODOG_CAM_CHANGED = false;
+  for (int i = 0; i < ROBODOG_CAM_SETTLE; i++) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) { return; }
+    esp_camera_fb_return(fb);
+  }
+}
+
+// One line of key=value, so a tuning session over the serial console can read
+// what is in the sensor rather than what it believes it asked for.
+extern void robodogCameraReport(){
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) { Serial.println("ROBODOG: cam absent"); return; }
+  camera_status_t *st = &s->status;
+  Serial.print("ROBODOG: cam size=");   Serial.print((int)st->framesize);
+  Serial.print("/");                    Serial.print((int)ROBODOG_CAM_MAX_SIZE);
+  Serial.print(" quality=");            Serial.print((int)st->quality);
+  Serial.print(" ae_level=");           Serial.print((int)st->ae_level);
+  Serial.print(" aec=");                Serial.print((int)st->aec);
+  Serial.print(" aec2=");               Serial.print((int)st->aec2);
+  Serial.print(" aec_value=");          Serial.print((int)st->aec_value);
+  Serial.print(" agc=");                Serial.print((int)st->agc);
+  Serial.print(" agc_gain=");           Serial.print((int)st->agc_gain);
+  Serial.print(" gainceiling=");        Serial.print((int)st->gainceiling);
+  Serial.print(" awb=");                Serial.print((int)st->awb);
+  Serial.print(" brightness=");         Serial.print((int)st->brightness);
+  Serial.print(" contrast=");           Serial.print((int)st->contrast);
+  Serial.print(" saturation=");         Serial.print((int)st->saturation);
+  Serial.print(" psram=");              Serial.println(psramFound() ? 1 : 0);
+}
+
+// Runtime tuning, one integer per parameter. Reachable as `cam_<name>` from
+// serial JSON and from /control alike, so a tuning session does not depend on
+// which transport happens to be up. Returns 0 for a name it does not know.
+extern int robodogCameraSet(const char *name, int val){
+  sensor_t *s = esp_camera_sensor_get();
+  if (!name) { return 0; }
+
+  // Housekeeping first: these three touch no sensor register of their own.
+  if (!strcmp(name, "report")) { robodogCameraReport(); return 1; }
+  if (!strcmp(name, "settle")) {
+    ROBODOG_CAM_SETTLE = (val < 0) ? 0 : ((val > 30) ? 30 : val);
+    Serial.print("ROBODOG: cam settle="); Serial.println(ROBODOG_CAM_SETTLE);
+    return 1;
+  }
+  if (!strcmp(name, "reset")) { robodogCameraTune(s); robodogCameraReport(); return 1; }
+
+  if (!s) { Serial.println("ROBODOG: cam absent"); return 1; }
+  int known = 1;
+
+  if      (!strcmp(name, "quality"))     { ROBODOG_CAM_SET(s, set_quality,        val); }
+  else if (!strcmp(name, "size")) {
+    // Clamped, not rejected: see ROBODOG_CAM_MAX_SIZE above. Asking for more
+    // than the frame buffer holds is the one setting that ends in no image.
+    if (val < 0) { val = 0; }
+    if (val > (int)ROBODOG_CAM_MAX_SIZE) { val = (int)ROBODOG_CAM_MAX_SIZE; }
+    if (s->set_framesize) { s->set_framesize(s, (framesize_t)val); }
+  }
+  else if (!strcmp(name, "ae_level"))    { ROBODOG_CAM_SET(s, set_ae_level,       val); }
+  else if (!strcmp(name, "aec"))         { ROBODOG_CAM_SET(s, set_exposure_ctrl,  val); }
+  else if (!strcmp(name, "aec2"))        { ROBODOG_CAM_SET(s, set_aec2,           val); }
+  else if (!strcmp(name, "aec_value"))   { ROBODOG_CAM_SET(s, set_aec_value,      val); }
+  else if (!strcmp(name, "agc"))         { ROBODOG_CAM_SET(s, set_gain_ctrl,      val); }
+  else if (!strcmp(name, "agc_gain"))    { ROBODOG_CAM_SET(s, set_agc_gain,       val); }
+  else if (!strcmp(name, "gainceiling")) {
+    if (s->set_gainceiling) { s->set_gainceiling(s, (gainceiling_t)val); }
+  }
+  else if (!strcmp(name, "brightness"))  { ROBODOG_CAM_SET(s, set_brightness,     val); }
+  else if (!strcmp(name, "contrast"))    { ROBODOG_CAM_SET(s, set_contrast,       val); }
+  else if (!strcmp(name, "saturation"))  { ROBODOG_CAM_SET(s, set_saturation,     val); }
+  else if (!strcmp(name, "sharpness"))   { ROBODOG_CAM_SET(s, set_sharpness,      val); }
+  else if (!strcmp(name, "denoise"))     { ROBODOG_CAM_SET(s, set_denoise,        val); }
+  else if (!strcmp(name, "awb"))         { ROBODOG_CAM_SET(s, set_whitebal,       val); }
+  else if (!strcmp(name, "awb_gain"))    { ROBODOG_CAM_SET(s, set_awb_gain,       val); }
+  else if (!strcmp(name, "wb_mode"))     { ROBODOG_CAM_SET(s, set_wb_mode,        val); }
+  else if (!strcmp(name, "raw_gma"))     { ROBODOG_CAM_SET(s, set_raw_gma,        val); }
+  else if (!strcmp(name, "lenc"))        { ROBODOG_CAM_SET(s, set_lenc,           val); }
+  else if (!strcmp(name, "bpc"))         { ROBODOG_CAM_SET(s, set_bpc,            val); }
+  else if (!strcmp(name, "wpc"))         { ROBODOG_CAM_SET(s, set_wpc,            val); }
+  else if (!strcmp(name, "dcw"))         { ROBODOG_CAM_SET(s, set_dcw,            val); }
+  else if (!strcmp(name, "hmirror"))     { ROBODOG_CAM_SET(s, set_hmirror,        val); }
+  else if (!strcmp(name, "vflip"))       { ROBODOG_CAM_SET(s, set_vflip,          val); }
+  else if (!strcmp(name, "effect"))      { ROBODOG_CAM_SET(s, set_special_effect, val); }
+  else { known = 0; }
+
+  if (known) {
+    ROBODOG_CAM_CHANGED = true;
+    Serial.print("ROBODOG: cam "); Serial.print(name);
+    Serial.print("="); Serial.println(val);
+  } else {
+    Serial.print("ROBODOG: cam unknown parameter "); Serial.println(name);
+  }
+  return known;
+}
+// === end RoboDog ===========================================================
+
 // === RoboDog: grab one frame to the serial console =========================
 // Diagnosis for ASSUMPTIONS F2. The stream endpoint hangs and the vendor page
 // shows black, but `esp_camera_init` reports ok -- so the open question is
@@ -472,6 +727,7 @@ static const char ROBODOG_B64_CHARS[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 extern void robodogSnap(int withImage){
+  robodogCameraSettle();   // whatever was just changed, let it reach the frame
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("ROBODOG: snap NULL -- esp_camera_fb_get returned nothing");
@@ -546,6 +802,12 @@ void webServerInit(){
   config.jpeg_quality = 63;
   config.fb_count = 1;
 
+  // === RoboDog: choose the frame buffer before it gets allocated ============
+  // The three lines above are the vendor's, and esp_camera_init below is the
+  // last moment any of them can still change. See robodogCameraConfig.
+  robodogCameraConfig(&config);
+  // === end RoboDog ==========================================================
+
   pinMode(13, INPUT_PULLUP);
   pinMode(14, INPUT_PULLUP);
 
@@ -560,6 +822,10 @@ void webServerInit(){
     s->set_saturation(s, 2);
     delay(1000); 
   }
+
+  // === RoboDog: apply our settings, and retry smaller if the buffer did not fit
+  err = robodogCameraStart(&config, err);
+  // === end RoboDog ===========================================================
 
   // === RoboDog: say whether the camera came up ===============================
   // Upstream commented out both the message and the `return`, so a failed

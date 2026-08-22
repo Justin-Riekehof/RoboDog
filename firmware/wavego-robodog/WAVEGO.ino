@@ -60,6 +60,8 @@ extern int ROBODOG_WATCHDOG_TRIPPED = 0;
 
 // RoboDog: defined in app_httpd.cpp, which has the camera headers.
 extern void robodogSnap(int withImage);
+// RoboDog: camera tuning, also defined in app_httpd.cpp.
+extern int robodogCameraSet(const char *name, int val);
 
 extern void robodogWatchdogFeed(){
   ROBODOG_LAST_CMD_MS = millis();
@@ -195,6 +197,17 @@ extern void robodogApply(){
 
 
 // var(variable), val(value).                  
+// === RoboDog: the "var" key as a plain string ===============================
+// Needed for prefix matching. The vendor's chain compares whole names, and the
+// camera parameters are a family ("cam_ae_level", "cam_quality", ...) rather
+// than one name -- listing two dozen of them here would put the same table in
+// two files and let them drift apart.
+static const char* robodogVar(){
+  const char *v = docReceive["var"];
+  return v ? v : "";
+}
+// === end RoboDog ===========================================================
+
 void serialCtrl(){
   if (Serial.available()){
     // Read the JSON document from the "link" serial port
@@ -285,6 +298,12 @@ void serialCtrl(){
       // val=1 also dumps the JPEG as base64. See robodogSnap() in app_httpd.cpp.
       else if(docReceive["var"] == "snap"){
         robodogSnap(val);
+      }
+
+      // Camera parameters, "cam_<name>", the same names /control takes.
+      // {"var":"cam_ae_level","val":2}, {"var":"cam_report","val":0}.
+      else if(strncmp(robodogVar(), "cam_", 4) == 0){
+        robodogCameraSet(robodogVar() + 4, val);
       }
 
       // Stage one leg's foot target; see robodogLegTarget above.

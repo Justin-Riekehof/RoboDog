@@ -155,8 +155,9 @@ theirs.
 
 ## The camera
 
-It works, and it needs no firmware change: `http://192.168.4.1:81/stream` is
-live MJPEG (320x240), confirmed 2026-08-22. On the vendor page at
+It works, and *working* needs no firmware change: `http://192.168.4.1:81/stream`
+is live MJPEG, confirmed 2026-08-22 -- 320x240 on the vendor firmware, larger on
+the fork (see Image quality below). On the vendor page at
 `http://192.168.4.1` the image stays black until you press **Start** -- that
 button is what sets the `<img>` source, and an unpressed button looks exactly
 like a dead camera.
@@ -164,8 +165,74 @@ like a dead camera.
 The fork adds `{"var":"snap","val":1}` over serial, which returns one frame as
 base64. Slower than the stream by far, but it works with no Wi-Fi involved --
 worth knowing on a setup where joining the robot's access point means losing
-the internet. Note `fb_count = 1`: one frame buffer, so a browser holding the
-stream blocks `snap` and the other way round.
+the internet. Note the vendor's `fb_count = 1`: with a single frame buffer a
+browser holding the stream blocks `snap` and the other way round. The fork
+allocates two when there is PSRAM for them, which lifts that.
+
+### Image quality
+
+Working and *good* are different questions, and the vendor firmware only
+answers the first. It configures the camera once -- `FRAMESIZE_QVGA` at
+`jpeg_quality = 63`, the **worst** value on the 0-63 scale, where lower is
+better -- and touches the sensor exactly once, for `set_saturation(s, 2)`.
+Everything else keeps the driver's defaults. That is what F2's reference frames
+show: 320x240 with block artefacts, oversaturated in light, green and noisy in
+the dark.
+
+Three separate things limit that picture, and only the first is what "exposure"
+means:
+
+| | Vendor | Fork |
+|---|---|---|
+| **Exposure** | AEC at its default target, gain ceiling 2X | `ae_level` +2, `aec2` on, gain ceiling 16X -- still automatic, aimed higher |
+| **Detail** | `jpeg_quality = 63`, QVGA 320x240 | quality 10-12, SVGA 800x600 with PSRAM, VGA 640x480 without |
+| **Colour** | saturation +2, everything else off | AWB gain, gamma and lens correction on, saturation neutral |
+
+The resolution is decided at boot, because `esp_camera_init` allocates the
+frame buffer once and `set_framesize` afterwards only writes sensor registers
+-- it never grows that buffer. So `cam_size` can go **down** from what we
+booted with, never up; asking for more would return no image at all, which
+looks exactly like the camera fault F2 turned out not to be. If the larger
+buffer does not fit, the fork retries at the vendor's QVGA rather than leave
+the robot blind, and says so on the console.
+
+### Tuning it without reflashing
+
+Every setting moves at runtime under the name `cam_<parameter>`, on **both**
+transports -- the same names, the same code:
+
+    serial   {"var":"cam_ae_level","val":2}
+    HTTP     http://192.168.4.1/control?var=cam_ae_level&val=2
+
+| Parameter | Range | What it does |
+|---|---|---|
+| `cam_report` | -- | prints every value the sensor actually holds, plus `psram=0\|1` |
+| `cam_reset` | -- | back to the fork's defaults |
+| `cam_ae_level` | -2..+2 | what the auto-exposure aims for. **The exposure knob** |
+| `cam_aec` / `cam_aec2` | 0/1 | auto-exposure, and the DSP's own longer integration |
+| `cam_aec_value` | 0..1200 | manual exposure time, in lines -- only with `cam_aec` 0 |
+| `cam_agc` / `cam_agc_gain` | 0/1, 0..30 | auto gain, and its manual value |
+| `cam_gainceiling` | 0..6 | 0 = 2X ... 6 = 128X. Brightness in the dark, paid in noise |
+| `cam_quality` | 0..63 | JPEG compression, lower is better |
+| `cam_size` | 0..booted size | frame size, clamped to what was allocated |
+| `cam_brightness` `cam_contrast` `cam_saturation` | -2..+2 | after the exposure, in the DSP |
+| `cam_awb` `cam_awb_gain` `cam_wb_mode` | 0/1, 0/1, 0..4 | white balance |
+| `cam_raw_gma` `cam_lenc` `cam_bpc` `cam_wpc` `cam_dcw` | 0/1 | gamma, lens, pixel corrections |
+| `cam_hmirror` `cam_vflip` `cam_effect` | 0/1, 0/1, 0..6 | orientation and effects |
+| `cam_settle` | 0..30 | frames dropped after a change, default 4 |
+
+That last one is the non-obvious part. The sensor does not act on a register
+write immediately: the frame already in flight was exposed under the old
+settings, and the AEC needs a few more to converge. A `snap` taken right after
+a change would show the setting *before* it and read as "that parameter does
+nothing" -- so a change is remembered, and the next `snap` drops `cam_settle`
+frames first. Only after a change; an unchanged camera pays nothing.
+
+Two warnings worth having before a tuning session. More exposure is longer
+integration, which is motion blur on a robot that walks -- judge any setting
+while walking, not only on the stand. And a bigger frame is a bigger JPEG,
+which the serial `snap` pays for in seconds (ASSUMPTIONS F5); the MJPEG stream
+on port 81 is the way to watch, `snap` the way to diagnose.
 
 ## Going back
 

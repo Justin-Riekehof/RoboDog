@@ -183,3 +183,109 @@ def test_arduinojson_is_pinned_to_the_api_the_sketch_uses() -> None:
     assert "StaticJsonDocument" in source
     common = (ROOT / "firmware/common.ini").read_text(encoding="utf-8")
     assert "ArduinoJson@^6" in common
+
+
+# --- the camera delta ---------------------------------------------------------
+#
+# There is no compiler here either, so these say nothing about image quality.
+# What they protect are the three properties that decide whether a bad camera
+# setting is recoverable on a robot that has no screen: the sensor is never
+# called through a null function pointer, the frame size can never exceed the
+# buffer that was allocated for it, and a failed init falls back instead of
+# leaving the robot blind.
+
+
+def camera_block(name: str = "app_httpd.cpp") -> list[str]:
+    """The lines of the fork's camera-quality block."""
+    out, inside = [], False
+    for line in lines(FORK / name):
+        if "=== RoboDog: camera image quality" in line:
+            inside = True
+        if inside:
+            out.append(line)
+        if inside and "=== end RoboDog" in line:
+            break
+    assert out, "the camera block is gone from the fork"
+    return out
+
+
+def test_every_sensor_setter_is_null_guarded() -> None:
+    """The OV2640 driver of this core generation leaves some setter pointers
+    null -- sharpness and denoise are the known ones. Calling through one
+    reboots the ESP32, and robodogCameraTune runs inside webServerInit, before
+    Wi-Fi: the reboot loop would be silent and would look like a hardware
+    fault. Every call goes through the ROBODOG_CAM_SET macro or carries its
+    own `if`."""
+    unguarded = []
+    for line in camera_block():
+        for call in re.finditer(r"(\w+)->(set_\w+)\s*\(", line):
+            obj, setter = call.group(1), call.group(2)
+            if "ROBODOG_CAM_SET(" in line:  # the macro tests the pointer itself
+                continue
+            if f"if ({obj}->{setter})" in line:
+                continue
+            unguarded.append(line.strip())
+    assert not unguarded, f"sensor setters called without a null check: {unguarded}"
+
+
+def test_the_macro_actually_checks_the_pointer() -> None:
+    """...because every call above is allowed to lean on it."""
+    source = "\n".join(camera_block())
+    macro = source.split("#define ROBODOG_CAM_SET")[1].split("while (0)")[0]
+    assert "(cam)->setter" in macro and "if ((cam) && (cam)->setter)" in macro
+
+
+def test_the_frame_size_stays_inside_the_allocated_buffer() -> None:
+    """esp_camera_init allocates the frame buffer once, for the size it is
+    given; set_framesize afterwards only writes sensor registers and never
+    grows it. Letting `cam_size` past that ceiling is the one setting that can
+    end in no image at all -- which is exactly what F2 spent a session on."""
+    source = "\n".join(camera_block())
+    assert "ROBODOG_CAM_MAX_SIZE = config->frame_size" in source, (
+        "the ceiling must be recorded from the config that was actually allocated"
+    )
+    resize = source.split('!strcmp(name, "size")')[1].split("else if")[0]
+    assert "ROBODOG_CAM_MAX_SIZE" in resize, "cam_size does not clamp to the ceiling"
+    assert "set_framesize" in resize
+
+
+def test_a_camera_that_does_not_fit_falls_back_instead_of_going_blind() -> None:
+    """A larger frame is a want; a working camera is a need. If the buffer does
+    not fit, the vendor's own frame size has to still come up."""
+    source = "\n".join(camera_block())
+    start = source.split("robodogCameraStart")[-1]
+    assert "esp_camera_deinit()" in start, "a retry without deinit leaks the first attempt"
+    assert "FRAMESIZE_QVGA" in start and "esp_camera_init(config)" in start
+
+
+def test_a_changed_setting_reaches_the_frame_before_it_is_read() -> None:
+    """The sensor exposes the frame already in flight under the old settings.
+    Grabbing a picture right after a change would measure the setting before
+    it and read as "the parameter does nothing"."""
+    source = (FORK / "app_httpd.cpp").read_text(encoding="utf-8", errors="surrogateescape")
+    snap = source.split("extern void robodogSnap(int withImage){")[1]
+    assert "robodogCameraSettle();" in snap.split("esp_camera_fb_get")[0], (
+        "snap reads a frame before dropping the ones exposed under the old settings"
+    )
+
+
+def test_the_camera_is_tunable_from_both_transports() -> None:
+    """Same reasoning as the watchdog: a parameter that only exists on one
+    transport is a trap for whoever is on the other one. Both route into the
+    same robodogCameraSet, so the name list cannot drift apart."""
+    ino = (FORK / "WAVEGO.ino").read_text(encoding="utf-8", errors="surrogateescape")
+    httpd = (FORK / "app_httpd.cpp").read_text(encoding="utf-8", errors="surrogateescape")
+    assert 'strncmp(robodogVar(), "cam_", 4)' in ino
+    assert 'strncmp(variable, "cam_", 4)' in httpd
+    assert ino.count("robodogCameraSet(robodogVar() + 4, val)") == 1
+    assert httpd.count("robodogCameraSet(variable + 4, val)") == 1
+
+
+def test_the_baseline_keeps_the_vendors_camera_settings() -> None:
+    """The way back to a stock robot has to include the stock picture, or
+    "flash the baseline again" stops being a way to tell our changes apart
+    from the hardware."""
+    source = (UPSTREAM / "app_httpd.cpp").read_text(encoding="utf-8", errors="surrogateescape")
+    assert "config.jpeg_quality = 63;" in source
+    assert "config.frame_size = FRAMESIZE_QVGA;" in source
+    assert "robodogCamera" not in source
