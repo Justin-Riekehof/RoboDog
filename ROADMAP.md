@@ -134,9 +134,14 @@ commands plus an on-device safety net.
   walking without tripping, then stopped and crouched by itself at the deadline.
   +384 B flash, +16 B RAM over the baseline; off by default, so the stock web UI
   is unaffected.
-  ⏳ **open:** the host side -- arm it on connect, feed it while driving, and
-  report the capability so the D10 warnings can be softened where they are
-  earned.
+  ✅ **host side done 2026-08-22**: `HttpBackend` arms it at 1500 ms on connect
+  and disarms it on disconnect -- leaving it armed would stop the robot for
+  whoever drives it next from the vendor's own page, which sends nothing while
+  it walks. Every accepted command feeds it, so ordinary traffic keeps it alive
+  and no keep-alive thread is needed; and because it only acts on a robot that
+  is *moving*, a long pause during teach-in costs nothing. Exercised on the
+  robot in the teach session below -- the arming request was accepted, which is
+  weaker evidence than the on-device measurement above and is all it is.
 - Pose-level commands (leg targets, joint angles) → `LEG_TARGET` and
   `JOINT_ANGLES` on real hardware, so `motion` routines and pose teach-in run on
   the robot.
@@ -160,6 +165,14 @@ commands plus an on-device safety net.
   flushes one pose per tick — **94-140 ms each** — and `routines/bow.yaml`
   played on the real robot at 10.7 poses/s. A workspace violation was still
   refused above the backend and never reached the robot.
+  ✅ **and pose teach-in in the browser, on the robot 2026-08-22**: the operator
+  posed the real robot by dragging feet in the teach UI. Two defects surfaced on
+  the way and are fixed: the preview and the teach ticker both ran a fixed
+  50 Hz, which over a link carrying ten poses a second plays a routine several
+  times too long (both now ask the backend, as `robodog play` already did); and
+  the drive pad -- with the only STOP button -- was locked inside the Sequence
+  tab, so posing happened with no stop on screen. It is now a console beside
+  both tabs, with a **Home** button that stops and re-centres.
 - Active telemetry: battery voltage and the **full** IMU (the stock firmware
   reads only 2 of the ICM20948's 9 axes) → `TELEMETRY`.
 - Current-based stall detection from the INA219 as the open-loop safety net.
