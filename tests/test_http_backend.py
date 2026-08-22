@@ -48,6 +48,7 @@ KNOWN_VARS = {"framesize", "funcMode", "sconfig", "sset", "move"}
 # What firmware/wavego-robodog adds on top. A fake that speaks them stands in
 # for a flashed robot; one that does not stands in for a stock one.
 ROBODOG_VARS = {"ping", "watchdog", "pose"}
+# ...plus everything matching `cam_*`, which the fork resolves by prefix.
 
 
 class FakeFirmware:
@@ -89,7 +90,11 @@ def make_handler(state: FakeFirmware) -> type[BaseHTTPRequestHandler]:
             var = query["var"][0]
             state.queries.append(parsed.query)
             known = KNOWN_VARS | (ROBODOG_VARS if state.robodog else set())
-            if var not in known:
+            # The camera family is matched by prefix in the firmware too: the
+            # names are the sensor driver's, and listing two dozen of them here
+            # would be the same table in two places, drifting apart.
+            camera = state.robodog and var.startswith("cam_")
+            if var not in known and not camera:
                 self.send_error(500)
                 return
             if state.fail_next > 0:
@@ -137,7 +142,10 @@ def moves(state: FakeFirmware) -> list[int]:
 
 def test_capabilities_match_what_the_firmware_offers_over_wifi() -> None:
     caps = HttpBackend().capabilities
-    assert caps == {Capability.LOCOMOTION, Capability.SERVO_TRIM}
+    # CAMERA is in the floor: the vendor's own firmware serves the same MJPEG
+    # stream, so watching the robot is not what the fork added -- tuning the
+    # sensor is, and that is CAMERA_TUNING below.
+    assert caps == {Capability.LOCOMOTION, Capability.SERVO_TRIM, Capability.CAMERA}
     # Explicitly absent: everything the HTTP handler cannot do (ASSUMPTIONS D2).
     for missing in (
         Capability.GESTURE,
@@ -146,6 +154,7 @@ def test_capabilities_match_what_the_firmware_offers_over_wifi() -> None:
         Capability.LEG_TARGET,
         Capability.JOINT_ANGLES,
         Capability.TELEMETRY,
+        Capability.CAMERA_TUNING,
     ):
         assert missing not in caps
 

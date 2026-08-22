@@ -121,6 +121,47 @@ none of this can fix is a **dropped Wi-Fi link**: no stop command reaches a
 robot that is no longer listening (ASSUMPTIONS D10), so the robot belongs on a
 stand with the power switch in reach.
 
+## Camera tab: the live feed, and the sensor behind it
+
+```console
+uv run robodog teach patrol --backend http    # the tab appears on Wi-Fi only
+```
+
+The tab shows the robot's MJPEG stream and, on our own firmware, a control for
+every sensor register the fork exposes (`cam_<name>`, see
+[docs/firmware.md](firmware.md)). Mock and the twin have no lens, so the tab is
+not there at all.
+
+- **Start / Stop.** The robot serves **one viewer at a time**, and an `<img>` on
+  a hidden tab keeps its connection open — so leaving the tab drops the stream
+  rather than holding it against the next person. Starting again reconnects with
+  a fresh URL; a cached dead stream otherwise shows the last frame of the
+  previous session forever.
+- **Exposure** is the group that decides whether you can see anything: auto
+  exposure and its DSP variant, the level the AEC aims for, and the manual
+  integration time and gain for when you switch the automatics off. Everything
+  here is bought with something — longer integration is motion blur on a robot
+  that walks, more gain is grain (ASSUMPTIONS F6).
+- **Image** carries the frame size and JPEG quality. Quality is inverted:
+  *lower* is better and bigger. The size list stops at 320x240 because the frame
+  buffer is allocated once at boot and never grows — asking for more ends in no
+  image at all (F4).
+- **Colour** is white balance and its presets; **Orientation** is mirror and
+  flip.
+
+**The controls show what was asked for, not what the sensor holds.** There is no
+readback over Wi-Fi: the firmware's `cam_report` answers on the serial console.
+So the page opens on the firmware's own boot-time tuning and tracks what it has
+sent since; a camera someone adjusted over USB will disagree until **Reset**,
+which re-applies those defaults on both sides at once.
+
+Every value goes through the safety supervisor like any other command — not
+because a white balance setting can hurt anyone, but because a value outside a
+register's range is a silent no-op that reads as a broken camera, and one
+particular value (frame size) really does end in a black screen. The ranges the
+sliders draw and the ranges the validator enforces are the same table
+([src/robodog/camera.py](../src/robodog/camera.py)).
+
 ## The drive console: hand control on both tabs
 
 To the right of whichever tab is open sits the **drive console**, which belongs

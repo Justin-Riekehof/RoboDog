@@ -35,6 +35,7 @@ from robodog.api.types import (
     LegServoAngles,
     LegTarget,
     SetBodyPose,
+    SetCameraParam,
     SetFunction,
     SetJointAngles,
     SetLegTarget,
@@ -560,6 +561,15 @@ def _command_to_step(command: Command) -> tuple[str, dict[str, Any]]:
             raise RoutineError(
                 "servo trim is a calibration action and cannot be stored in a routine; "
                 "it is relative and would accumulate on every replay"
+            )
+        case SetCameraParam():
+            # Also deliberately absent, for a different reason: a routine is a
+            # timeline of movement, and how the camera is exposed has no place
+            # on one. It is a property of the session watching the robot, not
+            # of the motion the robot performs.
+            raise RoutineError(
+                "camera settings belong to a session, not to a motion routine; "
+                "set them from the teach UI or with cam_<name> over the wire"
             )
 
 

@@ -29,6 +29,8 @@ class Capability(Enum):
     LEG_TARGET = auto()  # per-leg cartesian foot targets
     JOINT_ANGLES = auto()  # direct servo angles
     TELEMETRY = auto()  # voltage / IMU readback
+    CAMERA = auto()  # a live MJPEG stream exists (both firmwares, over Wi-Fi)
+    CAMERA_TUNING = auto()  # the sensor's own registers can be set (M4 fork)
 
 
 class SafetyState(Enum):
@@ -165,6 +167,23 @@ class TrimServo:
     offset: int
 
 
+@dataclass(frozen=True, slots=True)
+class SetCameraParam:
+    """Set one camera register by the firmware's own name (`cam_<name>`).
+
+    A command like any other, so it passes the safety supervisor -- not because
+    a white balance setting can hurt anyone, but because the rule that nothing
+    reaches a backend around the supervisor is worth more than the exception.
+    What the check earns here is real enough: `size` above what the frame buffer
+    was allocated for ends in no image at all (ASSUMPTIONS F4), and a value
+    outside a register's range is a silent no-op the operator reads as a broken
+    camera. See robodog.camera for the table of names and ranges.
+    """
+
+    name: str
+    value: int
+
+
 Command = (
     Drive
     | SetFunction
@@ -175,6 +194,7 @@ Command = (
     | Led
     | Buzzer
     | TrimServo
+    | SetCameraParam
 )
 
 

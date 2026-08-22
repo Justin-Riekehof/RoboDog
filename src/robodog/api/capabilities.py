@@ -10,6 +10,7 @@ from robodog.api.types import (
     Gesture,
     Led,
     SetBodyPose,
+    SetCameraParam,
     SetFunction,
     SetJointAngles,
     SetLegTarget,
@@ -33,6 +34,8 @@ def required_capability(command: Command) -> Capability:
             return Capability.JOINT_ANGLES
         case TrimServo():
             return Capability.SERVO_TRIM
+        case SetCameraParam():
+            return Capability.CAMERA_TUNING
 
 
 def parse_capability(name: str) -> Capability:

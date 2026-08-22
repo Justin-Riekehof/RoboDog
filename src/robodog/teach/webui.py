@@ -39,7 +39,11 @@ from robodog.api.types import (
     LegId,
     LegTarget,
     SafetyState,
+    SetCameraParam,
 )
+from robodog.camera import CAMERA_PARAMS
+from robodog.camera import DEFAULTS as CAMERA_DEFAULTS
+from robodog.camera import PARAMS_BY_NAME as CAMERA_PARAMS_BY_NAME
 from robodog.errors import KinematicsError, RobodogError, RoutineError, SafetyError
 from robodog.kinematics.constants import LINKAGE_W
 from robodog.kinematics.leg import leg_roll_and_depth, leg_target_from_roll
@@ -175,6 +179,14 @@ class TeachUIServer:
         # Posing needs leg targets; over Wi-Fi the stock firmware has none, so
         # that half of the UI is switched off instead of failing per drag (D2).
         self._pose_enabled = Capability.LEG_TARGET in client.capabilities
+        # Two separate questions: is there a picture to watch, and can the
+        # sensor be told anything. The vendor firmware answers yes and no.
+        self._stream_url = getattr(client, "stream_url", None)
+        self._camera_tuning = Capability.CAMERA_TUNING in client.capabilities
+        # No readback exists over Wi-Fi (`cam_report` prints to the serial
+        # console), so this is what the firmware boots with plus whatever we
+        # have sent since -- see robodog.camera.
+        self._camera_values = dict(CAMERA_DEFAULTS)
         self._busy: str | None = None
         self._state_cache: dict[str, Any] = {}
         self._quit = threading.Event()
@@ -281,6 +293,7 @@ class TeachUIServer:
                 "interpolation": session.interpolation,
                 "dirty": session.dirty,
                 "pose_enabled": self._pose_enabled,
+                "camera": self._camera_json(),
                 "default_spacing": session.default_spacing,
                 "save_path": str(session.default_path),
                 "hips": {LEG_IDS_TO_NAMES[leg]: list(HIPS[leg]) for leg in LegId},
@@ -419,6 +432,8 @@ class TeachUIServer:
             return self._save(body)
         if action == "preview":
             return self._start_preview()
+        if action == "camera":
+            return self._camera(body)
         if action == "lean":
             # Not the roll axis: see TeachSession.lean for why one roll value on
             # four legs splays the feet and leaves the body level.
@@ -571,6 +586,29 @@ class TeachUIServer:
             return 409, {"ok": False, "message": str(exc)}
         return 200, {"ok": True, "message": f"saved {path}", "path": str(path)}
 
+    def _camera_json(self) -> dict[str, Any] | None:
+        """The stream, the controls to draw, and what we last asked for."""
+        if self._stream_url is None:
+            return None
+        return {
+            "stream": self._stream_url,
+            "tuning": self._camera_tuning,
+            "values": dict(self._camera_values),
+            "params": [
+                {
+                    "name": param.name,
+                    "label": param.label,
+                    "kind": param.kind,
+                    "group": param.group,
+                    "min": param.minimum,
+                    "max": param.maximum,
+                    "note": param.note,
+                    "choices": list(param.choices),
+                }
+                for param in CAMERA_PARAMS
+            ],
+        }
+
     def _manual_json(self) -> dict[str, Any]:
         """The hand-driven move, reconciled against the robot's own state.
 
@@ -711,6 +749,30 @@ class TeachUIServer:
         self._manual_note = ""
         label = MOVE_LABELS.get(move, move)
         return 200, {"ok": True, "message": label if self._manual else "stopped"}
+
+    def _camera(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Set one camera register, by the firmware's own name.
+
+        Remembered as well as sent, because nothing can be read back: over
+        Wi-Fi `cam_report` answers on the serial console, so the page's controls
+        show what we asked for rather than what the sensor holds. Recording it
+        only after the robot accepted it keeps that as close to true as the
+        transport allows.
+        """
+        name = str(body.get("name", "")).strip()
+        param = CAMERA_PARAMS_BY_NAME.get(name)
+        if param is None:
+            known = ", ".join(sorted(CAMERA_PARAMS_BY_NAME))
+            raise ValueError(f"unknown camera parameter {name!r} (known: {known})")
+        value = 0 if param.kind == "action" else int(_num(body, "value"))
+        self._client.send(SetCameraParam(name=name, value=value))
+        if param.kind == "action":
+            # `reset` puts the sensor back to the firmware's own tuning, so the
+            # page's idea of every other control has to go back with it.
+            self._camera_values = dict(CAMERA_DEFAULTS)
+            return 200, {"ok": True, "message": "camera back to the fork's defaults"}
+        self._camera_values[name] = value
+        return 200, {"ok": True, "message": f"{param.label}: {value}"}
 
     def _home(self) -> tuple[int, dict[str, Any]]:
         """Back to the pose the session opened in, from wherever the robot is.

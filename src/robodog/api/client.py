@@ -117,6 +117,20 @@ class RobotClient:
         return tick_for(self._backend)
 
     @property
+    def stream_url(self) -> str | None:
+        """Where the robot's live video is, or None if it has none.
+
+        Gated on the capability rather than on the attribute: a backend that
+        grew a URL but does not claim CAMERA is not offering a stream, and a
+        page that pointed an <img> at it would show a broken image instead of
+        nothing.
+        """
+        if Capability.CAMERA not in self.capabilities:
+            return None
+        url: str | None = getattr(self._backend, "stream_url", None)
+        return url
+
+    @property
     def watchdog_timeout(self) -> float:
         """The budget actually in force, which is not known until connect()."""
         return self._supervisor.watchdog_timeout

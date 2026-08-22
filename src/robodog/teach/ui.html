@@ -101,6 +101,18 @@
   .pad button.active { background: var(--accent); border-color: var(--accent);
                        color: #0b1016; font-weight: 700; }
   .driving { color: var(--bad); font-weight: 600; }
+  .stream { background: #0d1116; border-radius: 6px; min-height: 240px;
+            display: flex; align-items: center; justify-content: center; }
+  .stream img { max-width: 100%; display: block; image-rendering: pixelated; }
+  .stream.empty::after { content: "stream stopped"; color: var(--dim); font-size: 12px; }
+  .cam-group { margin-top: 12px; }
+  .cam-group h3 { margin: 0 0 6px; font-size: 11px; text-transform: uppercase;
+                  letter-spacing: .08em; color: var(--dim); font-weight: 600; }
+  .cam-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .cam-row label { flex: 0 0 120px; font-size: 12px; }
+  .cam-row input[type=range] { flex: 1; }
+  .cam-row .val { flex: 0 0 52px; text-align: right; font-size: 12px; color: var(--dim); }
+  .cam-note { font-size: 11px; color: var(--dim); margin: -2px 0 8px 128px; }
   .keys { margin-top: 10px; }
   .keys b { color: var(--text); font-family: ui-monospace, Consolas, monospace; }
   .estop-note { color: var(--bad); font-weight: 600; font-size: 12px; margin-right: 6px; }
@@ -115,6 +127,7 @@
   <nav class="tabs">
     <button class="tab" data-tab="pose" id="tab-pose">Pose</button>
     <button class="tab" data-tab="sequence" id="tab-sequence">Sequence</button>
+    <button class="tab" data-tab="camera" id="tab-camera" hidden>Camera</button>
   </nav>
   <span class="busy-note" id="busy-note"></span>
   <span id="estop" hidden>
@@ -248,6 +261,34 @@
         <button id="seq-load">Load</button>
       </div>
       <div class="row"><span class="coords" id="seq-path"></span></div>
+    </div>
+  </div>
+</main>
+
+<main id="view-camera" hidden>
+  <div class="col-views">
+    <div class="panel">
+      <h2>Live feed <span class="hint">(MJPEG straight from the robot; only
+        one viewer at a time)</span></h2>
+      <!-- The src is set when this tab opens and cleared when it closes: an
+           <img> on a hidden tab holds the connection open, and the robot has
+           one stream to give. -->
+      <div class="stream empty" id="stream-box"><img id="cam-image" alt=""></div>
+      <div class="row" style="margin-top:8px">
+        <button id="cam-toggle" class="primary">Start</button>
+        <button id="cam-reset">Reset to defaults</button>
+        <span class="hint" id="cam-note"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-ctrl">
+    <div class="panel">
+      <h2>Sensor</h2>
+      <div class="row"><span class="hint">No robot answers with its current
+        settings over Wi-Fi, so these show what was asked for, not what the
+        sensor holds. <b>Reset</b> puts both back in step.</span></div>
+      <div id="cam-controls"></div>
     </div>
   </div>
 </main>
@@ -510,6 +551,11 @@ function selectTab(name) {
   tab = name;
   $("view-pose").hidden = name !== "pose";
   $("view-sequence").hidden = name !== "sequence";
+  $("view-camera").hidden = name !== "camera";
+  // Leaving the tab drops the stream. An <img> on a hidden tab keeps its
+  // connection open, and the robot serves one viewer at a time -- so a glance
+  // at the camera would otherwise cost the next person the whole feed.
+  if (name !== "camera") stopStream();
   for (const button of document.querySelectorAll("nav.tabs button"))
     button.classList.toggle("active", button.dataset.tab === name);
   if (name === "sequence") refreshFiles();
@@ -531,6 +577,7 @@ function render() {
   // carries only the sequence overlay -- wait for a full snapshot to decide.
   if (state.pose_enabled !== undefined) {
     $("tab-pose").hidden = !state.pose_enabled;
+    $("tab-camera").hidden = !state.camera;
     if (tab === null) { selectTab(state.pose_enabled ? "pose" : "sequence"); return; }
   }
   if (tab === null) return;
@@ -541,6 +588,7 @@ function render() {
     `backend: ${state.backend}` + (unsaved.length ? ` -- unsaved ${unsaved.join(" + ")}` : "");
   renderConsole();
   if (tab === "sequence") renderSequence();
+  else if (tab === "camera") renderCamera();
   else renderPose();
 }
 
@@ -703,6 +751,122 @@ function renderFunctions() {
     return button;
   }));
   functionsBuilt = true;
+}
+
+let streaming = false, camControlsBuilt = false;
+
+function stopStream() {
+  streaming = false;
+  const img = $("cam-image");
+  // removeAttribute, not src="": an empty src makes the browser re-request the
+  // page itself, which shows as a broken image and a pointless round trip.
+  img.removeAttribute("src");
+  $("stream-box").classList.add("empty");
+  $("cam-toggle").textContent = "Start";
+}
+
+function startStream() {
+  if (!state.camera) return;
+  streaming = true;
+  // A fresh query each time: without it a browser that cached the dead stream
+  // shows the last frame of the previous session and never reconnects.
+  $("cam-image").src = state.camera.stream + "?t=" + Date.now();
+  $("stream-box").classList.remove("empty");
+  $("cam-toggle").textContent = "Stop";
+}
+
+function camControl(param, values) {
+  const row = document.createElement("div");
+  row.className = "cam-row";
+  const label = document.createElement("label");
+  label.textContent = param.label;
+  row.appendChild(label);
+  const value = values[param.name];
+
+  if (param.kind === "action") {
+    label.textContent = "";
+    const button = document.createElement("button");
+    button.textContent = param.label;
+    button.addEventListener("click", () => api("camera", {name: param.name, value: 0}));
+    row.appendChild(button);
+    return row;
+  }
+  if (param.kind === "toggle") {
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = !!value;
+    box.addEventListener("change", () =>
+      api("camera", {name: param.name, value: box.checked ? 1 : 0}));
+    row.appendChild(box);
+    return row;
+  }
+  if (param.kind === "choice") {
+    const select = document.createElement("select");
+    select.style.flex = "1";
+    param.choices.forEach((text, index) => {
+      const option = document.createElement("option");
+      option.value = String(param.min + index);
+      option.textContent = text;
+      select.appendChild(option);
+    });
+    select.value = String(value);
+    select.addEventListener("change", () =>
+      api("camera", {name: param.name, value: Number(select.value)}));
+    row.appendChild(select);
+    return row;
+  }
+  const slider = document.createElement("input");
+  slider.type = "range";
+  slider.min = param.min;
+  slider.max = param.max;
+  slider.value = value;
+  const shown = document.createElement("span");
+  shown.className = "val";
+  shown.textContent = value;
+  slider.addEventListener("input", () => { shown.textContent = slider.value; });
+  // On release, not on every pixel of the drag: each one is a request to the
+  // robot over the same link the control loop uses.
+  slider.addEventListener("change", () =>
+    api("camera", {name: param.name, value: Number(slider.value)}));
+  row.appendChild(slider);
+  row.appendChild(shown);
+  return row;
+}
+
+function renderCamera() {
+  const cam = state.camera;
+  if (!cam) return;
+  $("cam-note").textContent = cam.tuning
+    ? ""
+    : "this robot runs the stock firmware: the picture is all it offers";
+  $("cam-reset").hidden = !cam.tuning;
+  if (camControlsBuilt || !cam.tuning) return;
+  const host = $("cam-controls");
+  host.replaceChildren();
+  const groups = [];
+  cam.params.forEach((param) => {
+    if (!groups.length || groups[groups.length - 1].name !== param.group)
+      groups.push({name: param.group, params: []});
+    groups[groups.length - 1].params.push(param);
+  });
+  groups.forEach((group) => {
+    const box = document.createElement("div");
+    box.className = "cam-group";
+    const title = document.createElement("h3");
+    title.textContent = group.name;
+    box.appendChild(title);
+    group.params.forEach((param) => {
+      box.appendChild(camControl(param, cam.values));
+      if (param.note) {
+        const note = document.createElement("div");
+        note.className = "cam-note";
+        note.textContent = param.note;
+        box.appendChild(note);
+      }
+    });
+    host.appendChild(box);
+  });
+  camControlsBuilt = true;
 }
 
 // The console belongs to the robot rather than to a tab, so it draws from the
@@ -954,6 +1118,13 @@ $("seq-run").addEventListener("click", () => {
 $("seq-stop").addEventListener("click", () => api("stop", {}));
 $("btn-reset").addEventListener("click", () => api("reset", {}));
 $("btn-home").addEventListener("click", () => api("home", {}));
+$("cam-toggle").addEventListener("click", () => (streaming ? stopStream() : startStream()));
+$("cam-reset").addEventListener("click", () => {
+  api("camera", {name: "reset", value: 0}).then(() => {
+    camControlsBuilt = false;   // the values moved, so the controls must be redrawn
+    render();
+  });
+});
 
 // --- keyboard control -------------------------------------------------------
 // WASD is HOLD-to-walk, unlike the pad's click-to-latch. A latched direction

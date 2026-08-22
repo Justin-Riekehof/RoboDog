@@ -1278,3 +1278,96 @@ def test_the_page_script_parses(tmp_path: Path) -> None:
 
     done = subprocess.run([node, "--check", str(path)], capture_output=True, text=True, timeout=60)
     assert done.returncode == 0, done.stderr
+
+
+# --- the camera --------------------------------------------------------------------
+
+
+def test_the_camera_tab_carries_a_reachable_stream(
+    posing_rig: tuple[FakeFirmware, str],
+) -> None:
+    """The URL has to come from the client, not from the backend behind it.
+
+    It was read off the client first and silently produced None for every
+    session, because the property lived on the backend -- a camera tab that
+    never appeared, with nothing failing anywhere.
+    """
+    from robodog.camera import STREAM_PATH
+
+    _firmware, url = posing_rig
+    camera = state_of(url)["camera"]
+    assert camera is not None, "a Wi-Fi robot always has a stream"
+    assert camera["stream"].endswith(STREAM_PATH)
+    assert camera["tuning"] is True
+    # One port above the control server, as the firmware does it.
+    control = int(url.rsplit(":", 1)[1].rstrip("/"))
+    assert f":{control + 1}{STREAM_PATH}" not in camera["stream"]  # not OUR port
+
+
+def test_a_robot_without_a_camera_offers_no_tab(
+    rig: tuple[TeachUIServer, MockBackend, str],
+) -> None:
+    """Mock and the twin have no lens; a tab that shows a broken image is
+    worse than no tab."""
+    _server, _backend, url = rig
+    assert state_of(url)["camera"] is None
+
+
+def test_the_controls_carry_their_own_ranges(posing_rig: tuple[FakeFirmware, str]) -> None:
+    """The page draws from the table rather than hard-coding end stops, so a
+    slider cannot ask for a value the safety layer will refuse."""
+    from robodog.camera import CAMERA_PARAMS
+
+    _firmware, url = posing_rig
+    params = {entry["name"]: entry for entry in state_of(url)["camera"]["params"]}
+    assert len(params) == len(CAMERA_PARAMS)
+    assert params["ae_level"]["min"] == -2 and params["ae_level"]["max"] == 2
+    assert params["quality"]["kind"] == "range"
+    assert params["aec"]["kind"] == "toggle"
+    assert params["size"]["choices"][-1] == "320x240"  # the frame-buffer ceiling (F4)
+
+
+def test_setting_a_parameter_reaches_the_robot(posing_rig: tuple[FakeFirmware, str]) -> None:
+    firmware, url = posing_rig
+    status, data = post(url, "camera", {"name": "ae_level", "value": -1})
+    assert status == 200 and data["ok"], data
+    assert ("cam_ae_level", -1, 0) in firmware.calls
+    assert state_of(url)["camera"]["values"]["ae_level"] == -1
+
+
+def test_a_value_the_sensor_would_ignore_is_refused(
+    posing_rig: tuple[FakeFirmware, str],
+) -> None:
+    """An out-of-range write is a silent no-op on the sensor, which the operator
+    reads as a broken camera. Refusing it with the range says more."""
+    firmware, url = posing_rig
+    before = len(firmware.calls)
+    status, data = post(url, "camera", {"name": "ae_level", "value": 9})
+    assert status == 409, data
+    assert "outside" in data["message"]
+    assert len(firmware.calls) == before, "the robot was written to anyway"
+
+
+def test_an_unknown_parameter_is_refused_by_name(posing_rig: tuple[FakeFirmware, str]) -> None:
+    _firmware, url = posing_rig
+    status, data = post(url, "camera", {"name": "sharpness", "value": 1})
+    assert status == 400
+    assert "unknown camera parameter" in data["message"]
+
+
+def test_reset_puts_the_page_back_in_step_with_the_sensor(
+    posing_rig: tuple[FakeFirmware, str],
+) -> None:
+    """Nothing can be read back, so the page's values are a memory of what was
+    asked. `reset` re-applies the firmware's own tuning, and the memory has to
+    follow or every control afterwards is a lie."""
+    from robodog.camera import DEFAULTS
+
+    firmware, url = posing_rig
+    post(url, "camera", {"name": "saturation", "value": 2})
+    assert state_of(url)["camera"]["values"]["saturation"] == 2
+
+    status, data = post(url, "camera", {"name": "reset", "value": 0})
+    assert status == 200 and data["ok"]
+    assert ("cam_reset", 0, 0) in firmware.calls
+    assert state_of(url)["camera"]["values"] == DEFAULTS

@@ -15,11 +15,13 @@ from robodog.api.types import (
     LegServoAngles,
     LegTarget,
     SetBodyPose,
+    SetCameraParam,
     SetFunction,
     SetJointAngles,
     SetLegTarget,
     TrimServo,
 )
+from robodog.camera import PARAMS_BY_NAME
 from robodog.errors import KinematicsError, LimitViolationError
 from robodog.kinematics.constants import (
     GESTURE_OFFSET_MAX,
@@ -190,6 +192,19 @@ def check_command(command: Command, cfg: LimitConfig) -> None:
                 raise LimitViolationError(
                     f"servo trim offset {offset} exceeds +/-{cfg.servo_trim_offset_max} counts "
                     f"per command; step towards a limit, do not jump at it"
+                )
+        case SetCameraParam(name=name, value=value):
+            param = PARAMS_BY_NAME.get(name)
+            if param is None:
+                known = ", ".join(sorted(PARAMS_BY_NAME))
+                raise LimitViolationError(f"unknown camera parameter {name!r} (known: {known})")
+            if param.kind != "action" and not param.clamps(value):
+                # Worth refusing rather than letting the sensor ignore it: an
+                # out-of-range write is a silent no-op that reads as a broken
+                # camera, and `size` above the allocated frame buffer is no
+                # image at all (ASSUMPTIONS F4).
+                raise LimitViolationError(
+                    f"camera {name}={value} outside [{param.minimum}, {param.maximum}]"
                 )
         case SetFunction() | Buzzer():
             pass

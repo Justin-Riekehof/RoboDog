@@ -40,12 +40,14 @@ from robodog.api.types import (
     LegId,
     LegTarget,
     RobotState,
+    SetCameraParam,
     SetFunction,
     SetLegTarget,
     TrimServo,
 )
 from robodog.backends.base import DEFAULT_TICK
 from robodog.backends.mock import MockBackend
+from robodog.camera import STREAM_PATH, STREAM_PORT
 from robodog.errors import BackendError, CapabilityError
 from robodog.kinematics.constants import SERVO_CHANNELS, SERVO_MIDDLE
 from robodog.netdiag import diagnose_unreachable
@@ -69,7 +71,7 @@ MOVE_STOP_LR: Final = 6
 FIRMWARE_CHOICES: Final = ("auto", "stock", "robodog")
 
 # Capabilities our own firmware adds on top of the stock set.
-ROBODOG_CAPABILITIES: Final = frozenset({Capability.LEG_TARGET})
+ROBODOG_CAPABILITIES: Final = frozenset({Capability.LEG_TARGET, Capability.CAMERA_TUNING})
 
 # How long our firmware may go unheard before it stops itself, in milliseconds.
 # It only ever acts on a robot that is actually moving, so a long quiet spell
@@ -120,7 +122,12 @@ class HttpBackend:
     name = "http"
     # What the stock firmware offers over Wi-Fi, and the floor for every robot:
     # our own firmware only ever adds to this (see ROBODOG_CAPABILITIES).
-    STOCK_CAPABILITIES = frozenset({Capability.LOCOMOTION, Capability.SERVO_TRIM})
+    # CAMERA is in the floor because the vendor's own firmware serves the same
+    # MJPEG stream -- watching the robot is not what the fork added, tuning the
+    # sensor is (CAMERA_TUNING).
+    STOCK_CAPABILITIES = frozenset(
+        {Capability.LOCOMOTION, Capability.SERVO_TRIM, Capability.CAMERA}
+    )
 
     def __init__(
         self,
@@ -254,6 +261,21 @@ class HttpBackend:
         self._pose_dirty = False
 
     @property
+    def stream_url(self) -> str:
+        """Where the robot's MJPEG stream lives.
+
+        The firmware starts a second server one port above the control one
+        (`config.server_port += 1`), so the port is derived rather than assumed:
+        a control host on a non-standard port has its stream one above that too,
+        which is what makes this reachable in a test.
+        """
+        host = self.host.split("://", 1)[-1].split("/", 1)[0]
+        name, _, port = host.rpartition(":")
+        if name and port.isdigit():
+            return f"http://{name}:{int(port) + 1}{STREAM_PATH}"
+        return f"http://{host}:{STREAM_PORT}{STREAM_PATH}"
+
+    @property
     def suggested_tick(self) -> float:
         """Seconds per player tick this transport can keep up with.
 
@@ -326,6 +348,10 @@ class HttpBackend:
                 self._control("funcMode", int(mode))
             case TrimServo(channel=channel, offset=offset):
                 self.trim_servo(channel, offset)
+            case SetCameraParam(name=name, value=value):
+                # Straight through: the sensor holds this itself, there is
+                # nothing to stage and nothing to flush.
+                self._control(f"cam_{name}", value)
             case SetLegTarget(leg=leg, target=target):
                 # Staged, not sent: the player writes all four legs and then
                 # ticks, so flushing per tick turns a pose into one request.
