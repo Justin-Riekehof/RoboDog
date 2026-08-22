@@ -1377,3 +1377,63 @@ def test_reset_puts_the_page_back_in_step_with_the_sensor(
     assert status == 200 and data["ok"]
     assert ("cam_reset", 0, 0) in firmware.calls
     assert state_of(url)["camera"]["values"] == DEFAULTS
+
+
+def test_the_controls_show_what_the_sensor_holds(posing_rig: tuple[FakeFirmware, str]) -> None:
+    """Read back, not remembered.
+
+    The camera is the one thing on this robot someone else can change -- the
+    vendor's own web page, a serial session -- so what we asked for and what it
+    holds are two different questions, and only one of them is the truth.
+    """
+    firmware, url = posing_rig
+    camera = state_of(url)["camera"]
+    assert camera["readback"] is True
+
+    # Someone else moves it, without going through us at all.
+    firmware.camera["contrast"] = -2
+    post(url, "camera", {"name": "brightness", "value": 1})
+    values = state_of(url)["camera"]["values"]
+    assert values["brightness"] == 1
+    assert values["contrast"] == -2, "the page kept its own memory over the robot's answer"
+
+
+def test_a_clamped_value_is_reported_as_clamped(posing_rig: tuple[FakeFirmware, str]) -> None:
+    """`size` is clamped to whatever frame buffer the robot allocated, and it
+    does not say no -- it just lands somewhere else. A control that snapped back
+    with no explanation would look broken."""
+    firmware, url = posing_rig
+    firmware.camera["size_max"] = 5  # this robot fell back to QVGA
+    status, data = post(url, "camera", {"name": "size", "value": 8})
+    assert status == 200 and data["ok"]
+    assert "asked 8, holding 5" in data["message"]
+    assert state_of(url)["camera"]["values"]["size"] == 5
+
+
+def test_the_page_is_told_this_robots_own_ceiling(
+    posing_rig: tuple[FakeFirmware, str],
+) -> None:
+    """Nothing else can discover it: the buffer is allocated once, before
+    esp_camera_init, and only the robot knows whether it got VGA (F4)."""
+    firmware, url = posing_rig
+    firmware.camera["size_max"] = 5
+    post(url, "camera", {"name": "quality", "value": 20})  # any write refreshes it
+    assert state_of(url)["camera"]["limits"]["size_max"] == 5
+
+
+def test_firmware_that_cannot_answer_still_works(posing_rig: tuple[FakeFirmware, str]) -> None:
+    """An older fork answers cam_ with an empty 200. Losing the readback must
+    not lose the write that already succeeded."""
+    firmware, url = posing_rig
+    firmware.camera_answers = False
+    status, data = post(url, "camera", {"name": "saturation", "value": -1})
+    assert status == 200 and data["ok"], data
+    camera = state_of(url)["camera"]
+    assert camera["readback"] is False
+    assert camera["values"]["saturation"] == -1  # remembered, and labelled as such
+
+
+def test_the_page_says_which_of_the_two_it_is_showing() -> None:
+    page = resources.files("robodog.teach").joinpath("ui.html").read_text(encoding="utf-8")
+    assert "read back from the sensor" in page
+    assert "what was asked " in page

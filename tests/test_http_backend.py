@@ -7,6 +7,7 @@ requests return an empty 200. No hardware, no network beyond localhost.
 
 from __future__ import annotations
 
+import json
 import threading
 import urllib.parse
 from collections.abc import Iterator
@@ -41,6 +42,7 @@ from robodog.backends.http import (
     MOVE_TURN_RIGHT,
     HttpBackend,
 )
+from robodog.camera import DEFAULTS as CAMERA_DEFAULTS
 from robodog.errors import BackendError, CapabilityError
 from tests.conftest import FakeClock
 
@@ -60,6 +62,11 @@ class FakeFirmware:
         self.fail_next = 0  # respond 500 to this many upcoming /control calls
         self.robodog = False  # True = speaks our firmware's added commands
         self.queries: list[str] = []  # full query strings, for the pose keys
+        # The sensor's own state, which our firmware answers every cam_ request
+        # with. `size_max` is what this robot managed to allocate at boot -- the
+        # one value no host can work out for itself (ASSUMPTIONS F4).
+        self.camera: dict[str, int] = {**CAMERA_DEFAULTS, "size_max": 8, "psram": 0}
+        self.camera_answers = True  # False = firmware too old to reply with a body
 
 
 def make_handler(state: FakeFirmware) -> type[BaseHTTPRequestHandler]:
@@ -103,6 +110,23 @@ def make_handler(state: FakeFirmware) -> type[BaseHTTPRequestHandler]:
                 return
 
             state.calls.append((var, int(query["val"][0]), int(query["cmd"][0])))
+            if camera:
+                name, value = var[4:], int(query["val"][0])
+                if name == "reset":
+                    state.camera.update(CAMERA_DEFAULTS)
+                elif name == "size":
+                    # Clamped, not rejected, exactly as the firmware does it.
+                    state.camera[name] = min(value, state.camera["size_max"])
+                elif name in CAMERA_DEFAULTS:
+                    state.camera[name] = value
+                if state.camera_answers:
+                    body = json.dumps({"camera": True, **state.camera}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
             self.send_response(200)
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Length", "0")

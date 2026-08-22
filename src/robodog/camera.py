@@ -10,10 +10,11 @@ firmware/wavego-robodog/app_httpd.cpp), so nothing here translates anything.
 
 Two things are worth knowing before trusting a control:
 
-* **There is no readback over Wi-Fi.** `cam_report` prints to the serial
-  console, not to the HTTP response, so the values here are what the firmware
-  applies at boot (`robodogCameraTune`) plus whatever we have sent since. A
-  camera someone tuned over USB will disagree with the sliders until `reset`.
+* **The defaults here are a starting point, not the truth.** Every `cam_*`
+  request now answers with the sensor's own state, so a connected robot
+  replaces these immediately and a write confirms itself in the same round
+  trip. They are what is shown before the first answer, and all there is on
+  firmware too old to give one.
 * **Not every setter exists.** The OV2640 driver of this core generation leaves
   some function pointers null -- `sharpness` and `denoise` are the known ones --
   and the firmware skips those writes rather than crashing. A slider for them

@@ -183,10 +183,12 @@ class TeachUIServer:
         # sensor be told anything. The vendor firmware answers yes and no.
         self._stream_url = getattr(client, "stream_url", None)
         self._camera_tuning = Capability.CAMERA_TUNING in client.capabilities
-        # No readback exists over Wi-Fi (`cam_report` prints to the serial
-        # console), so this is what the firmware boots with plus whatever we
-        # have sent since -- see robodog.camera.
+        # A starting point only: the robot's own answer replaces this as soon
+        # as it gives one, and firmware that cannot answer keeps it.
         self._camera_values = dict(CAMERA_DEFAULTS)
+        self._camera_extra: dict[str, int] = {}
+        self._camera_read = False
+        self._refresh_camera()
         self._busy: str | None = None
         self._state_cache: dict[str, Any] = {}
         self._quit = threading.Event()
@@ -586,6 +588,30 @@ class TeachUIServer:
             return 409, {"ok": False, "message": str(exc)}
         return 200, {"ok": True, "message": f"saved {path}", "path": str(path)}
 
+    def _refresh_camera(self) -> bool:
+        """Replace our idea of the camera with the robot's, if it will say.
+
+        True when the robot answered. Firmware older than the JSON reply says
+        nothing, and then the page falls back to remembering what it asked for
+        -- which is what it always did, and what it must stop claiming to be a
+        readback the moment a robot can do better.
+        """
+        state = self._client.read_camera_state()
+        # Set both ways, not latched: the flag says whether the values on screen
+        # came from the robot *this time*. A robot that has stopped answering
+        # leaves a memory behind, and calling that a readback is the lie this
+        # whole change exists to remove.
+        self._camera_read = bool(state)
+        if not state:
+            return False
+        self._camera_values = {
+            name: value for name, value in state.items() if name in CAMERA_PARAMS_BY_NAME
+        }
+        self._camera_extra = {
+            name: value for name, value in state.items() if name not in CAMERA_PARAMS_BY_NAME
+        }
+        return True
+
     def _camera_json(self) -> dict[str, Any] | None:
         """The stream, the controls to draw, and what we last asked for."""
         if self._stream_url is None:
@@ -593,7 +619,14 @@ class TeachUIServer:
         return {
             "stream": self._stream_url,
             "tuning": self._camera_tuning,
+            # False means the values below are what was asked for, not what the
+            # sensor holds -- the page says which, because they differ the
+            # moment anyone else touches the camera.
+            "readback": self._camera_read,
             "values": dict(self._camera_values),
+            # size_max is the one thing nothing else can discover: which frame
+            # buffer this particular robot managed to allocate (F4).
+            "limits": dict(self._camera_extra),
             "params": [
                 {
                     "name": param.name,
@@ -766,12 +799,23 @@ class TeachUIServer:
             raise ValueError(f"unknown camera parameter {name!r} (known: {known})")
         value = 0 if param.kind == "action" else int(_num(body, "value"))
         self._client.send(SetCameraParam(name=name, value=value))
+        # Every cam_ reply carries the resulting state, so this is a read of
+        # what the sensor now holds rather than a note of what was asked. Where
+        # the firmware cannot answer, the note is all there is.
+        if not self._refresh_camera():
+            self._camera_values = (
+                dict(CAMERA_DEFAULTS)
+                if param.kind == "action"
+                else {**self._camera_values, name: value}
+            )
         if param.kind == "action":
-            # `reset` puts the sensor back to the firmware's own tuning, so the
-            # page's idea of every other control has to go back with it.
-            self._camera_values = dict(CAMERA_DEFAULTS)
             return 200, {"ok": True, "message": "camera back to the fork's defaults"}
-        self._camera_values[name] = value
+        held = self._camera_values.get(name, value)
+        if held != value:
+            # The robot took the write and landed somewhere else -- `size` is
+            # clamped to whatever frame buffer it allocated. Saying so beats a
+            # control that snaps back for no visible reason.
+            return 200, {"ok": True, "message": f"{param.label}: asked {value}, holding {held}"}
         return 200, {"ok": True, "message": f"{param.label}: {value}"}
 
     def _home(self) -> tuple[int, dict[str, Any]]:

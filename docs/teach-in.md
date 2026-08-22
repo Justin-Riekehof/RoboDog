@@ -149,11 +149,20 @@ not there at all.
 - **Colour** is white balance and its presets; **Orientation** is mirror and
   flip.
 
-**The controls show what was asked for, not what the sensor holds.** There is no
-readback over Wi-Fi: the firmware's `cam_report` answers on the serial console.
-So the page opens on the firmware's own boot-time tuning and tracks what it has
-sent since; a camera someone adjusted over USB will disagree until **Reset**,
-which re-applies those defaults on both sides at once.
+**The controls show what the sensor holds.** Every `cam_*` request answers with
+the camera's own state, so a write confirms itself in the same round trip and a
+change made elsewhere — the vendor's web page, a serial session — shows up on
+the next one. The panel says which of the two you are looking at: firmware older
+than that reply answers with an empty 200, and then the controls fall back to
+remembering what was asked for and label themselves accordingly.
+
+Two things follow from reading rather than remembering. **Frame size is clamped,
+not refused** — the robot silently lands on whatever frame buffer it allocated
+at boot, so asking for 640x480 on a robot that fell back to QVGA answers *asked
+8, holding 5* instead of pretending. And the list of sizes is **capped to that
+robot's own ceiling**, which is the one value nothing else can work out: the
+buffer is chosen once, before `esp_camera_init`, and only the robot knows
+whether it got what it asked for (ASSUMPTIONS F4).
 
 Every value goes through the safety supervisor like any other command — not
 because a white balance setting can hurt anyone, but because a value outside a

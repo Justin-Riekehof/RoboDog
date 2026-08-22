@@ -25,6 +25,7 @@ worth being able to overrule by hand.
 from __future__ import annotations
 
 import contextlib
+import json
 import time
 import urllib.error
 import urllib.parse
@@ -154,6 +155,9 @@ class HttpBackend:
         # and one round trip beats four.
         self._pose: dict[LegId, LegTarget] = {}
         self._pose_dirty = False
+        # What the robot last said its camera holds. None until asked, and on
+        # firmware too old to answer.
+        self.camera_state: dict[str, int] | None = None
         self._clock = clock
         # When the robot last heard anything from us, and whether it is counting.
         self._last_sent = clock()
@@ -201,7 +205,7 @@ class HttpBackend:
         *,
         timeout: float | None = None,
         extra: str = "",
-    ) -> None:
+    ) -> bytes:
         """Issue one /control request. All three keys are mandatory (D3).
 
         `extra` appends already-encoded key/value pairs, which is how a whole
@@ -210,7 +214,7 @@ class HttpBackend:
         query = urllib.parse.urlencode({"var": var, "val": val, "cmd": cmd})
         if extra:
             query = f"{query}&{extra}"
-        self._get(f"/control?{query}", timeout=timeout)
+        return self._get(f"/control?{query}", timeout=timeout)
 
     # --- lifecycle ---
 
@@ -259,6 +263,46 @@ class HttpBackend:
                 ) from exc
         self._pose = dict(self._model.state().leg_targets)
         self._pose_dirty = False
+
+    def _remember_camera(self, body: bytes) -> bool:
+        """Keep the last camera state the robot reported.
+
+        Every `cam_*` reply carries it, so this costs nothing and needs no
+        second request. A body that is not the JSON we expect is ignored rather
+        than raised on: an older firmware answers those requests with an empty
+        200, and losing the readback is not a reason to fail the write that
+        already succeeded.
+        """
+        try:
+            state = json.loads(body)
+        except (ValueError, TypeError):
+            return False
+        if not (isinstance(state, dict) and state.get("camera")):
+            return False
+        self.camera_state = {
+            key: int(value)
+            for key, value in state.items()
+            if key != "camera" and isinstance(value, int)
+        }
+        return True
+
+    def read_camera_state(self) -> dict[str, int] | None:
+        """Ask the robot what the camera holds, rather than what we asked for.
+
+        `cam_report` changes nothing on the sensor -- it is the firmware's own
+        "say what you have" -- so this is safe to call at any time. Returns None
+        where the firmware is too old to answer with a body.
+
+        None means *this* read produced nothing, even when an earlier one did:
+        handing back the last known state would report freshness that does not
+        exist, and a page would go on calling a stale memory a readback.
+        """
+        if Capability.CAMERA_TUNING not in self.capabilities:
+            return None
+        fresh = False
+        with contextlib.suppress(BackendError):
+            fresh = self._remember_camera(self._control("cam_report", 0))
+        return self.camera_state if fresh else None
 
     @property
     def stream_url(self) -> str:
@@ -350,8 +394,9 @@ class HttpBackend:
                 self.trim_servo(channel, offset)
             case SetCameraParam(name=name, value=value):
                 # Straight through: the sensor holds this itself, there is
-                # nothing to stage and nothing to flush.
-                self._control(f"cam_{name}", value)
+                # nothing to stage and nothing to flush. The reply carries the
+                # resulting state, so a write confirms itself.
+                self._remember_camera(self._control(f"cam_{name}", value))
             case SetLegTarget(leg=leg, target=target):
                 # Staged, not sent: the player writes all four legs and then
                 # ticks, so flushing per tick turns a pose into one request.

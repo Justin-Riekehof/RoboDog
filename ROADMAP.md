@@ -139,8 +139,11 @@ commands plus an on-device safety net.
   open with `watchdog timeout (0.500s)` -- the supervisor's budget was read
   from the backend *before* connect, and before connect a transport that probes
   for its firmware can only answer with the pessimistic stock number. Sized at
-  connect now. Still unconfirmed on the device: the keep-alive that holds a
-  *walk* up, which needs someone to hold a direction for several seconds.
+  connect now.
+  ✅ **and the walk keep-alive, on the robot 2026-08-22**: a direction held for
+  several seconds keeps walking. It used to stop and crouch after ~1.5 s,
+  because the one state the on-device watchdog guards -- a latched move -- is
+  the one state that produces no traffic to feed it.
   ✅ **host side done 2026-08-22**: `HttpBackend` arms it at 1500 ms on connect
   and disarms it on disconnect -- leaving it armed would stop the robot for
   whoever drives it next from the vendor's own page, which sends nothing while
@@ -203,10 +206,14 @@ commands plus an on-device safety net.
     resolutions were missing. This is why the picture now "looks a lot sharper".
   * ASSUMPTIONS F4 was open: `psram=0`, measured. No PSRAM, and VGA fits in
     internal DRAM regardless, so the vendor's QVGA was a choice.
-  ⏳ **open:** no readback over Wi-Fi. `cam_report` answers on the serial
-  console, so the controls show what was asked for rather than what the sensor
-  holds, and nothing over Wi-Fi can ask a given robot what its frame buffer
-  ceiling actually is. A response body on `/control` would close both.
+  ✅ **and readback over Wi-Fi**: every `cam_*` request now answers with the
+  sensor's own state as JSON, so a write confirms itself in the same round trip
+  and a change made from the vendor's page or a serial session shows up on the
+  next one. It carries `size_max` too -- the frame-buffer ceiling this
+  particular robot managed to allocate, which nothing else can discover (F4) --
+  so the size list is capped per robot rather than offering settings the
+  firmware would silently clamp. Firmware without the reply still works and the
+  page says it is remembering rather than reading.
 - Active telemetry: battery voltage and the **full** IMU (the stock firmware
   reads only 2 of the ICM20948's 9 axes) → `TELEMETRY`.
 - Current-based stall detection from the INA219 as the open-loop safety net.

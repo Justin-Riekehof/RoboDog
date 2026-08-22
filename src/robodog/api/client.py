@@ -130,6 +130,20 @@ class RobotClient:
         url: str | None = getattr(self._backend, "stream_url", None)
         return url
 
+    def read_camera_state(self) -> dict[str, int] | None:
+        """What the robot says its camera holds, or None if it cannot say.
+
+        Distinct from every other reader here: the camera is the one thing on
+        this robot that can be changed by someone else -- the vendor's own web
+        page, a serial session -- so what we asked for and what it holds are
+        genuinely two different questions.
+        """
+        reader = getattr(self._backend, "read_camera_state", None)
+        if reader is None:
+            return None
+        state: dict[str, int] | None = reader()
+        return state
+
     @property
     def watchdog_timeout(self) -> float:
         """The budget actually in force, which is not known until connect()."""

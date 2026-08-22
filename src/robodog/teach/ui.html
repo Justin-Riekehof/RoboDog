@@ -288,9 +288,7 @@
   <div class="col-ctrl">
     <div class="panel">
       <h2>Sensor</h2>
-      <div class="row"><span class="hint">No robot answers with its current
-        settings over Wi-Fi, so these show what was asked for, not what the
-        sensor holds. <b>Reset</b> puts both back in step.</span></div>
+      <div class="row"><span class="hint" id="cam-source"></span></div>
       <div class="row"><span class="cam-failed" id="cam-error" hidden></span></div>
       <div id="cam-controls"></div>
     </div>
@@ -779,6 +777,18 @@ function startStream() {
   $("cam-toggle").textContent = "Stop";
 }
 
+// Written by camControl, read here: the robot's answer can differ from what
+// was asked -- `size` is clamped to whatever frame buffer it allocated -- and a
+// control left showing the request would be showing a value the robot rejected
+// without saying so.
+const camControls = new Map();
+
+function syncCamControls(cam) {
+  camControls.forEach((apply, name) => {
+    if (name in cam.values) apply(cam.values[name]);
+  });
+}
+
 // A control that failed must not look like one that worked. Without this a
 // refused write leaves the slider where it was dragged and the reason in the
 // small status line at the top of the window -- which is indistinguishable
@@ -821,15 +831,24 @@ function camControl(param, values) {
       const asked = box.checked;
       camSet(param, asked ? 1 : 0, () => { box.checked = !asked; });
     });
+    camControls.set(param.name, (held) => {
+      if (document.activeElement !== box) box.checked = !!held;
+    });
     row.appendChild(box);
     return row;
   }
   if (param.kind === "choice") {
     const select = document.createElement("select");
     select.style.flex = "1";
+    // A per-robot ceiling where the robot published one: the frame buffer is
+    // allocated at boot and the firmware silently clamps anything above it, so
+    // offering the larger sizes would be offering a setting that does nothing.
+    const ceiling = (state.camera.limits || {})[param.name + "_max"];
     param.choices.forEach((text, index) => {
+      const value = param.min + index;
+      if (ceiling !== undefined && value > ceiling) return;
       const option = document.createElement("option");
-      option.value = String(param.min + index);
+      option.value = String(value);
       option.textContent = text;
       select.appendChild(option);
     });
@@ -840,6 +859,9 @@ function camControl(param, values) {
       camSet(param, Number(asked), () => { select.value = accepted; }).then((ok) => {
         if (ok) accepted = asked;
       });
+    });
+    camControls.set(param.name, (held) => {
+      if (document.activeElement !== select) { select.value = String(held); accepted = String(held); }
     });
     row.appendChild(select);
     return row;
@@ -863,6 +885,12 @@ function camControl(param, values) {
       shown.textContent = accepted;
     }).then((ok) => { if (ok) accepted = asked; });
   });
+  camControls.set(param.name, (held) => {
+    if (document.activeElement === slider) return;
+    slider.value = held;
+    shown.textContent = held;
+    accepted = String(held);
+  });
   row.appendChild(slider);
   row.appendChild(shown);
   return row;
@@ -871,13 +899,22 @@ function camControl(param, values) {
 function renderCamera() {
   const cam = state.camera;
   if (!cam) return;
+  if (camControlsBuilt) syncCamControls(cam);
   $("cam-note").textContent = cam.tuning
     ? ""
     : "this robot runs the stock firmware: the picture is all it offers";
   $("cam-reset").hidden = !cam.tuning;
+  // Which of the two these controls are is worth saying plainly: a value read
+  // back from the sensor is the truth, a remembered one is only our side of a
+  // conversation and drifts the moment anyone else touches the camera.
+  $("cam-source").textContent = cam.readback
+    ? "read back from the sensor after every change"
+    : "this firmware cannot report its camera, so these show what was asked "
+      + "for, not what the sensor holds";
   if (camControlsBuilt || !cam.tuning) return;
   const host = $("cam-controls");
   host.replaceChildren();
+  camControls.clear();
   const groups = [];
   cam.params.forEach((param) => {
     if (!groups.length || groups[groups.length - 1].name !== param.group)

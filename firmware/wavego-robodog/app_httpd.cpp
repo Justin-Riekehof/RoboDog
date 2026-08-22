@@ -69,6 +69,7 @@ extern void robodogWatchdogFeed();
 // RoboDog: camera image quality, defined further down in this file.
 extern int robodogCameraSet(const char *name, int val);
 extern void robodogCameraReport();
+extern int robodogCameraJson(char *out, size_t n);
 
 
 extern void getMAC(){
@@ -365,6 +366,19 @@ static esp_err_t cmd_handler(httpd_req_t *req){
       httpd_resp_send_404(req);
       return ESP_FAIL;
     }
+    // Answer with what the sensor holds now, so a write confirms itself in the
+    // same round trip. The alternative -- set, then ask -- doubles the traffic
+    // on a link that also carries the control loop, and still races anyone
+    // else touching the camera in between.
+    {
+      char json[512];
+      int len = robodogCameraJson(json, sizeof(json));
+      if (len < 0) { len = 0; }
+      if ((size_t)len >= sizeof(json)) { len = sizeof(json) - 1; }
+      httpd_resp_set_type(req, "application/json");
+      httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+      return httpd_resp_send(req, json, len);
+    }
   }
   // === end RoboDog =========================================================
 
@@ -624,6 +638,39 @@ extern void robodogCameraSettle(){
 
 // One line of key=value, so a tuning session over the serial console can read
 // what is in the sensor rather than what it believes it asked for.
+// The same values robodogCameraReport prints, as JSON for the HTTP caller.
+// Over Wi-Fi the serial console is not readable, so without this a host can
+// set the camera but never learn what it holds -- and a teach UI showing what
+// it *asked for* rather than what the sensor has is a UI that lies as soon as
+// anything else touches the camera.
+//
+// `size_max` is the one value nothing else can discover: the frame buffer is
+// allocated once, before esp_camera_init, and a host has no way to know
+// whether this robot got VGA or fell back to QVGA (ASSUMPTIONS F4).
+//
+// Returns the length written. The buffer is caller-owned and the snprintf is
+// bounded -- this runs on the device, where an overrun is a reboot.
+extern int robodogCameraJson(char *out, size_t n){
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) { return snprintf(out, n, "{\"camera\":false}"); }
+  camera_status_t *st = &s->status;
+  return snprintf(out, n,
+    "{\"camera\":true,\"size\":%d,\"size_max\":%d,\"quality\":%d,"
+    "\"ae_level\":%d,\"aec\":%d,\"aec2\":%d,\"aec_value\":%d,"
+    "\"agc\":%d,\"agc_gain\":%d,\"gainceiling\":%d,"
+    "\"brightness\":%d,\"contrast\":%d,\"saturation\":%d,"
+    "\"raw_gma\":%d,\"lenc\":%d,"
+    "\"awb\":%d,\"awb_gain\":%d,\"wb_mode\":%d,"
+    "\"hmirror\":%d,\"vflip\":%d,\"psram\":%d}",
+    (int)st->framesize, (int)ROBODOG_CAM_MAX_SIZE, (int)st->quality,
+    (int)st->ae_level, (int)st->aec, (int)st->aec2, (int)st->aec_value,
+    (int)st->agc, (int)st->agc_gain, (int)st->gainceiling,
+    (int)st->brightness, (int)st->contrast, (int)st->saturation,
+    (int)st->raw_gma, (int)st->lenc,
+    (int)st->awb, (int)st->awb_gain, (int)st->wb_mode,
+    (int)st->hmirror, (int)st->vflip, psramFound() ? 1 : 0);
+}
+
 extern void robodogCameraReport(){
   sensor_t *s = esp_camera_sensor_get();
   if (!s) { Serial.println("ROBODOG: cam absent"); return; }
