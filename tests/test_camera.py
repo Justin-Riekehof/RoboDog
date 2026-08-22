@@ -28,12 +28,22 @@ def test_choices_cover_their_range_exactly() -> None:
         assert len(param.choices) == param.maximum - param.minimum + 1, param.name
 
 
-def test_the_frame_size_ceiling_matches_the_frame_buffer() -> None:
-    """The buffer is allocated once, at esp_camera_init, and set_framesize never
-    grows it -- asking for more than the robot booted with ends in no image at
-    all, which is exactly the fault F2 turned out not to be (ASSUMPTIONS F4)."""
-    assert FRAME_SIZES[-1] == "320x240"  # FRAMESIZE_QVGA, the firmware's cap
+def test_the_frame_size_list_reaches_what_the_fork_allocates() -> None:
+    """The ceiling is chosen at boot, not at compile time.
+
+    This table first stopped at QVGA, reading `ROBODOG_CAM_MAX_SIZE` as the
+    constant it is initialised to -- but the fork overwrites it from the config
+    it hands esp_camera_init, which asks for VGA and only drops to QVGA if that
+    allocation fails. Measured on the robot 2026-08-22: `size=8/8`, VGA, on a
+    unit with no PSRAM at all. Stopping at QVGA hid three usable resolutions.
+    """
+    assert FRAME_SIZES[-1] == "640x480"  # FRAMESIZE_VGA, what the fork asks for
+    assert len(FRAME_SIZES) == 9  # framesize_t 0..8, contiguous
     assert PARAMS_BY_NAME["size"].maximum == len(FRAME_SIZES) - 1
+    # The firmware clamps rather than rejects, so offering more than a given
+    # robot allocated is silent but harmless -- and nothing over Wi-Fi can ask
+    # which it was, so the note has to say so.
+    assert "clamps" in PARAMS_BY_NAME["size"].note
 
 
 def test_the_setters_this_sensor_does_not_have_are_absent() -> None:

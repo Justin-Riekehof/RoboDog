@@ -50,10 +50,19 @@ class CameraParam:
         return self.minimum <= value <= self.maximum
 
 
-# Frame sizes, in the firmware's own enum order (framesize_t). The list stops at
-# QVGA on purpose: the frame buffer is allocated once, at esp_camera_init, and
-# set_framesize never grows it -- asking for more than the robot booted with
-# ends in no image at all (ASSUMPTIONS F4).
+# Frame sizes, in the firmware's own enum order (framesize_t), up to the
+# largest the fork will ever allocate.
+#
+# The ceiling is NOT a constant: the frame buffer is chosen once, before
+# esp_camera_init, from how much memory there is, and set_framesize never grows
+# it afterwards. The fork asks for VGA and drops to QVGA only if that
+# allocation fails -- measured on this robot 2026-08-22: `size=8/8`, VGA, with
+# no PSRAM at all. Listing only up to QVGA, as this table first did, hid three
+# usable resolutions.
+#
+# The firmware clamps rather than rejects, so asking for more than a given
+# robot allocated is harmless but silent, and there is no way to ask over Wi-Fi
+# which it was (`cam_report` answers on the serial console). See ASSUMPTIONS F4.
 FRAME_SIZES: Final = (
     "96x96",
     "160x120",
@@ -61,6 +70,9 @@ FRAME_SIZES: Final = (
     "240x176",
     "240x240",
     "320x240",
+    "400x296",
+    "480x320",
+    "640x480",
 )
 
 # Gain ceilings, in gainceiling_t order.
@@ -125,9 +137,9 @@ CAMERA_PARAMS: Final[tuple[CameraParam, ...]] = (
         "choice",
         "Image",
         maximum=len(FRAME_SIZES) - 1,
-        default=5,
+        default=8,
         choices=FRAME_SIZES,
-        note="capped at what the frame buffer was allocated for (F4)",
+        note="the robot silently clamps this to what it allocated at boot (F4)",
     ),
     CameraParam(
         "quality",
@@ -136,8 +148,8 @@ CAMERA_PARAMS: Final[tuple[CameraParam, ...]] = (
         "Image",
         minimum=10,
         maximum=63,
-        default=12,
-        note="LOWER is better and bigger; 63 is the vendor's, 10-12 is ours",
+        default=10,
+        note="LOWER is better and bigger; 63 is the vendor's, 10 is what we boot with",
     ),
     CameraParam("brightness", "Brightness", "range", "Image", minimum=-2, maximum=2, default=0),
     CameraParam("contrast", "Contrast", "range", "Image", minimum=-2, maximum=2, default=0),

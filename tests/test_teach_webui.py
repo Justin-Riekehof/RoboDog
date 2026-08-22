@@ -1324,7 +1324,7 @@ def test_the_controls_carry_their_own_ranges(posing_rig: tuple[FakeFirmware, str
     assert params["ae_level"]["min"] == -2 and params["ae_level"]["max"] == 2
     assert params["quality"]["kind"] == "range"
     assert params["aec"]["kind"] == "toggle"
-    assert params["size"]["choices"][-1] == "320x240"  # the frame-buffer ceiling (F4)
+    assert params["size"]["choices"][-1] == "640x480"  # what the fork allocates (F4)
 
 
 def test_setting_a_parameter_reaches_the_robot(posing_rig: tuple[FakeFirmware, str]) -> None:
@@ -1340,12 +1340,18 @@ def test_a_value_the_sensor_would_ignore_is_refused(
 ) -> None:
     """An out-of-range write is a silent no-op on the sensor, which the operator
     reads as a broken camera. Refusing it with the range says more."""
+
+    def camera_calls() -> list[tuple[str, int, int]]:
+        # Only these: the ticker flushes poses on its own thread, and counting
+        # every call makes this a race with it rather than a test of the write.
+        return [call for call in firmware.calls if call[0].startswith("cam_")]
+
     firmware, url = posing_rig
-    before = len(firmware.calls)
+    before = camera_calls()
     status, data = post(url, "camera", {"name": "ae_level", "value": 9})
     assert status == 409, data
     assert "outside" in data["message"]
-    assert len(firmware.calls) == before, "the robot was written to anyway"
+    assert camera_calls() == before, "the robot was written to anyway"
 
 
 def test_an_unknown_parameter_is_refused_by_name(posing_rig: tuple[FakeFirmware, str]) -> None:
