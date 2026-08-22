@@ -69,7 +69,8 @@ on-device watchdog, i.e. M4.
 ## M2 — Digital twin (MuJoCo) ✅ core done
 
 - MJCF model **generated from** `kinematics/constants.py`, so model and code
-  cannot drift apart. Legs are a serial stand-in for the five-bar linkage whose
+  cannot drift apart — joint ranges included (they were not, until the roll
+  hinge's hard-coded ±60° was found clamping the measured −27…+135° envelope). Legs are a serial stand-in for the five-bar linkage whose
   foot positions match the ported kinematics exactly (ASSUMPTIONS E4).
 - `SimBackend` with the full capability set. It composes `MockBackend` as the
   command interpreter — the ported firmware logic exists once — and adds physics
@@ -102,7 +103,17 @@ positioning through the firmware's `sconfig` trim facility (ASSUMPTIONS D8).
   (`funcMode=9` baseline, then one trim request per servo — mind the D6 jump).
 - Measure a handful of known poses on the real robot, compute the systematic
   per-servo offset, store it as a calibration table in the repo.
+  ✅ **tooling done:** `robodog calibrate-servos` walks a leg joint by joint
+  against a reference the kinematics defines (both upper arms vertical, leg
+  plane vertical), writes `calibration/servos.yaml` plus a dated report, and
+  rehearses against the mock backend. Partial tables are valid, so the robot
+  can be measured one leg per sitting.
+  ⏳ **open:** the measurement itself — one joint of one leg has been measured
+  so far (front-left wiggle, roll range, 2026-08-21).
 - Apply that table in the servo mapping so twin poses land correctly on hardware.
+  `kinematics.servo.channel_pwm` already takes the table; the consumer that
+  pushes a twin pose to the robot (D8: baseline plus one `sconfig` per servo,
+  static poses only) is the next piece.
 
 **Acceptance:** a static pose authored in the twin is reproduced on the real
 robot within a documented tolerance; the calibration table is version-controlled
@@ -115,9 +126,40 @@ commands plus an on-device safety net.
 
 - **On-device link watchdog** — the robot stops and crouches by itself when the
   link dies. Closes the M1 residual risk (ASSUMPTIONS B9/D10).
+  ✅ **written** in [firmware/wavego-robodog/](firmware/wavego-robodog/): two
+  commands (`watchdog`, `ping`) on both transports, off by default so the stock
+  web UI is unaffected, +48/-0 and +15/-0 lines on the upstream sketch with
+  `ServoCtrl.h` untouched.
+  ✅ **done and measured on the robot** (2026-08-22): armed at 2 s, fed while
+  walking without tripping, then stopped and crouched by itself at the deadline.
+  +384 B flash, +16 B RAM over the baseline; off by default, so the stock web UI
+  is unaffected.
+  ⏳ **open:** the host side -- arm it on connect, feed it while driving, and
+  report the capability so the D10 warnings can be softened where they are
+  earned.
 - Pose-level commands (leg targets, joint angles) → `LEG_TARGET` and
   `JOINT_ANGLES` on real hardware, so `motion` routines and pose teach-in run on
   the robot.
+  ✅ **`leg` + `apply` over serial, on the robot 2026-08-22.** Four foot targets
+  are staged into a shadow of `GoalPWM[]` and applied in one copy, so the twelve
+  servos move together. Uses the firmware's own `singleLegCtrl`, so twin and
+  robot compute the same pose. Cost the discovery that **no task but `loop()`
+  may touch I2C** — see the fork's README.
+  Verified by driving five poses in sequence (105 → 80 → 105 → 80 → 95 mm of
+  reach) and having the operator confirm the robot reached each one, in order,
+  with nothing moving during staging. The simultaneity itself rests on the
+  shadow-copy design and on no ripple being reported; it was not instrumented.
+  ✅ **and over HTTP, measured 2026-08-22**: `var=pose` carries all twelve
+  values in one request and lands in **78-94 ms** on the robot's own access
+  point — about twelve poses a second, where the stock trim path managed
+  static poses only. An incomplete pose is refused with 500 and moves nothing.
+  ✅ **and the host side, end to end on the robot 2026-08-22**: `HttpBackend`
+  probes the firmware at connect (`var=ping`; stock answers 500, ours 200) and
+  reports `LEG_TARGET` only when it is really there; `--firmware` overrules the
+  probe and fails loudly if the assertion is wrong. `SetLegTarget` stages and
+  flushes one pose per tick — **94-140 ms each** — and `routines/bow.yaml`
+  played on the real robot at 10.7 poses/s. A workspace violation was still
+  refused above the backend and never reached the robot.
 - Active telemetry: battery voltage and the **full** IMU (the stock firmware
   reads only 2 of the ICM20948's 9 axes) → `TELEMETRY`.
 - Current-based stall detection from the INA219 as the open-loop safety net.
@@ -127,6 +169,15 @@ commands plus an on-device safety net.
 **Acceptance:** cut the link mid-gait → the robot enters the safe state on its
 own; `robodog play routines/bow.yaml --backend http` works; twin and robot run
 the same motion routine side by side.
+
+**Status 2026-08-22: the first two are met.** The link watchdog was measured on
+the device, and `bow.yaml` played on the robot through the full stack. What is
+left of M4 is the rest of its list: telemetry, stall detection from the INA219,
+and gestures/LED/buzzer over Wi-Fi. Two numbers worth carrying forward: a pose
+costs 94-140 ms over the robot's own access point, so the player ticks at 0.1 s
+there instead of 0.02 — a routine keeps its authored length, coarser rather
+than four times too long. And **do not leave a serial console attached** while
+timing anything: with one open the same request took ~1050 ms.
 
 ## M5 — Gamepad teleoperation (Xbox One controller)
 

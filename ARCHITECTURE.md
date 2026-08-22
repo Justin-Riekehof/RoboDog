@@ -37,7 +37,13 @@ before it reaches the backend. Backends are swappable at construction time:
 - The **sim backend** (MuJoCo) is the digital twin. It does not reimplement any
   command semantics: it *composes* the mock backend as the command interpreter
   and adds physics, so the ported firmware logic exists exactly once. Its MJCF
-  model is generated from `kinematics/constants.py`, and unlike every other
+  model is generated from `kinematics/constants.py` — **including its joint
+  ranges**, which had to be learned the hard way: the roll hinge carried a
+  hard-coded ±60° while the measured envelope was −27…+135° (C13), so the twin
+  silently clamped a third of the range the supervisor accepted. Both sides now
+  read `ROLL_MIN_DEG`/`ROLL_MAX_DEG`, and a test sweeps the permitted workspace
+  to prove every pose the safety layer allows is one the model can hold.
+  Unlike every other
   backend it reports **measured** state — the twin is allowed to disagree with
   the command, which is what makes it useful.
 - The **http backend** talks to the stock firmware over its own Wi-Fi access
@@ -55,12 +61,21 @@ different command sets (ASSUMPTIONS D2). Rather than designing the API down to
 the lowest common denominator, each backend declares capabilities and
 apps/routines degrade gracefully:
 
+Capabilities are not a fixed property of a transport: `HttpBackend` **asks the
+robot** at connect which firmware it runs (a `var=ping` probe -- the stock
+firmware answers 500 to a variable it does not know, ours answers 200) and adds
+`LEG_TARGET` only when the answer says so. `--firmware stock|robodog` overrules
+the probe, because guessing wrong about what a robot can be told to do should be
+correctable by hand. The probe errs towards *less*: a capability claimed but not
+delivered turns into a command swallowed by a 500 below the safety layer,
+instead of one refused above it.
+
 | Capability     | Mock | Sim | HTTP (stock fw) | Serial (stock fw) | Custom fw (M4) |
 |----------------|------|-----|-----------------|-------------------|----------------|
 | `LOCOMOTION`   | ✅   | ✅  | ✅              | ✅                | ✅             |
 | `GESTURE`      | ✅   | ✅  | ❌              | ✅                | ✅             |
 | `PERIPHERALS`  | ✅   | ✅  | ❌              | ✅                | ✅             |
-| `SERVO_TRIM`   | —    | —   | ✅              | ❌                | ✅             |
+| `SERVO_TRIM`   | ✅   | —   | ✅              | ❌                | ✅             |
 | `BODY_POSE`    | ✅   | ✅  | ❌              | ❌                | ✅             |
 | `LEG_TARGET`   | ✅   | ✅  | ❌              | ❌                | ✅             |
 | `JOINT_ANGLES` | ✅   | ✅  | ❌              | ❌                | ✅             |
@@ -148,7 +163,7 @@ recorded in ASSUMPTIONS.md.
 
 Routines are single YAML files in [routines/](routines/) — one file per
 routine, git-diffable, hand-editable, schema-versioned via a `schema` field.
-Two kinds share one envelope:
+Three kinds share one envelope:
 
 ```yaml
 schema: robodog.routine/v1
@@ -166,6 +181,19 @@ steps:
   - at: 2.5
     do: gesture
     args: {axis: yaw, direction: 1}
+```
+
+```yaml
+schema: robodog.routine/v1
+name: patrol-loop
+kind: sequence            # named drive moves, each with its own duration
+requires: [LOCOMOTION]
+gap: 0.5                  # seconds of standing still between two moves
+repeat: 3                 # passes through the list; 0 = until stopped
+moves:
+  - {move: forward, seconds: 10}
+  - {move: left, seconds: 2}
+  - {move: backward, seconds: 5}
 ```
 
 ```yaml
@@ -188,9 +216,43 @@ keyframes:
 Design intent: `commands` routines run on **every** backend today (recording a
 gamepad session produces this kind); `motion` routines are the pose-level
 teach-in — authorable and playable on mock/sim now, on hardware once M4 adds
-joint-level commands. The player validates `requires` against backend
-capabilities and the supervisor clamps every frame, so a hand-edited file
-cannot drive the robot outside its workspace.
+joint-level commands. `sequence` is the operator-facing shorthand for the first
+kind: a list of named moves with durations, expanded into a drive timeline at
+load time, so the player and every backend see an ordinary command timeline.
+It is the one teach-in that already runs on the real robot, because locomotion
+is all the stock firmware offers over Wi-Fi (ASSUMPTIONS D2).
+
+`repeat` belongs to the envelope rather than to one kind, and `repeat: 0` means
+*until stopped*. Playback therefore has an outside stop signal
+(`play_routine(..., should_stop=...)`), which the web UI drives from its Stop
+button, the Escape key and a dead-man's switch on the page's own polling — an
+endless routine with no way out would be a safety defect, not a feature
+(ASSUMPTIONS D10).
+
+The player validates `requires` against backend capabilities and the supervisor
+clamps every frame, so a hand-edited file cannot drive the robot outside its
+workspace.
+
+## Calibration data
+
+The kinematic model says PWM 300 is every joint's zero; the robot disagrees by
+a constant per servo. That constant is measured once and versioned in
+[calibration/](calibration/) as its own tiny schema:
+
+```yaml
+schema: robodog.calibration/v1
+measured: 2026-08-21
+reference: upper arms vertical, leg plane vertical
+offsets:
+  front_left: {fore: 6, back: -4, wiggle: 2}   # PWM counts from the firmware middle
+```
+
+Deliberate properties: offsets are **relative to the firmware's stored middle**
+(the only thing the measurement can see, ASSUMPTIONS D8); **partial tables are
+valid**, so a leg can be measured per sitting; and the table is *data*, not a
+default baked into the mapping — `kinematics.servo.channel_pwm` takes it as an
+argument, so the twin keeps running nominal while the hardware path applies the
+measured zeros. Procedure and its limits: [docs/calibration.md](docs/calibration.md).
 
 ## Repository layout
 
@@ -201,12 +263,18 @@ src/robodog/          Python package (src layout)
   kinematics/         linkage constants, IK/FK, servo map, gait, easing
   safety/             SafetySupervisor, limits, watchdog
   teach/              routine schema, loader/validator, player, teach-in
-                      session + web UI + scriptable console
+                      session (poses) + sequence session (drive moves)
+                      + web UI + scriptable console
+  calibration.py      servo zero table: schema, loader, PWM mapping input
+  calibrate.py        guided hardware procedures that produce that table
   viz/                stick-figure rendering from FK (optional `viz` extra)
   bringup.py          guided hardware bring-up procedure (M1)
   cli.py              `robodog` entry point
 tests/                pytest suite (mirrors package layout)
+firmware/             our fork of the vendor firmware (M4) -- editable,
+                      adds only; `vendor/` stays the pristine reference
 routines/             teach-in files (YAML, versioned in git)
+calibration/          measured servo zeros (YAML, versioned in git)
 sim/                  exported models + meshes (the MJCF itself is generated)
 cad/                  CAD sources/exports (existing leg STL; CadQuery later)
 vendor/wavego-firmware/  pinned upstream firmware reference (MIT, read-only)

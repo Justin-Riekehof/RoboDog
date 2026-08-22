@@ -45,6 +45,9 @@ from robodog.errors import BackendError, CapabilityError
 from tests.conftest import FakeClock
 
 KNOWN_VARS = {"framesize", "funcMode", "sconfig", "sset", "move"}
+# What firmware/wavego-robodog adds on top. A fake that speaks them stands in
+# for a flashed robot; one that does not stands in for a stock one.
+ROBODOG_VARS = {"ping", "watchdog", "pose"}
 
 
 class FakeFirmware:
@@ -54,6 +57,8 @@ class FakeFirmware:
         self.calls: list[tuple[str, int, int]] = []
         self.index_hits = 0
         self.fail_next = 0  # respond 500 to this many upcoming /control calls
+        self.robodog = False  # True = speaks our firmware's added commands
+        self.queries: list[str] = []  # full query strings, for the pose keys
 
 
 def make_handler(state: FakeFirmware) -> type[BaseHTTPRequestHandler]:
@@ -82,7 +87,9 @@ def make_handler(state: FakeFirmware) -> type[BaseHTTPRequestHandler]:
                 self.send_error(404)
                 return
             var = query["var"][0]
-            if var not in KNOWN_VARS:
+            state.queries.append(parsed.query)
+            known = KNOWN_VARS | (ROBODOG_VARS if state.robodog else set())
+            if var not in known:
                 self.send_error(500)
                 return
             if state.fail_next > 0:
@@ -458,3 +465,187 @@ def test_wifi_routine_plays_end_to_end(
     assert len(moves(state)) == 12
     assert moves(state)[0] == MOVE_FORWARD
     assert moves(state)[-2:] == [MOVE_STOP_FB, MOVE_STOP_LR]
+
+
+# --- which firmware is on the robot -------------------------------------------------
+
+
+def test_stock_firmware_is_detected(firmware: tuple[FakeFirmware, str]) -> None:
+    """A robot that does not know `ping` gets the stock capability set."""
+    _state, host = firmware
+    backend = HttpBackend(host)
+    backend.connect()
+    assert backend.capabilities == HttpBackend.STOCK_CAPABILITIES
+    assert Capability.LEG_TARGET not in backend.capabilities
+    backend.disconnect()
+
+
+def test_our_firmware_is_detected(firmware: tuple[FakeFirmware, str]) -> None:
+    state, host = firmware
+    state.robodog = True
+    backend = HttpBackend(host)
+    backend.connect()
+    assert Capability.LEG_TARGET in backend.capabilities
+    assert backend.capabilities >= HttpBackend.STOCK_CAPABILITIES  # only ever adds
+    backend.disconnect()
+
+
+def test_the_probe_cannot_move_the_robot(firmware: tuple[FakeFirmware, str]) -> None:
+    """Detection asks with `ping`, the one added command that changes nothing."""
+    state, host = firmware
+    state.robodog = True
+    backend = HttpBackend(host)
+    backend.connect()
+    probes = [c for c in state.calls if c[0] == "ping"]
+    assert len(probes) == 1
+    assert not [c for c in state.calls if c[0] in ("funcMode", "sconfig", "pose")]
+    backend.disconnect()
+
+
+def test_the_firmware_can_be_stated_instead_of_probed(
+    firmware: tuple[FakeFirmware, str],
+) -> None:
+    """A probe that guesses wrong must be overrulable by hand."""
+    state, host = firmware
+    state.robodog = True
+    backend = HttpBackend(host, firmware="robodog")
+    backend.connect()
+    assert Capability.LEG_TARGET in backend.capabilities
+    assert not [c for c in state.calls if c[0] == "ping"]  # declared, not probed
+    backend.disconnect()
+
+
+def test_declaring_stock_leaves_the_extras_alone(firmware: tuple[FakeFirmware, str]) -> None:
+    """Even on a robot that has them -- the operator's word wins."""
+    state, host = firmware
+    state.robodog = True
+    backend = HttpBackend(host, firmware="stock")
+    backend.connect()
+    assert Capability.LEG_TARGET not in backend.capabilities
+    assert not [c for c in state.calls if c[0] in ("ping", "watchdog")]
+    backend.disconnect()
+
+
+def test_declaring_our_firmware_on_a_stock_robot_fails_loudly(
+    firmware: tuple[FakeFirmware, str],
+) -> None:
+    """Asserting a robot that stops itself, when it does not, is worse than a
+    wrong guess: it would silently be trusted."""
+    _state, host = firmware  # a stock fake: it refuses `watchdog`
+    backend = HttpBackend(host, firmware="robodog")
+    with pytest.raises(BackendError, match="not running 'robodog' firmware"):
+        backend.connect()
+
+
+def test_an_unknown_firmware_name_is_refused() -> None:
+    with pytest.raises(BackendError, match="unknown firmware"):
+        HttpBackend("127.0.0.1", firmware="experimental")
+
+
+# --- poses ---------------------------------------------------------------------------
+
+
+def stand_targets() -> dict[LegId, LegTarget]:
+    return {
+        leg: LegTarget(16.0 if leg in (LegId.FRONT_LEFT, LegId.FRONT_RIGHT) else -16.0, 95.0, 25.0)
+        for leg in LegId
+    }
+
+
+def test_a_whole_pose_travels_in_one_request(firmware: tuple[FakeFirmware, str]) -> None:
+    """Four SetLegTarget commands and a tick must cost exactly one round trip."""
+    state, host = firmware
+    state.robodog = True
+    backend = HttpBackend(host)
+    backend.connect()
+    before = len(state.calls)
+    for leg, target in stand_targets().items():
+        backend.send(SetLegTarget(leg=leg, target=target))
+    assert len(state.calls) == before  # nothing sent yet: staged only
+    backend.tick(0.02)
+
+    poses = [q for q in state.queries if "var=pose" in q]
+    assert len(poses) == 1
+    query = poses[0]
+    for leg in LegId:
+        for axis in ("x", "y", "z"):
+            assert f"l{int(leg)}{axis}=" in query, f"l{int(leg)}{axis} missing from {query}"
+    backend.disconnect()
+
+
+def test_an_unchanged_pose_is_not_resent(firmware: tuple[FakeFirmware, str]) -> None:
+    """The teach UI ticks 50 times a second while the operator thinks."""
+    state, host = firmware
+    state.robodog = True
+    backend = HttpBackend(host)
+    backend.connect()
+    for leg, target in stand_targets().items():
+        backend.send(SetLegTarget(leg=leg, target=target))
+    backend.tick(0.02)
+    for _ in range(10):
+        backend.tick(0.02)
+    assert len([q for q in state.queries if "var=pose" in q]) == 1
+    backend.disconnect()
+
+
+def test_a_pose_on_stock_firmware_says_what_is_missing(
+    firmware: tuple[FakeFirmware, str],
+) -> None:
+    """Without our firmware the command has nowhere to go; say so, do not send."""
+    state, host = firmware  # state.robodog stays False
+    backend = HttpBackend(host)
+    backend.connect()
+    backend.send(SetLegTarget(leg=LegId.FRONT_LEFT, target=LegTarget(16.0, 95.0, 25.0)))
+    with pytest.raises(CapabilityError, match="wavego-robodog"):
+        backend.tick(0.02)
+    assert not [q for q in state.queries if "var=pose" in q]
+    backend.disconnect()
+
+
+def test_the_robot_watchdog_is_armed_and_disarmed_around_a_session(
+    firmware: tuple[FakeFirmware, str],
+) -> None:
+    """Armed on connect, released on the way out.
+
+    Leaving it armed would stop the robot mid-walk for whoever drives it next
+    from the vendor's own page, which sends nothing while the robot walks.
+    """
+    state, host = firmware
+    state.robodog = True
+    backend = HttpBackend(host)
+    backend.connect()
+    armed = [c for c in state.calls if c[0] == "watchdog"]
+    assert armed and armed[0][1] > 0
+    backend.disconnect()
+    disarmed = [c for c in state.calls if c[0] == "watchdog"]
+    assert disarmed[-1][1] == 0
+
+
+def test_a_stock_robot_is_never_told_about_a_watchdog(
+    firmware: tuple[FakeFirmware, str],
+) -> None:
+    state, host = firmware  # stays stock
+    backend = HttpBackend(host)
+    backend.connect()
+    backend.disconnect()
+    assert not [c for c in state.calls if c[0] == "watchdog"]
+
+
+def test_the_host_budget_outlasts_the_transport(firmware: tuple[FakeFirmware, str]) -> None:
+    """A pose takes about a second on the robot's own AP, and the supervisor
+    checks its deadline right after the request returns. A budget below that
+    E-stops a healthy robot -- which it did, twice, before this existed."""
+    from robodog.backends.http import STOCK_WATCHDOG, SUGGESTED_WATCHDOG
+
+    state, host = firmware
+    backend = HttpBackend(host)
+    backend.connect()
+    assert backend.suggested_watchdog == STOCK_WATCHDOG  # nothing slow to do
+    backend.disconnect()
+
+    state.robodog = True
+    posing = HttpBackend(host)
+    posing.connect()
+    assert posing.suggested_watchdog == SUGGESTED_WATCHDOG
+    assert SUGGESTED_WATCHDOG > 1.2  # the slowest pose measured on the device
+    posing.disconnect()

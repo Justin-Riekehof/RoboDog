@@ -5,8 +5,8 @@
 Software platform for a Waveshare **WAVEGO Standard BASIC** (12-DOF quadruped,
 SKU 22615, **no Raspberry Pi**, PWM servos **without position feedback**).
 High-level code runs on the owner's Windows PC; the robot's ESP32 is reached
-over USB serial (115200, `{"var":...,"val":...}` JSON) — stock firmware for
-now, a custom fork is planned in M5.
+over Wi-Fi (HTTP) today; USB serial is a second transport in the M7 outlook.
+Stock firmware for now, a custom fork is **M4**.
 
 Read in this order when context is needed:
 [ARCHITECTURE.md](ARCHITECTURE.md) (component cut, capability model, safety),

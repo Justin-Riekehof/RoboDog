@@ -41,6 +41,12 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
     "types-pyyaml>=6.0",
+    # Talking to the ESP32 over USB. Officially the serial transport is M7
+    # outlook, but in practice it is the channel that works while the laptop
+    # keeps its internet -- flashing, the camera `snap`, and every firmware
+    # diagnostic go through it.
+    "pyserial>=3.5",
+    "types-pyserial>=3.5",
 ]
 
 [build-system]

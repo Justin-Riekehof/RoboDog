@@ -13,6 +13,9 @@ build/
 .coverage
 htmlcov/
 
+# PlatformIO build output (toolchains and objects, hundreds of MB)
+.pio/
+
 # Editors
 .idea/
 .vscode/

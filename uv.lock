@@ -779,6 +779,15 @@ wheels = [
 ]
 
 [[package]]
+name = "pyserial"
+version = "3.5"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1e/7d/ae3f0a63f41e4d2f6cb66a5b57197850f919f59e558159a4dd3a818f5082/pyserial-3.5.tar.gz", hash = "sha256:3c77e014170dfffbd816e6ffc205e9842efb10be9f58ec16d3e8675b4925cddb", size = 159125, upload-time = "2020-11-23T03:59:15.045Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/07/bc/587a445451b253b285629263eb51c2d8e9bcea4fc97826266d186f96f558/pyserial-3.5-py2.py3-none-any.whl", hash = "sha256:c4451db6ba391ca6ca299fb3ec7bae67a5c55dde170964c7a14ceefec02f2cf0", size = 90585, upload-time = "2020-11-23T03:59:13.41Z" },
+]
+
+[[package]]
 name = "pytest"
 version = "9.1.1"
 source = { registry = "https://pypi.org/simple" }
@@ -871,8 +880,10 @@ viz = [
 [package.dev-dependencies]
 dev = [
     { name = "mypy" },
+    { name = "pyserial" },
     { name = "pytest" },
     { name = "ruff" },
+    { name = "types-pyserial" },
     { name = "types-pyyaml" },
 ]
 
@@ -887,8 +898,10 @@ provides-extras = ["viz", "sim"]
 [package.metadata.requires-dev]
 dev = [
     { name = "mypy", specifier = ">=1.11" },
+    { name = "pyserial", specifier = ">=3.5" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "ruff", specifier = ">=0.6" },
+    { name = "types-pyserial", specifier = ">=3.5" },
     { name = "types-pyyaml", specifier = ">=6.0" },
 ]
 
@@ -924,6 +937,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68a0e064b6af791aa332cf192da575fd474ed7d6f16a2/six-1.17.0.tar.gz", hash = "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81", size = 34031, upload-time = "2024-12-04T17:35:28.174Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
+]
+
+[[package]]
+name = "types-pyserial"
+version = "3.5.0.20260712"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ec/e7/6ce4a4ea526397fd0a1ac122085673f3f81fd3e43f4c77bd2dbe7743d644/types_pyserial-3.5.0.20260712.tar.gz", hash = "sha256:19c0a184e9f39e1282783ed7d35d89d73503bd482b39e072299983704e805d00", size = 20875, upload-time = "2026-07-12T05:13:50.657Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ab/66/00bb637724c659494a41687bf06ac613a860720f7183109fca62986d4f69/types_pyserial-3.5.0.20260712-py3-none-any.whl", hash = "sha256:ee4f34b7432a0608bb016c88cb5b1ad3b960df4784289de56dda471503ceb53d", size = 25323, upload-time = "2026-07-12T05:13:49.523Z" },
 ]
 
 [[package]]

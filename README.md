@@ -9,8 +9,8 @@ Software platform for the [Waveshare WAVEGO](https://www.waveshare.com/wiki/WAVE
 
 1. **Motion/control stack** — gait, IK/FK and telemetry, ported faithfully from
    the open (MIT) Waveshare firmware.
-2. **Teach-in programming** — record, name, replay and git-version poses and
-   trajectories as human-editable YAML routines.
+2. **Teach-in programming** — record, name, replay and git-version poses,
+   trajectories and timed move sequences as human-editable YAML routines.
 3. **Gamepad teleoperation** — low-latency Xbox controller driving with a
    hard-wired software E-stop.
 4. **Digital twin** — URDF/MJCF simulation; twin and real robot are driven
@@ -36,6 +36,9 @@ uv run robodog play routines/patrol-demo.yaml --backend mock
 
 # play a keyframed leg-space motion routine
 uv run robodog play routines/bow.yaml --backend mock
+
+# play a drive sequence: named moves with durations, repeated
+uv run robodog play routines/patrol-loop.yaml --backend mock
 
 # validate a routine file without running it
 uv run robodog validate routines/bow.yaml
@@ -74,6 +77,23 @@ times faster than real time) and keeps the window open when the routine ends,
 until you close it. Without the viewer, an 8-second routine finishes in about a
 quarter of a second — handy for tests, useless for watching.
 
+### Programming move sequences
+
+The same UI has a second tab that needs no pose capability at all: build a
+sequence of **standard moves with durations** — 10 s forward, 2 s left, 5 s
+backward — set the pause inserted between moves, repeat it a number of times or
+loop it until stopped, and run it. A **drive pad** underneath sends the same
+moves one at a time, for driving the robot by hand between runs. Stop is on the
+page, on the Escape key, and on the page's own heartbeat (close the tab and
+whatever moves stops). Saving produces a `kind: sequence` routine that
+`robodog play` replays unchanged:
+
+```console
+uv run robodog teach patrol --backend sim          # author against the twin
+uv run robodog teach patrol --backend http         # ... or on the real robot
+uv run robodog play routines/patrol-loop.yaml --backend http
+```
+
 ## On the real robot (Wi-Fi, stock firmware)
 
 Join the robot's access point (SSID `WAVESHARE Robot`, password `1234567890`),
@@ -83,6 +103,23 @@ then:
 uv run robodog info --backend http        # connectivity + capability check
 uv run robodog bringup                    # guided bring-up, writes a report
 uv run robodog play routines/patrol-wifi.yaml --backend http
+
+# author and run move sequences in the browser, on the robot
+uv run robodog teach patrol --backend http
+
+# with our own firmware flashed, poses reach the robot too; the backend
+# detects which firmware is on it, and --firmware overrules the probe
+uv run robodog info --backend http --firmware robodog
+
+# and then a keyframed motion routine plays on the real robot
+uv run robodog play routines/bow.yaml --backend http
+
+# measure a leg's real roll range (rehearse with --backend mock first)
+uv run robodog calibrate-roll --legs front_left
+
+# measure where each servo's zero really is, into a versioned table
+uv run robodog calibrate-servos --legs front_left
+uv run robodog calibrate-servos --show
 ```
 
 **Put the robot on a stand first.** The stock firmware has no link watchdog: if
@@ -117,6 +154,8 @@ leg deviates from the firmware's link geometry (ASSUMPTIONS F1/F3).
 | [ASSUMPTIONS.md](ASSUMPTIONS.md) | Every unverified claim about the hardware and firmware, with its source and current status |
 | [docs/bringup.md](docs/bringup.md) | Guided first contact with the real robot, and why each step is in that order |
 | [docs/teach-in.md](docs/teach-in.md) | Authoring routines: web UI, scriptable console, the routine file format |
+| [docs/calibration.md](docs/calibration.md) | Servo zero calibration: the reference, the procedure, what the numbers do and do not say |
+| [docs/firmware.md](docs/firmware.md) | Flashing the ESP32: the pristine baseline, then the fork with the link watchdog |
 | [docs/research/](docs/research/) | Phase-0 source research on the WAVEGO and WAVEGO Pro, with citations |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Development setup and the project's non-negotiable rules |
 

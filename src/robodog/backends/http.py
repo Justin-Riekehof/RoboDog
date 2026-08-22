@@ -13,6 +13,13 @@ Two properties of this transport shape the whole class:
 * There is **no way to guarantee a stop**. The firmware has no link watchdog and
   Wi-Fi can drop mid-command, after which nothing we send arrives (ASSUMPTIONS
   D10). Operate with the robot on a stand or a hand on the power switch.
+
+Both change on our own firmware (`firmware/wavego-robodog`), which the backend
+detects at connect: it adds a whole-pose command and an on-device watchdog. The
+detection is a single `var=ping` request -- the stock firmware answers 500 to a
+variable it does not know, ours answers 200. Pass `firmware=` to override it,
+because a probe that guesses wrong about *what a robot can be told to do* is
+worth being able to overrule by hand.
 """
 
 from __future__ import annotations
@@ -29,8 +36,11 @@ from robodog.api.types import (
     Drive,
     FunctionMode,
     LegId,
+    LegTarget,
     RobotState,
     SetFunction,
+    SetLegTarget,
+    TrimServo,
 )
 from robodog.backends.mock import MockBackend
 from robodog.errors import BackendError, CapabilityError
@@ -52,6 +62,37 @@ MOVE_TURN_RIGHT: Final = 4
 MOVE_BACKWARD: Final = 5
 MOVE_STOP_LR: Final = 6
 
+# What `firmware=` accepts. "auto" probes; the other two state it outright.
+FIRMWARE_CHOICES: Final = ("auto", "stock", "robodog")
+
+# Capabilities our own firmware adds on top of the stock set.
+ROBODOG_CAPABILITIES: Final = frozenset({Capability.LEG_TARGET})
+
+# How long our firmware may go unheard before it stops itself, in milliseconds.
+# It only ever acts on a robot that is actually moving, so a long quiet spell
+# while an operator poses and thinks costs nothing -- and a dropped link during
+# a walk costs at most this.
+FIRMWARE_WATCHDOG_MS: Final = 1500
+
+# What the host's own watchdog must tolerate on this transport. A pose request
+# was measured at 1.0-1.2 s on the robot's own access point (2026-08-22), and
+# the supervisor checks its deadline immediately after the request returns --
+# so a budget below that latches an E-stop on a perfectly healthy robot, which
+# is what happened twice before this number existed.
+#
+# Raising it is only defensible because the ROBOT now stops itself: with our
+# firmware the on-device watchdog is the net that matters for a moving robot,
+# and this one is the second line. Against stock firmware it stays strict.
+SUGGESTED_WATCHDOG: Final = 3.0
+STOCK_WATCHDOG: Final = 0.5
+
+# Seconds per pose this transport can actually sustain. Measured 2026-08-22:
+# 94-140 ms per request, so ten a second. Interpolating a routine at the twin's
+# 50 Hz and sending every frame does not make the robot smoother -- it makes a
+# 3-second bow take fourteen. Playing at the rate the channel has keeps the
+# motion the length it was authored to be; it is coarser, not slower.
+SUGGESTED_TICK: Final = 0.1
+
 _STOP_RETRIES: Final = 2
 # A stop attempt over a link that is already gone must fail fast: the operator is
 # standing next to a moving robot, and a tool that hangs for half a minute
@@ -61,18 +102,34 @@ STOP_TIMEOUT: Final = 1.0
 
 class HttpBackend:
     name = "http"
-    # Wi-Fi exposes locomotion and the servo-trim facility, and nothing else.
-    capabilities = frozenset({Capability.LOCOMOTION, Capability.SERVO_TRIM})
+    # What the stock firmware offers over Wi-Fi, and the floor for every robot:
+    # our own firmware only ever adds to this (see ROBODOG_CAPABILITIES).
+    STOCK_CAPABILITIES = frozenset({Capability.LOCOMOTION, Capability.SERVO_TRIM})
 
     def __init__(
         self,
         host: str = DEFAULT_HOST,
         *,
         timeout: float = DEFAULT_TIMEOUT,
+        firmware: str = "auto",
         opener: urllib.request.OpenerDirector | None = None,
     ) -> None:
+        if firmware not in FIRMWARE_CHOICES:
+            raise BackendError(
+                f"unknown firmware {firmware!r} (valid: {', '.join(FIRMWARE_CHOICES)})"
+            )
         self.host = host
         self.timeout = timeout
+        self.firmware = firmware
+        # Until we have asked the robot, assume the least: a capability claimed
+        # and not delivered is a command that vanishes, which is worse than one
+        # that is refused.
+        self.capabilities = self.STOCK_CAPABILITIES
+        # Foot targets accumulate here and go out as one request per tick --
+        # `SetLegTarget` is per leg, but the firmware moves a whole pose at once
+        # and one round trip beats four.
+        self._pose: dict[LegId, LegTarget] = {}
+        self._pose_dirty = False
         # Bypass any system proxy: the robot is a link-local device on its own
         # access point, and routing 192.168.4.1 through a configured corporate
         # or VPN proxy would simply fail.
@@ -105,9 +162,23 @@ class HttpBackend:
         except (urllib.error.URLError, OSError, TimeoutError) as exc:
             raise BackendError(f"cannot reach robot at {url}: {exc}") from exc
 
-    def _control(self, var: str, val: int, cmd: int = 0, *, timeout: float | None = None) -> None:
-        """Issue one /control request. All three keys are mandatory (D3)."""
+    def _control(
+        self,
+        var: str,
+        val: int,
+        cmd: int = 0,
+        *,
+        timeout: float | None = None,
+        extra: str = "",
+    ) -> None:
+        """Issue one /control request. All three keys are mandatory (D3).
+
+        `extra` appends already-encoded key/value pairs, which is how a whole
+        pose travels in one request without twelve more parameters here.
+        """
         query = urllib.parse.urlencode({"var": var, "val": val, "cmd": cmd})
+        if extra:
+            query = f"{query}&{extra}"
         self._get(f"/control?{query}", timeout=timeout)
 
     # --- lifecycle ---
@@ -132,8 +203,54 @@ class HttpBackend:
             hints = diagnose_unreachable(self.host, AP_SSID, AP_PASSWORD)
             raise BackendError("\n  ".join([str(exc), *hints])) from exc
         self._model.send(Drive(0, 0))
+        ours = self._detect_robodog_firmware()
+        self.capabilities = self.STOCK_CAPABILITIES | (
+            ROBODOG_CAPABILITIES if ours else frozenset()
+        )
+        if ours:
+            # Arm the robot's own watchdog. Every accepted command feeds it, so
+            # ordinary traffic keeps it alive and no keep-alive thread is
+            # needed; and because it only acts while the robot is moving, a
+            # long pause during teach-in never trips it.
+            try:
+                self._control("watchdog", FIRMWARE_WATCHDOG_MS)
+            except BackendError as exc:
+                # Only reachable when the firmware was declared rather than
+                # probed. Failing loudly is the point: the operator asserted a
+                # robot that stops itself, and it does not.
+                self._connected = False
+                self._model.disconnect()
+                raise BackendError(
+                    f"this robot refused the watchdog command, so it is not running "
+                    f"{self.firmware!r} firmware -- drop --firmware, or flash "
+                    f"firmware/wavego-robodog ({exc})"
+                ) from exc
+        self._pose = dict(self._model.state().leg_targets)
+        self._pose_dirty = False
+
+    @property
+    def suggested_tick(self) -> float:
+        """Seconds per player tick this transport can keep up with."""
+        return SUGGESTED_TICK if Capability.LEG_TARGET in self.capabilities else 0.02
+
+    @property
+    def suggested_watchdog(self) -> float:
+        """Host-side watchdog budget this backend needs to work at all.
+
+        The supervisor's watchdog measures time between feeds, and a request on
+        this transport IS that time -- a pose takes about a second. Sizing the
+        budget below the transport's latency does not make anything safer; it
+        just E-stops a healthy robot mid-pose.
+        """
+        return SUGGESTED_WATCHDOG if Capability.LEG_TARGET in self.capabilities else STOCK_WATCHDOG
 
     def disconnect(self) -> None:
+        # Disarm the robot's watchdog on the way out. Leaving it armed would
+        # stop the robot mid-walk for whoever drives it next from the vendor's
+        # own web page, which sends nothing while it walks.
+        if self._connected and Capability.LEG_TARGET in self.capabilities:
+            with contextlib.suppress(BackendError):
+                self._control("watchdog", 0)
         # Skip the stop when we already know the robot is stopped: repeating it
         # over a dead link only doubles the time spent failing.
         if self._connected and not self._stop_confirmed:
@@ -142,6 +259,26 @@ class HttpBackend:
                 self._stop_motion()
         self._connected = False
         self._model.disconnect()
+
+    def _detect_robodog_firmware(self) -> bool:
+        """Ask the robot which firmware it runs, unless we were told.
+
+        The probe is `var=ping`, which our firmware answers with 200 and the
+        stock one with 500 -- its handler ends in `res = -1` for any variable it
+        does not know. `ping` is deliberate: of our added commands it is the
+        only one that changes nothing at all, so probing can never move a robot.
+
+        A failed probe means "stock". Erring the other way would claim a
+        capability the robot cannot honour, and the command would be swallowed
+        by a 500 somewhere below the safety layer instead of refused above it.
+        """
+        if self.firmware != "auto":
+            return self.firmware == "robodog"
+        try:
+            self._control("ping", 0)
+        except BackendError:
+            return False
+        return True
 
     def _require_connected(self) -> None:
         if not self._connected:
@@ -157,6 +294,13 @@ class HttpBackend:
                 self._send_drive(forward, turn)
             case SetFunction(mode=mode):
                 self._control("funcMode", int(mode))
+            case TrimServo(channel=channel, offset=offset):
+                self.trim_servo(channel, offset)
+            case SetLegTarget(leg=leg, target=target):
+                # Staged, not sent: the player writes all four legs and then
+                # ticks, so flushing per tick turns a pose into one request.
+                self._pose[leg] = target
+                self._pose_dirty = True
             case _:
                 raise CapabilityError(
                     f"{type(command).__name__} is not available over Wi-Fi on the stock "
@@ -221,7 +365,36 @@ class HttpBackend:
 
     def tick(self, dt: float) -> None:
         self._require_connected()
+        self.flush_pose()
         self._model.tick(dt)
+
+    def flush_pose(self) -> None:
+        """Send the staged foot targets, if any changed since the last flush.
+
+        One request carries all twelve values and lands in 78-94 ms on the
+        robot's own access point (measured 2026-08-22). Sending only on change
+        matters: the teach UI ticks at 50 Hz while the operator thinks, and
+        every unchanged tick would otherwise be another round trip.
+        """
+        if not self._pose_dirty:
+            return
+        self._pose_dirty = False
+        if Capability.LEG_TARGET not in self.capabilities:
+            raise CapabilityError(
+                "this robot runs the stock firmware, which has no pose command "
+                "(ASSUMPTIONS D2); flash firmware/wavego-robodog for LEG_TARGET"
+            )
+        query: list[str] = []
+        for leg in LegId:
+            target = self._pose.get(leg)
+            if target is None:
+                raise BackendError(f"no target staged for {leg.name}")
+            query += [
+                f"l{int(leg)}x={target.x:.2f}",
+                f"l{int(leg)}y={target.y:.2f}",
+                f"l{int(leg)}z={target.z:.2f}",
+            ]
+        self._control("pose", 0, extra="&".join(query))
 
     def state(self) -> RobotState:
         self._require_connected()

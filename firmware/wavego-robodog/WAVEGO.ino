@@ -1,0 +1,539 @@
+// WIFI settings in app_httpd.cpp
+
+// OLED screen display.
+// === PAGE 1 ===
+// Row1: [WIFI_MODE]:IP ADDRESS
+//       [WIFI_MODE]: 1 as [AP] mode, it will not connect other wifi.
+//                    2 as [STA] mode, it will connect to known wifi.
+// Row2: [RSSI]
+// Row3: [STATUS] [A] [B] [C] [D]
+//       [A]: 1 as forward. -1 as backward.
+//       [B]: 1 as turn right. -1 as turn left.
+//       [C]: 0 as not in the debugMode. Robot can be controled.
+//            1 as in the debugMode. You can debug the servos.
+//       [D]: 0 as not in any function mode. Robot can be controled to move around.
+//            1 as in steady mode. keep balancing.
+//            2 as stayLow action.
+//            3 as handshake action.
+//            4 as jump action.
+//            5, 6 and 7 as ActionA, ActionB and ActionC.
+//            8 as servos moving to initPos, initPos is the middle angle for servos.
+//            9 as servos moving to middlePos, middlePos is the middle angle for program.
+// Row4: [BATTERY]
+// === PAGE 2 ===
+// [SHOW] DebugMode via wire config.
+// [ . . . o o ]  LED G21 G15 G12 3V3
+// [ . . . . . ]  TX  RX  GND  5V  5V
+//    <SWITCH>
+extern IPAddress IP_ADDRESS = (0, 0, 0, 0);
+extern byte WIFI_MODE = 0; // select WIFI_MODE in app_httpd.cpp
+extern void getWifiStatus();
+extern int WIFI_RSSI = 0;
+
+// gait type ctrl
+// 0: simpleGait(DiagonalGait).
+// 1: triangularGait.
+extern int GAIT_TYPE = 0;
+
+int CODE_DEBUG = 0;
+
+
+// ctrl interface.
+// refer to OLED screen display for more detail information.
+extern int moveFB = 0;
+extern int moveLR = 0;
+extern int debugMode = 0;
+extern int funcMode  = 0;
+
+// === RoboDog: on-device link watchdog =======================================
+// Not in the upstream firmware. The stock protocol LATCHES: one "move" walks
+// until a stop arrives, so a lost link leaves the robot walking and no command
+// can reach it (ASSUMPTIONS B9/D10). This is the on-device answer.
+//
+// OFF BY DEFAULT, deliberately. The vendor's own web UI sends nothing while the
+// robot walks, so a watchdog that was always on would break it. A host that
+// wants the net asks for it ("watchdog", value in ms) and then has to keep
+// talking -- any command feeds it, "ping" feeds it without changing anything.
+extern unsigned long ROBODOG_WATCHDOG_MS = 0;   // 0 = disabled
+extern unsigned long ROBODOG_LAST_CMD_MS = 0;
+extern int ROBODOG_WATCHDOG_TRIPPED = 0;
+
+// RoboDog: defined in app_httpd.cpp, which has the camera headers.
+extern void robodogSnap(int withImage);
+
+extern void robodogWatchdogFeed(){
+  ROBODOG_LAST_CMD_MS = millis();
+  ROBODOG_WATCHDOG_TRIPPED = 0;
+}
+
+// Called from loop(). Only ever stops something that is actually moving, so a
+// parked or trimming robot is never disturbed by it.
+extern void robodogWatchdogCheck(){
+  if(ROBODOG_WATCHDOG_MS == 0){return;}
+  if(ROBODOG_WATCHDOG_TRIPPED){return;}
+  if(moveFB == 0 && moveLR == 0){return;}
+  // Unsigned arithmetic, so this stays correct across the millis() rollover.
+  if(millis() - ROBODOG_LAST_CMD_MS <= ROBODOG_WATCHDOG_MS){return;}
+  moveFB = 0;
+  moveLR = 0;
+  funcMode = 2;                    // stayLow: down, low and stable
+  ROBODOG_WATCHDOG_TRIPPED = 1;
+  Serial.println("WATCHDOG: link lost, stopping and crouching");
+}
+// === end RoboDog ============================================================
+float gestureUD = 0;
+float gestureLR = 0;
+float gestureOffSetMax = 15;
+float gestureSpeed = 2;
+int STAND_STILL = 0;
+
+const char* UPPER_IP = "";
+int UPPER_TYPE = 0;
+unsigned long LAST_JSON_SEND;
+int JSON_SEND_INTERVAL;
+
+
+// import libraries.
+#include "InitConfig.h"
+#include "ServoCtrl.h"
+#include "PreferencesConfig.h"
+#include <ArduinoJson.h>
+
+StaticJsonDocument<200> docReceive;
+StaticJsonDocument<100> docSend;
+TaskHandle_t threadings;
+
+// placeHolders.
+void webServerInit();
+
+
+// === RoboDog: pose commands, twelve servos at once =========================
+// The gap the stock firmware leaves: `sconfig` moves ONE servo, relatively, in
+// PWM counts, and it switches the control loop off (ASSUMPTIONS D5/D8). There
+// is no way to say "put the feet here" -- which is what pose teach-in and
+// keyframe playback need.
+//
+// This is that command, in two halves on purpose:
+//
+//   {"var":"leg","val":1,"x":16,"y":95,"z":25}   stage one leg
+//   {"var":"apply"}                              move all twelve, together
+//
+// Two rules shape the implementation, both learned the hard way:
+//
+// 1. NEVER touch I2C from this task. `GoalPosAll()` writes the PCA9685 over
+//    Wire, and `robotCtrl()` already calls it from loop() on every pass. Doing
+//    it from the serial task too crashes the ESP32 core 1.0.x I2C driver with
+//    IntegerDivideByZero in i2cProcQueue -- verified on the device 2026-08-22,
+//    backtrace decoded. So `apply` only publishes values; the main loop is the
+//    single writer to the bus.
+//
+// 2. Stage into a shadow copy, not into GoalPWM. The loop re-applies GoalPWM
+//    continuously, so writing legs into it one at a time would move them one at
+//    a time. The shadow is copied over in one go, which is what makes the pose
+//    simultaneous rather than a servo-by-servo ripple.
+//
+// `singleLegCtrl` runs the firmware's own IK and writes GoalPWM[] without
+// applying it. Using the firmware's IK rather than our own is deliberate:
+// `robodog.kinematics` is a line-faithful port of it, so twin and robot compute
+// the same pose.
+//
+// Frame: x forward, y down towards the ground, z outward, millimetres --
+// exactly the frame `LegTarget` uses. Legs 1..4 are FL, HL, FR, HR.
+//
+// There is NO workspace check here. The host's safety supervisor does that
+// before anything is sent; a hand-typed command over serial bypasses it, which
+// is the same trade the firmware already makes everywhere else.
+int ROBODOG_STAGED[16];
+int ROBODOG_HAS_STAGED = 0;
+
+extern void robodogLegTarget(int leg, double x, double y, double z){
+  if(leg < 1 || leg > 4){
+    Serial.println("ROBODOG: leg must be 1..4");
+    return;
+  }
+  int live[16];
+  for(int i = 0; i < 16; i++){live[i] = GoalPWM[i];}
+  if(!ROBODOG_HAS_STAGED){
+    for(int i = 0; i < 16; i++){ROBODOG_STAGED[i] = live[i];}
+    ROBODOG_HAS_STAGED = 1;
+  }
+  // Compute into GoalPWM (that is where singleLegCtrl writes), harvest the
+  // result into the shadow, then put the live pose back untouched.
+  for(int i = 0; i < 16; i++){GoalPWM[i] = ROBODOG_STAGED[i];}
+  singleLegCtrl((uint8_t)leg, x, y, z);
+  for(int i = 0; i < 16; i++){ROBODOG_STAGED[i] = GoalPWM[i];}
+  for(int i = 0; i < 16; i++){GoalPWM[i] = live[i];}
+
+  Serial.print("ROBODOG: staged leg ");Serial.print(leg);
+  Serial.print(" x=");Serial.print(x);
+  Serial.print(" y=");Serial.print(y);
+  Serial.print(" z=");Serial.println(z);
+}
+
+extern void robodogApply(){
+  if(!ROBODOG_HAS_STAGED){
+    Serial.println("ROBODOG: nothing staged");
+    return;
+  }
+  // Leave the states that would overwrite the pose on the next loop pass: a
+  // gait writes GoalPWM every iteration, funcMode 8/9 rewrite it forever
+  // (ASSUMPTIONS D11), and debugMode suspends the loop altogether. STAND_STILL
+  // matters too -- at 0 the loop calls standMassCenter() once more and the
+  // pose would be gone before it was ever seen.
+  moveFB = 0;
+  moveLR = 0;
+  funcMode = 0;
+  debugMode = 0;
+  STAND_STILL = 1;
+  for(int i = 0; i < 16; i++){GoalPWM[i] = ROBODOG_STAGED[i];}
+  ROBODOG_HAS_STAGED = 0;
+  // No GoalPosAll() here, on purpose -- see rule 1. The loop applies this
+  // within STEP_DELAY, and it is the only thing allowed to drive the bus.
+  Serial.println("ROBODOG: pose applied");
+}
+// === end RoboDog ===========================================================
+
+
+// var(variable), val(value).                  
+void serialCtrl(){
+  if (Serial.available()){
+    // Read the JSON document from the "link" serial port
+    DeserializationError err = deserializeJson(docReceive, Serial);
+
+    if (err == DeserializationError::Ok){
+      UPPER_TYPE = 1;
+      docReceive["val"].as<int>();
+
+      int val = docReceive["val"];
+
+      robodogWatchdogFeed();   // RoboDog: any accepted command counts as "alive"
+
+      if(docReceive["var"] == "funcMode"){
+        debugMode = 0;
+        gestureUD = 0;
+        gestureLR = 0;
+        if(val == 1){
+          if(funcMode == 1){funcMode = 0;Serial.println("Steady OFF");}
+          else if(funcMode == 0){funcMode = 1;Serial.println("Steady ON");}
+        }
+        else{
+          funcMode = val;
+          Serial.println(val);
+        }
+      }
+
+      else if(docReceive["var"] == "move"){
+        debugMode = 0;
+        funcMode  = 0;
+        digitalWrite(BUZZER, HIGH);
+        switch(val){
+          case 1: moveFB = 1; Serial.println("Forward");break;
+          case 2: moveLR =-1; Serial.println("TurnLeft");break;
+          case 3: moveFB = 0; Serial.println("FBStop");break;
+          case 4: moveLR = 1; Serial.println("TurnRight");break;
+          case 5: moveFB =-1; Serial.println("Backward");break;
+          case 6: moveLR = 0; Serial.println("LRStop");break;
+        }
+      }
+
+      else if(docReceive["var"] == "ges"){
+        debugMode = 0;
+        funcMode  = 0;
+        switch(val){
+          case 1: gestureUD += gestureSpeed;if(gestureUD > gestureOffSetMax){gestureUD = gestureOffSetMax;}break;
+          case 2: gestureUD -= gestureSpeed;if(gestureUD <-gestureOffSetMax){gestureUD =-gestureOffSetMax;}break;
+          case 3: break;
+          case 4: gestureLR -= gestureSpeed;if(gestureLR <-gestureOffSetMax){gestureLR =-gestureOffSetMax;}break;
+          case 5: gestureLR += gestureSpeed;if(gestureLR > gestureOffSetMax){gestureLR = gestureOffSetMax;}break;
+          case 6: break;
+        }
+        pitchYawRollHeightCtrl(gestureUD, gestureLR, 0, 0);
+      }
+
+      else if(docReceive["var"] == "light"){
+        switch(val){
+          case 0: setSingleLED(0,matrix.Color(0, 0, 0));setSingleLED(1,matrix.Color(0, 0, 0));break;
+          case 1: setSingleLED(0,matrix.Color(0, 32, 255));setSingleLED(1,matrix.Color(0, 32, 255));break;
+          case 2: setSingleLED(0,matrix.Color(255, 32, 0));setSingleLED(1,matrix.Color(255, 32, 0));break;
+          case 3: setSingleLED(0,matrix.Color(32, 255, 0));setSingleLED(1,matrix.Color(32, 255, 0));break;
+          case 4: setSingleLED(0,matrix.Color(255, 255, 0));setSingleLED(1,matrix.Color(255, 255, 0));break;
+          case 5: setSingleLED(0,matrix.Color(0, 255, 255));setSingleLED(1,matrix.Color(0, 255, 255));break;
+          case 6: setSingleLED(0,matrix.Color(255, 0, 255));setSingleLED(1,matrix.Color(255, 0, 255));break;
+          case 7: setSingleLED(0,matrix.Color(255, 64, 32));setSingleLED(1,matrix.Color(32, 64, 255));break;
+        }
+      }
+
+      else if(docReceive["var"] == "buzzer"){
+        switch(val){
+          case 0: digitalWrite(BUZZER, HIGH);break;
+          case 1: digitalWrite(BUZZER, LOW);break;
+        }
+      }
+
+      // RoboDog: arm the link watchdog. val = milliseconds, 0 disables it.
+      else if(docReceive["var"] == "watchdog"){
+        ROBODOG_WATCHDOG_MS = (val > 0) ? (unsigned long)val : 0;
+        Serial.print("watchdog:");Serial.println(val);
+      }
+
+      // RoboDog: keep-alive that changes nothing else.
+      else if(docReceive["var"] == "ping"){
+        Serial.println("ping");
+      }
+
+      // === RoboDog: grab one camera frame to this console ===================
+      // val=1 also dumps the JPEG as base64. See robodogSnap() in app_httpd.cpp.
+      else if(docReceive["var"] == "snap"){
+        robodogSnap(val);
+      }
+
+      // Stage one leg's foot target; see robodogLegTarget above.
+      else if(docReceive["var"] == "leg"){
+        robodogLegTarget(val, docReceive["x"], docReceive["y"], docReceive["z"]);
+      }
+
+      // Move every staged leg at once.
+      else if(docReceive["var"] == "apply"){
+        robodogApply();
+      }
+      // === end RoboDog ======================================================
+    }
+
+
+      // else if(docReceive['var'] == "ip"){
+      //     UPPER_IP = docReceive['ip'];
+      // }
+     
+
+    else {
+      while (Serial.available() > 0)
+        Serial.read();
+    }
+  }
+}
+
+
+void jsonSend(){
+  if(millis() - LAST_JSON_SEND > JSON_SEND_INTERVAL || millis() < LAST_JSON_SEND){
+    docSend["vol"] = loadVoltage_V;
+    serializeJson(docSend, Serial);
+    LAST_JSON_SEND = millis();
+  }
+}
+
+
+void robotThreadings(void *pvParameter){
+  delay(3000);
+  while(1){
+    serialCtrl();
+    delay(25);
+  }
+}
+
+
+void threadingsInit(){
+  xTaskCreate(&robotThreadings, "RobotThreadings", 4000, NULL, 5, &threadings);
+}
+
+
+void setup() {
+  Wire.begin(S_SDA, S_SCL);
+  Serial.begin(115200);
+
+  // WIRE DEBUG INIT.
+  wireDebugInit();
+  
+  // INA219 INIT.
+  InitINA219();
+
+  // BUZZER INIT.
+  InitBuzzer();
+
+  // RGB INIT
+  InitRGB();
+
+  // PCA9685 INIT.
+  ServoSetup();
+
+  // SSD1306 INIT.
+  InitScreen();
+
+  // EEPROM INIT.
+  preferencesSetup();
+
+  // Standup for ICM20948 calibrating.
+  delay(100);
+  setSingleLED(0,matrix.Color(0, 128, 255));
+  setSingleLED(1,matrix.Color(0, 128, 255));
+  standMassCenter(0, 0);GoalPosAll();delay(1000);
+  setSingleLED(0,matrix.Color(255, 128, 0));
+  setSingleLED(1,matrix.Color(255, 128, 0));
+  delay(500);
+
+  // ICM20948 INIT.
+  InitICM20948();
+
+  // WEBCTRL INIT. WIFI settings included.
+  webServerInit();
+
+  // RGB LEDs on.
+  delay(500);
+  setSingleLED(0,matrix.Color(0, 32, 255));
+  setSingleLED(1,matrix.Color(255, 32, 0));
+
+  // update data on screen.
+  allDataUpdate();
+
+  // threadings start.
+  threadingsInit();
+}
+
+
+// main loop.
+void loop() {
+  robotCtrl();
+  allDataUpdate();
+  wireDebugDetect();
+  robodogWatchdogCheck();   // RoboDog: stop by ourselves if the host went away
+}
+
+
+// <<<<<<<<<<=== Devices on Board ===>>>>>>>>>>>>
+
+// --- --- ---   --- --- ---   --- --- ---
+// ICM20948 init. --- 9-axis sensor for motion tracking.
+// InitICM20948();
+
+// read and update the pitch, raw and roll data from ICM20948.
+// accXYZUpdate();
+
+
+// --- --- ---   --- --- ---   --- --- ---
+// INA219 init. --- DC current/voltage sensor.
+// InitINA219();
+
+// read and update the voltage and current data from INA219.
+// InaDataUpdate();
+
+
+// --- --- ---   --- --- ---   --- --- ---
+// RGB INIT. --- the 2 RGB LEDs in front of the robot. LED_NUM = 0, 1.
+// InitRGB();
+
+// control RGB LED. 0 <= R, G, B <= 255.
+// setSingleLED(LED_NUM, matrix.Color(R, G, B));
+
+
+// --- --- ---   --- --- ---   --- --- ---
+// SSD1306 INIT. --- OLED Screen
+// InitScreen();
+
+// show the newest data on the OLED screen.
+// for more information you can refer to <OLED screen display>.
+// screenDataUpdate();
+
+
+// --- --- ---   --- --- ---   --- --- ---
+// BUZZER INIT. --- the device that make a sound.
+// InitBuzzer();
+
+// BUZZER on.
+// digitalWrite(BUZZER, HIGH);
+
+// BUZZER off.
+// digitalWrite(BUZZER, LOW);
+
+
+// --- --- ---   --- --- ---   --- --- ---
+// PCA9685 INIT.
+// ServoSetup();
+
+// all servos move to the middle position of the servos.
+// initPosAll();
+
+
+// <<<<<<<<<<<<=== Servos/Legs/Motion Ctrl ===>>>>>>>>>>>>>>>
+
+// --- --- ---   --- --- ---   --- --- ---
+// all servos move to the middle position of the program. 
+// the position that you have to debug it to make it moves to.
+// middlePosAll();
+
+// control a single servo by updating the angle data in GoalPWM[].
+// once it is called, call GoalPosALL() to move all of the servos.
+// goalPWMSet(servoNum, angleInput);
+
+// all servos move to goal position(GoalPWM[]).
+// GoalPosAll();
+
+// Ctrl a single leg of WAVEGO, once it is called, call GoalPosALL() to move all of the servos.
+// input (x,y) position and return angle alpha and angle beta.
+//     O  X  O                 O ------ [BODY]      I(1)  ^  III(3)
+//    /         .              |          |               |
+//   /    |        O           |          |               |
+//  O     y     .              |          |         II(2) ^  IV(4)
+//   \.   |  .                 |          |
+//    \.  .                    |          |
+//     O  |                    |          |
+//  .                          |          |
+//   \.   |                    |          |
+//    \-x-X                    X----z-----O
+// ---------------------------------------------------------------
+// x, y, z > 0
+// singleLegCtrl(LEG_NUM, X, Y, Z);
+
+
+// --- --- ---   --- --- ---   --- --- ---
+// a simple gait to ctrl the robot.
+// GlobalInput changes between 0-1.
+// use directionAngle to ctrl the direction.
+// once it is called, call GoalPosALL() to move all of the servos.
+// simpleGait(GlobalInput, directionAngle);
+
+// a triangular gait to ctrl the robot.
+// GlobalInput changes between 0-1.
+// use directionAngle to ctrl the direction.
+// once it is called, call GoalPosALL() to move all of the servos.
+// triangularGait(GlobalInput, directionAngle);
+
+
+// --- --- ---   --- --- ---   --- --- ---
+// Stand and adjust mass center.
+//     ^
+//     a
+//     |
+// <-b-M
+// a,b > 0
+// standMassCenter(aInput, bInput);
+
+
+// --- --- ---   --- --- ---   --- --- ---
+// ctrl pitch yaw and roll.
+// pitchInput (-, +), if > 0, look up.
+// yawInput   (-, +), if > 0, look right.
+// rollInput  (-, +), if > 0, lean right.
+// 75 < input < 115
+// pitchYawRoll(pitchInput, yawInput, rollInput);
+
+
+// --- --- ---   --- --- ---   --- --- ---
+// balancing function.
+// once it is called, call GoalPosALL() to move all of the servos.
+// balancing();
+
+
+// --- --- ---   --- --- ---   --- --- ---
+// the default function to control robot.
+// robotCtrl();
+
+
+// <<<<<<<<<<<<<<<=== Save Data Permanently ===>>>>>>>>>>>>>>>>>>
+
+// EEPROM INIT.
+// preferencesSetup();
+
+// save the current position of the servoNum in EEPROM.
+// servoConfigSave(servoNum);
+
+// read the saved middle position data of the servos from EEPROM.
+// middleUpdate();

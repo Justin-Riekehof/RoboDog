@@ -52,7 +52,9 @@ def test_play_verbose_lists_commands(capsys: pytest.CaptureFixture[str]) -> None
 
 def test_unavailable_backends_fail_cleanly(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["info", "--backend", "serial"]) == 1
-    assert "M5" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "M7" in err  # the serial backend is outlook, not a scheduled milestone
+    assert "no per-servo channel" in err  # and it would not unlock pose control
 
 
 def test_sim_backend_reports_its_capabilities(capsys: pytest.CaptureFixture[str]) -> None:
@@ -170,3 +172,56 @@ def test_no_subcommand_exits_with_usage_error() -> None:
     with pytest.raises(SystemExit) as excinfo:
         main([])
     assert excinfo.value.code == 2
+
+
+def test_validate_prints_a_sequence_as_its_move_list(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["validate", str(ROUTINES_DIR / "patrol-loop.yaml")]) == 0
+    out = capsys.readouterr().out
+    assert "kind:     sequence" in out
+    assert "repeat:   3x" in out
+    assert "10.00s forward" in out
+
+
+def test_play_repeats_a_sequence(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["play", str(ROUTINES_DIR / "patrol-loop.yaml"), "--backend", "mock"]) == 0
+    out = capsys.readouterr().out
+    assert "18.00s x 3 = 54.00s" in out
+    assert "done:" in out
+
+
+def test_teach_refuses_the_pose_console_on_hardware(capsys: pytest.CaptureFixture[str]) -> None:
+    """--repl authors poses, which Wi-Fi cannot carry -- say so, send nothing."""
+    assert main(["teach", "nope", "--backend", "http", "--repl"]) == 2
+    assert "web UI" in capsys.readouterr().err
+
+
+def test_the_firmware_flag_reaches_the_backend() -> None:
+    """Detection is the default, but a wrong guess must be overrulable."""
+    from robodog.api.types import Capability
+    from robodog.backends.http import HttpBackend
+    from robodog.cli import make_backend
+
+    stated = make_backend("http", host="127.0.0.1:1", firmware="robodog")
+    assert isinstance(stated, HttpBackend)
+    assert stated.firmware == "robodog"
+    # Not probed yet, so it still claims only what every robot has.
+    assert stated.capabilities == HttpBackend.STOCK_CAPABILITIES
+    assert Capability.LEG_TARGET not in stated.capabilities
+
+    assert make_backend("http", host="127.0.0.1:1").firmware == "auto"  # type: ignore[attr-defined]
+
+
+def test_the_player_tick_follows_the_transport() -> None:
+    """A routine interpolated at 50 Hz and sent over a ten-pose-a-second link
+    does not play smoothly, it plays long: a 3 s bow took 14 s on the robot."""
+    from robodog.backends.mock import MockBackend
+    from robodog.cli import _tick_for
+
+    class SlowBackend(MockBackend):
+        suggested_tick = 0.1
+
+    assert _tick_for(SlowBackend(), None) == 0.1  # the backend knows its rate
+    assert _tick_for(SlowBackend(), 0.02) == 0.02  # an explicit --tick still wins
+    assert _tick_for(MockBackend(), None) == 0.02  # backends that do not say keep the default
