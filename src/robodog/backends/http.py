@@ -400,6 +400,12 @@ class HttpBackend:
                 f"l{int(leg)}z={target.z:.2f}",
             ]
         self._control("pose", 0, extra="&".join(query))
+        # A pose ends a latched move, and the model has to know. The firmware
+        # clears moveFB/moveLR when it applies one (`robodogApply`), because a
+        # gait rewrites the servos every pass and would walk straight out of the
+        # pose it was just handed. Without this the host would go on reporting a
+        # move the robot dropped -- and the teach page would show it.
+        self._model.send(Drive(0, 0))
 
     def state(self) -> RobotState:
         self._require_connected()

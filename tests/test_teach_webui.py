@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 
 from robodog.api.client import RobotClient
-from robodog.api.types import Drive, FunctionMode, SetFunction
+from robodog.api.types import Drive, FunctionMode, LegId, SetFunction
 from robodog.backends.http import (
     MOVE_FORWARD,
     MOVE_STOP_FB,
@@ -1087,3 +1087,111 @@ def test_the_preview_is_paced_by_the_transport(
     # One second of routine at ten poses a second, not fifty.
     sent = len(poses(firmware)) - before
     assert 8 <= sent <= 25, f"{sent} poses for a 1s preview -- expected about 11"
+
+
+# --- the drive console, and the way back to the middle -------------------------------
+
+
+def test_the_drive_console_is_not_locked_inside_one_tab() -> None:
+    """The pad -- and the STOP in the middle of it -- used to live in the
+    Sequence tab only, so posing was done with no stop button on screen. It now
+    sits outside both <main>s, which is what puts it on both tabs."""
+    page = resources.files("robodog.teach").joinpath("ui.html").read_text(encoding="utf-8")
+    assert page.count('id="pad"') == 1, "the pad must exist once, not once per tab"
+    before_console = page[: page.index('<aside class="console"')]
+    assert 'id="pad"' not in before_console, "the pad is still inside a tab"
+    assert 'id="functions"' not in before_console
+    assert 'id="btn-home"' in page
+
+
+def test_home_stops_a_latched_move_and_stands(posing_rig: tuple[FakeFirmware, str]) -> None:
+    """One button for "wherever you are, come back": the stop first, because a
+    robot still walking walks straight out of the pose it was just given."""
+    from robodog.kinematics.constants import STAND_HEIGHT
+    from robodog.kinematics.poses import stand_pose
+
+    firmware, url = posing_rig
+    post(url, "drive", {"move": "forward"})
+    post(url, "set", {"legs": ["front_left"], "axis": "depth", "value": 88})
+    assert state_of(url)["targets"]["front_left"]["depth"] == pytest.approx(88.0)
+
+    status, data = post(url, "home", {})
+    assert status == 200 and data["ok"], data
+    assert "centred" in data["message"]
+
+    expected = stand_pose(STAND_HEIGHT)[LegId.FRONT_LEFT]
+    front_left = state_of(url)["targets"]["front_left"]
+    for axis in ("x", "y", "z"):
+        assert front_left[axis] == pytest.approx(getattr(expected, axis))
+    assert state_of(url)["manual"]["move"] is None
+    # The stop reached the firmware, not just our model.
+    assert ("move", MOVE_STOP_FB, 0) in firmware.calls
+
+
+def test_home_on_a_robot_that_cannot_pose_says_what_it_did(
+    wifi_rig: tuple[FakeFirmware, str],
+) -> None:
+    """Stock firmware has no pose to return to. Stopping and saying so beats a
+    button that quietly does half of what its label promises."""
+    _firmware, url = wifi_rig
+    post(url, "drive", {"move": "forward"})
+    status, data = post(url, "home", {})
+    assert status == 200 and data["ok"]
+    assert "takes no leg targets" in data["message"]
+    assert state_of(url)["manual"]["move"] is None
+
+
+def test_posing_the_robot_ends_a_latched_move_on_the_page_too(
+    posing_rig: tuple[FakeFirmware, str],
+) -> None:
+    """The firmware drops the move when it applies a pose (`robodogApply`), so
+    the page must stop calling it driving -- otherwise the pad shows a latched
+    direction that no longer exists, one drag away on the same screen."""
+    _firmware, url = posing_rig
+    post(url, "drive", {"move": "forward"})
+    assert state_of(url)["manual"]["move"] == "forward"
+
+    post(url, "set", {"legs": ["front_left"], "axis": "depth", "value": 88})
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and state_of(url)["manual"]["move"] is not None:
+        time.sleep(0.02)
+    assert state_of(url)["manual"]["move"] is None
+
+
+def test_the_page_markup_is_balanced() -> None:
+    """A stray tag renders as garbage in the browser and as nothing here.
+
+    Every other test in this file talks to the server; the page itself is only
+    ever asserted against by substring. So a restructuring that leaves a <div>
+    open passes all of them and breaks the whole layout -- which is exactly the
+    kind of edit the tab bar and the shared console each were.
+    """
+    from html.parser import HTMLParser
+
+    void = {"br", "hr", "img", "input", "meta", "link", "source", "track", "area", "base", "col"}
+
+    class Balance(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stack: list[tuple[str, int]] = []
+            self.problems: list[str] = []
+
+        def handle_starttag(self, tag: str, attrs: object) -> None:
+            if tag not in void:
+                self.stack.append((tag, self.getpos()[0]))
+
+        def handle_endtag(self, tag: str) -> None:
+            if not self.stack:
+                self.problems.append(f"line {self.getpos()[0]}: </{tag}> closes nothing")
+                return
+            opened, line = self.stack.pop()
+            if opened != tag:
+                self.problems.append(
+                    f"line {self.getpos()[0]}: </{tag}> closes <{opened}> opened on line {line}"
+                )
+
+    parser = Balance()
+    parser.feed(resources.files("robodog.teach").joinpath("ui.html").read_text(encoding="utf-8"))
+    assert not parser.problems, "; ".join(parser.problems)
+    unclosed = ", ".join(f"<{tag}> line {line}" for tag, line in parser.stack)
+    assert not parser.stack, f"never closed: {unclosed}"

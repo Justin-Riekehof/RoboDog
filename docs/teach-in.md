@@ -59,7 +59,8 @@ with `--viewer`, the MuJoCo window next to it showing live physics.
 - **Leg reach and roll sliders** move all four feet together — reach is measured
   *in the leg plane*, so it means the same thing at any roll angle;
   **Stand/Crouch** buttons jump to the known poses; per-leg **±5 mm** and
-  **±10°** nudges for fine trims.
+  **±10°** nudges for fine trims. **Home**, in the drive console beside the
+  tab, is the bigger hammer: it stops the robot first and then stands.
 - **Keyframes**: `Capture pose` records the current pose `dt` seconds after the
   previous one; the table offers *Go to* (drive the robot back into a frame)
   and *Delete*; `Preview` replays everything captured so far and returns to
@@ -120,12 +121,20 @@ none of this can fix is a **dropped Wi-Fi link**: no stop command reaches a
 robot that is no longer listening (ASSUMPTIONS D10), so the robot belongs on a
 stand with the power switch in reach.
 
-### Driving by hand
+## The drive console: hand control on both tabs
 
-Below the sequence sits a **drive pad**: the eight directions laid out as the
-controller they are, with STOP in the middle. One click sends one move straight
-through the safety supervisor to the robot — the same command a sequence step
-would send, just without the timer.
+To the right of whichever tab is open sits the **drive console**, which belongs
+to the robot rather than to a tab: the eight directions laid out as the
+controller they are with STOP in the middle, the **Home** button, and the
+firmware's canned animations. One click sends one move straight through the
+safety supervisor to the robot — the same command a sequence step would send,
+just without the timer.
+
+**Home** is the way back to the middle from wherever the robot ended up: it
+stops a latched move *first*, then stands in the pose the session opened in.
+The order is the point — a robot still walking walks straight out of the pose
+it was just given. On a robot that takes no leg targets (stock firmware) Home
+is the stop alone, and says so rather than pretending.
 
 Two things follow from the firmware's model and are worth internalising:
 
@@ -135,6 +144,13 @@ Two things follow from the firmware's model and are worth internalising:
 - **The page is the dead-man's switch.** Exactly like a running sequence, a
   hand-driven move is released when the page stops answering — close the tab,
   lose the browser, sleep the laptop, and the robot stops within ten seconds.
+
+- **A pose ends the move.** Our firmware clears both drive axes when it applies
+  a pose (`robodogApply`), because a gait rewrites the servos every pass and
+  would walk out of the pose within milliseconds. So dragging a foot — or
+  pressing Home, Stand or Crouch — stops the robot, and the pad stops showing a
+  direction. Against mock and the twin the two coexist, since nothing there
+  overwrites anything.
 
 The pad is locked while a sequence runs (its STOP is not), and starting a
 sequence takes over from hand driving.

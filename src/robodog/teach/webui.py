@@ -258,7 +258,7 @@ class TeachUIServer:
             "busy": self._busy,
             "sequence": self._sequence_json(),
             "run": dict(self._run),
-            "manual": {"move": self._manual, "note": self._manual_note},
+            "manual": self._manual_json(),
             "safety": {
                 "state": self._client.safety_state.name,
                 "reason": self._client.estop_reason,
@@ -419,6 +419,8 @@ class TeachUIServer:
             return self._save(body)
         if action == "preview":
             return self._start_preview()
+        if action == "home":
+            return self._home()
         if action == "drive":
             return self._drive(body)
         if action == "function":
@@ -565,6 +567,19 @@ class TeachUIServer:
             return 409, {"ok": False, "message": str(exc)}
         return 200, {"ok": True, "message": f"saved {path}", "path": str(path)}
 
+    def _manual_json(self) -> dict[str, Any]:
+        """The hand-driven move, reconciled against the robot's own state.
+
+        A latched move can end without anyone pressing stop: posing the robot
+        clears it (see `HttpBackend.flush_pose`). Remembering the last button
+        pressed would then leave the page claiming a move the robot no longer
+        has -- with the drive pad now on both tabs, that is one drag away.
+        """
+        if self._manual is not None and self._client.state().drive == Drive(0, 0):
+            self._manual = None
+            self._manual_note = ""
+        return {"move": self._manual, "note": self._manual_note}
+
     def _busy_guard(self) -> None:
         """Re-check under the lock: the outer check in handle_action is not, so
         two runs posted in the same instant could otherwise both start."""
@@ -692,6 +707,37 @@ class TeachUIServer:
         self._manual_note = ""
         label = MOVE_LABELS.get(move, move)
         return 200, {"ok": True, "message": label if self._manual else "stopped"}
+
+    def _home(self) -> tuple[int, dict[str, Any]]:
+        """Back to the pose the session opened in, from wherever the robot is.
+
+        Three things move it away from there and each needs undoing in turn: a
+        hand-driven move latches, a canned animation leaves the firmware in its
+        own mode, and posing simply is somewhere else. The stop goes first --
+        a robot still walking would walk out of the pose it was just given.
+
+        A robot that takes no leg targets gets the stop and is told so. Doing
+        half the job quietly is how a "centre" button ends up trusted for
+        something it never did.
+        """
+        self._client.stop()
+        self._manual = None
+        self._manual_note = ""
+        if not self._pose_enabled:
+            return 200, {
+                "ok": True,
+                "message": f"stopped -- {self._client.backend_name!r} takes no leg targets, "
+                "so there is no pose to return to",
+            }
+        errors = self._session.apply_pose("stand")
+        if errors:
+            return 200, {
+                "ok": False,
+                "message": "; ".join(
+                    f"{leg.name}: {message}" for leg, message in sorted(errors.items())
+                ),
+            }
+        return 200, {"ok": True, "message": "centred: stopped and standing"}
 
     def _function(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         """Run one of the firmware's canned animations (ASSUMPTIONS B4).
