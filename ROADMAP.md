@@ -137,11 +137,19 @@ commands plus an on-device safety net.
   ✅ **host side done 2026-08-22**: `HttpBackend` arms it at 1500 ms on connect
   and disarms it on disconnect -- leaving it armed would stop the robot for
   whoever drives it next from the vendor's own page, which sends nothing while
-  it walks. Every accepted command feeds it, so ordinary traffic keeps it alive
-  and no keep-alive thread is needed; and because it only acts on a robot that
-  is *moving*, a long pause during teach-in costs nothing. Exercised on the
-  robot in the teach session below -- the arming request was accepted, which is
-  weaker evidence than the on-device measurement above and is all it is.
+  it walks. Because it only acts on a robot that is *moving*, a long pause
+  during teach-in costs nothing.
+  ⚠️ **and it needed a keep-alive, which the first version did not have.**
+  "Any accepted command feeds it, so ordinary traffic keeps it alive" was
+  written here and is false where it matters: traffic to the robot is *poses*,
+  and poses only flow when the robot is not driving. A latched move is the one
+  state that produces no traffic, because the firmware walks on by itself
+  (ASSUMPTIONS B3/D4) -- so the single state the watchdog guards was the single
+  state that starved it. The robot stopped and crouched after 1.5 s of walking
+  on a perfectly healthy link, reported from the teach UI 2026-08-22. The host
+  now sends `ping` every 500 ms while and only while a move is latched, which
+  also changes what the watchdog means: from "has the host said anything
+  lately" to "is the host still there and does it still want this move".
 - Pose-level commands (leg targets, joint angles) → `LEG_TARGET` and
   `JOINT_ANGLES` on real hardware, so `motion` routines and pose teach-in run on
   the robot.

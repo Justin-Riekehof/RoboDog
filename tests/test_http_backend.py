@@ -676,3 +676,103 @@ def test_every_paced_loop_can_ask_how_fast_to_run(
     assert client.suggested_tick == SUGGESTED_TICK
     assert SUGGESTED_TICK > DEFAULT_TICK
     client.disconnect()
+
+
+# --- keeping a walking robot alive ---------------------------------------------------
+
+
+def test_a_latched_move_is_kept_alive(firmware: tuple[FakeFirmware, str]) -> None:
+    """The bug this exists for: the robot stopped and crouched mid-walk.
+
+    The firmware watchdog only acts on a robot that is MOVING, and a moving
+    robot is exactly what the host sends nothing to -- the move latches and the
+    firmware walks on by itself. So the one state the watchdog guards produced
+    no traffic to feed it, and a healthy link looked identical to a dead one
+    after a second and a half of walking.
+    """
+    from robodog.backends.http import FIRMWARE_FEED_INTERVAL, FIRMWARE_WATCHDOG_MS
+
+    state, host = firmware
+    state.robodog = True
+    clock = FakeClock()
+    backend = HttpBackend(host, clock=clock)
+    backend.connect()
+
+    backend.send(Drive(forward=1, turn=0))
+    state.calls.clear()
+
+    # Walk for four watchdog periods, ticking as the teach loop does.
+    for _ in range(int(4 * FIRMWARE_WATCHDOG_MS / 1000 / 0.1)):
+        clock.advance(0.1)
+        backend.tick(0.1)
+
+    feeds = [call for call in state.calls if call[0] == "ping"]
+    assert feeds, "the robot heard nothing for six seconds of walking"
+    # Never a gap the firmware would call silence.
+    assert len(feeds) >= 4 * 3 - 1
+
+    backend.disconnect()
+    assert FIRMWARE_FEED_INTERVAL * 1000 * 2 < FIRMWARE_WATCHDOG_MS, (
+        "two lost feeds must not be enough to stop the robot"
+    )
+
+
+def test_a_standing_robot_is_left_in_peace(firmware: tuple[FakeFirmware, str]) -> None:
+    """The other half: a feed on a robot that is not moving would be pure
+    traffic. The watchdog ignores a stopped robot, so there is nothing to keep
+    alive -- and over a link this slow, every needless request costs a pose."""
+    state, host = firmware
+    state.robodog = True
+    clock = FakeClock()
+    backend = HttpBackend(host, clock=clock)
+    backend.connect()
+    state.calls.clear()
+
+    for _ in range(100):
+        clock.advance(0.1)
+        backend.tick(0.1)
+
+    assert not [call for call in state.calls if call[0] == "ping"]
+    backend.disconnect()
+
+
+def test_posing_counts_as_being_alive(firmware: tuple[FakeFirmware, str]) -> None:
+    """Any accepted command feeds the firmware watchdog, so a pose already says
+    "still here". Sending a ping next to it would be one wasted round trip on a
+    link that carries ten of them a second."""
+    state, host = firmware
+    state.robodog = True
+    clock = FakeClock()
+    backend = HttpBackend(host, clock=clock)
+    backend.connect()
+    backend.send(Drive(forward=1, turn=0))
+    state.calls.clear()
+
+    for _ in range(20):
+        clock.advance(0.1)
+        # A pose stops the drive on the robot, so this also proves the feed
+        # stops when the move does.
+        for leg in LegId:
+            backend.send(SetLegTarget(leg, LegTarget(16.0, 95.0, 25.0)))
+        backend.tick(0.1)
+
+    assert not [call for call in state.calls if call[0] == "ping"]
+
+
+def test_the_stock_firmware_is_never_pinged(firmware: tuple[FakeFirmware, str]) -> None:
+    """It has no watchdog to feed and answers 500 to `ping` -- a feed there
+    would be an error on every tick of every walk."""
+    state, host = firmware
+    state.robodog = False
+    clock = FakeClock()
+    backend = HttpBackend(host, clock=clock)
+    backend.connect()
+    backend.send(Drive(forward=1, turn=0))
+    state.calls.clear()
+
+    for _ in range(50):
+        clock.advance(0.1)
+        backend.tick(0.1)
+
+    assert not [call for call in state.calls if call[0] == "ping"]
+    backend.disconnect()

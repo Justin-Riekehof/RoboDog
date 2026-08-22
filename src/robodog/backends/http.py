@@ -25,9 +25,11 @@ worth being able to overrule by hand.
 from __future__ import annotations
 
 import contextlib
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from typing import Final
 
 from robodog.api.types import (
@@ -75,6 +77,19 @@ ROBODOG_CAPABILITIES: Final = frozenset({Capability.LEG_TARGET})
 # a walk costs at most this.
 FIRMWARE_WATCHDOG_MS: Final = 1500
 
+# How often the host says "still here" while a move is latched.
+#
+# The firmware watchdog only acts on a robot that is MOVING -- and a latched
+# move is the one state in which the host has nothing to say, because the
+# firmware walks on by itself until a stop follows (ASSUMPTIONS B3/D4). So the
+# single state the watchdog guards is the single state that produces no traffic
+# to feed it, and the robot stops itself mid-walk on a perfectly healthy link.
+# That inversion is why this exists; "ordinary traffic keeps it alive" is true
+# only of posing, which is exactly when the watchdog is asleep.
+#
+# Three feeds per watchdog period, so two may be lost before the robot acts.
+FIRMWARE_FEED_INTERVAL: Final = FIRMWARE_WATCHDOG_MS / 3000.0
+
 # What the host's own watchdog must tolerate on this transport. A pose request
 # was measured at 1.0-1.2 s on the robot's own access point (2026-08-22), and
 # the supervisor checks its deadline immediately after the request returns --
@@ -113,6 +128,7 @@ class HttpBackend:
         *,
         timeout: float = DEFAULT_TIMEOUT,
         firmware: str = "auto",
+        clock: Callable[[], float] = time.monotonic,
         opener: urllib.request.OpenerDirector | None = None,
     ) -> None:
         if firmware not in FIRMWARE_CHOICES:
@@ -131,6 +147,10 @@ class HttpBackend:
         # and one round trip beats four.
         self._pose: dict[LegId, LegTarget] = {}
         self._pose_dirty = False
+        self._clock = clock
+        # When the robot last heard anything from us, and whether it is counting.
+        self._last_sent = clock()
+        self._watchdog_armed = False
         # Bypass any system proxy: the robot is a link-local device on its own
         # access point, and routing 192.168.4.1 through a configured corporate
         # or VPN proxy would simply fail.
@@ -154,6 +174,9 @@ class HttpBackend:
     def _get(self, path: str, *, timeout: float | None = None) -> bytes:
         url = f"{self._base_url()}{path}"
         self.request_log.append(path)
+        # Any accepted command feeds the firmware watchdog, so this is also the
+        # moment the robot last heard from us -- see _feed_firmware_watchdog.
+        self._last_sent = self._clock()
         try:
             with self._opener.open(url, timeout=timeout or self.timeout) as response:
                 body: bytes = response.read()
@@ -209,12 +232,13 @@ class HttpBackend:
             ROBODOG_CAPABILITIES if ours else frozenset()
         )
         if ours:
-            # Arm the robot's own watchdog. Every accepted command feeds it, so
-            # ordinary traffic keeps it alive and no keep-alive thread is
-            # needed; and because it only acts while the robot is moving, a
-            # long pause during teach-in never trips it.
+            # Arm the robot's own watchdog. It only acts while the robot is
+            # moving, so a long pause during teach-in never trips it -- but a
+            # moving robot is exactly what we send nothing to, so it needs
+            # feeding: see _feed_firmware_watchdog.
             try:
                 self._control("watchdog", FIRMWARE_WATCHDOG_MS)
+                self._watchdog_armed = True
             except BackendError as exc:
                 # Only reachable when the firmware was declared rather than
                 # probed. Failing loudly is the point: the operator asserted a
@@ -256,6 +280,7 @@ class HttpBackend:
         if self._connected and Capability.LEG_TARGET in self.capabilities:
             with contextlib.suppress(BackendError):
                 self._control("watchdog", 0)
+            self._watchdog_armed = False
         # Skip the stop when we already know the robot is stopped: repeating it
         # over a dead link only doubles the time spent failing.
         if self._connected and not self._stop_confirmed:
@@ -371,7 +396,32 @@ class HttpBackend:
     def tick(self, dt: float) -> None:
         self._require_connected()
         self.flush_pose()
+        self._feed_firmware_watchdog()
         self._model.tick(dt)
+
+    def _feed_firmware_watchdog(self) -> None:
+        """Tell the robot we are still here, while and only while it is moving.
+
+        Without this the on-device watchdog stops a walk on a healthy link: it
+        acts only on a moving robot, and a moving robot is precisely what we
+        send nothing to, because the move latches in the firmware and walks on
+        by itself. Any command counts as a feed, so this is needed exactly when
+        there is no command to send -- hence a `ping`, which changes nothing.
+
+        Feeding does not defeat the watchdog, it is what gives it its meaning.
+        Before this it asked "has the host said anything lately", which conflates
+        being alive with having something to say. Now it asks "is the host still
+        there and does it still want this move" -- and when the host dies mid-walk
+        the pings stop with it, which is the case the watchdog exists for.
+        """
+        if not self._watchdog_armed:
+            return
+        drive = self._model.state().drive
+        if drive.forward == 0 and drive.turn == 0:
+            return
+        if self._clock() - self._last_sent < FIRMWARE_FEED_INTERVAL:
+            return
+        self._control("ping", 0)
 
     def flush_pose(self) -> None:
         """Send the staged foot targets, if any changed since the last flush.
