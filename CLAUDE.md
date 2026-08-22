@@ -26,6 +26,12 @@ Read in this order when context is needed:
   [vendor/wavego-firmware/ServoCtrl.h](vendor/wavego-firmware/ServoCtrl.h)
   including quirks (see ASSUMPTIONS C6). Improvements go in separate,
   clearly-named functions, never by silently "fixing" the port.
+- **A backend does not know itself until `connect()`.** Its `capabilities`,
+  `suggested_watchdog` and `suggested_tick` are answers, not constants: the
+  Wi-Fi transport probes the robot for its firmware while connecting, and
+  before that it can only report the pessimistic stock set. Reading any of
+  them earlier has now shipped two bugs, most recently a teach session that
+  E-stopped itself on open with a stock-sized budget.
 - **vendor/ is read-only** — pinned upstream reference (MIT), never edited.
 - **No hardware in tests.** CI and the default test suite must pass with no
   robot attached, ever. Hardware-touching code is exercised via mock/replay.

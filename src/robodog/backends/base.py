@@ -39,6 +39,20 @@ class Backend(Protocol):
         ...
 
 
+def watchdog_for(backend: Backend) -> float | None:
+    """The host-side watchdog budget this backend needs, or None if it has none.
+
+    The supervisor measures the gap between feeds, and on a slow transport the
+    request itself IS that gap. A budget below the transport's own latency does
+    not make anything safer -- it E-stops a healthy robot mid-command.
+
+    Only meaningful once the backend is connected: a transport that probes the
+    robot for its firmware does not know its own latency before it has asked.
+    """
+    suggested = getattr(backend, "suggested_watchdog", None)
+    return float(suggested) if suggested is not None else None
+
+
 def tick_for(backend: Backend) -> float:
     """How fast this backend can actually be driven, in seconds per tick.
 

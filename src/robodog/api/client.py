@@ -44,18 +44,37 @@ class RobotClient:
         backend: Backend,
         *,
         limits: LimitConfig | None = None,
-        watchdog_timeout: float = DEFAULT_WATCHDOG_TIMEOUT,
+        watchdog_timeout: float | None = None,
         clock: Callable[[], float] | None = None,
     ) -> None:
         self._backend = backend
+        # None means "ask the backend once it can answer" -- see connect().
+        self._watchdog_fixed = watchdog_timeout is not None
         self._supervisor = SafetySupervisor(
-            backend, limits=limits, watchdog_timeout=watchdog_timeout, clock=clock
+            backend,
+            limits=limits,
+            watchdog_timeout=(
+                watchdog_timeout if watchdog_timeout is not None else DEFAULT_WATCHDOG_TIMEOUT
+            ),
+            clock=clock,
         )
 
     # --- lifecycle ---
 
     def connect(self) -> None:
         self._backend.connect()
+        # Only now can a backend answer this. The Wi-Fi transport probes the
+        # robot for its firmware while connecting, and what it finds decides
+        # both what the robot can be told and how long a command takes -- so a
+        # budget taken before connect is always the pessimistic, stock one, and
+        # E-stops a healthy robot the moment a pose exceeds it. Asked here, not
+        # in every caller, because every caller got it wrong the same way.
+        if not self._watchdog_fixed:
+            from robodog.backends.base import watchdog_for
+
+            suggested = watchdog_for(self._backend)
+            if suggested is not None:
+                self._supervisor.watchdog_timeout = suggested
 
     def disconnect(self) -> None:
         self._supervisor.disarm()
@@ -96,6 +115,11 @@ class RobotClient:
         from robodog.backends.base import tick_for
 
         return tick_for(self._backend)
+
+    @property
+    def watchdog_timeout(self) -> float:
+        """The budget actually in force, which is not known until connect()."""
+        return self._supervisor.watchdog_timeout
 
     @property
     def safety_state(self) -> SafetyState:

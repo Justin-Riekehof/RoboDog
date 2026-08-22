@@ -72,6 +72,23 @@ class SafetySupervisor:
         if self._state is SafetyState.ARMED:
             self._state = SafetyState.DISARMED
 
+    @property
+    def watchdog_timeout(self) -> float:
+        return self._watchdog_timeout
+
+    @watchdog_timeout.setter
+    def watchdog_timeout(self, seconds: float) -> None:
+        """Resize the budget, which only a connected transport can justify.
+
+        Set once, by RobotClient.connect(), when the backend can finally say
+        what its own latency is. Not something to reach for while armed: a
+        budget widened because a command was slow is a watchdog talked out of
+        doing its job.
+        """
+        if seconds <= 0:
+            raise ValueError("watchdog timeout must be positive")
+        self._watchdog_timeout = seconds
+
     def estop(self, reason: str = "operator") -> None:
         """Run the backend's safe sequence and latch. Idempotent."""
         if self._state is SafetyState.ESTOPPED:

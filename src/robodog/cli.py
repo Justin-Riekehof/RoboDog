@@ -44,7 +44,6 @@ from robodog.calibration import (
 )
 from robodog.errors import BackendError, RobodogError
 from robodog.kinematics.poses import crouch_pose, stand_pose
-from robodog.safety.supervisor import DEFAULT_WATCHDOG_TIMEOUT
 from robodog.teach.format import load_routine
 from robodog.teach.player import PlayEvent, play_routine
 
@@ -76,18 +75,6 @@ def make_backend(
             "Wi-Fi's sconfig (ASSUMPTIONS D2)"
         )
     raise BackendError(f"unknown backend {name!r}")
-
-
-def _watchdog_for(backend: Backend) -> float:
-    """Watchdog budget a backend can actually live with.
-
-    The supervisor measures the gap between feeds, and on a slow transport the
-    request itself IS that gap -- a pose over Wi-Fi takes about a second. A
-    budget below that E-stops a healthy robot, which is not safety, just noise.
-    Backends that know their own latency say so; the rest keep the default.
-    """
-    suggested = getattr(backend, "suggested_watchdog", None)
-    return float(suggested) if suggested is not None else DEFAULT_WATCHDOG_TIMEOUT
 
 
 def _tick_for(backend: Backend, requested: float | None) -> float:
@@ -202,7 +189,9 @@ def cmd_play(args: argparse.Namespace) -> int:
     # some thirty times faster than real time, so there would be nothing to see.
     realtime = args.realtime or on_hardware or with_viewer
 
-    with RobotClient(backend, watchdog_timeout=_watchdog_for(backend)) as client:
+    # No budget passed: the client asks the backend at connect, which is the
+    # first moment a transport that probes for its firmware can answer.
+    with RobotClient(backend) as client:
         client.arm()
         if routine.repeat == 1:
             pacing = f"{routine.duration:.2f}s"
@@ -424,10 +413,10 @@ def cmd_teach(args: argparse.Namespace) -> int:
         viewer=args.viewer,
         firmware=args.firmware,
     )
-    # See TEACH_WATCHDOG: the budget matches what a stalled loop can cost here.
-    watchdog = _watchdog_for(backend)
-    if not on_hardware:
-        watchdog = TEACH_VIEWER_WATCHDOG if args.viewer else TEACH_WATCHDOG
+    # On hardware the transport decides, at connect (see RobotClient.connect).
+    # Off it, the budget is about what a stalled loop can cost here instead --
+    # see TEACH_WATCHDOG.
+    watchdog = None if on_hardware else (TEACH_VIEWER_WATCHDOG if args.viewer else TEACH_WATCHDOG)
     with RobotClient(backend, watchdog_timeout=watchdog) as client:
         client.arm()
         pose_capable = Capability.LEG_TARGET in client.capabilities

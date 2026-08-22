@@ -776,3 +776,53 @@ def test_the_stock_firmware_is_never_pinged(firmware: tuple[FakeFirmware, str]) 
 
     assert not [call for call in state.calls if call[0] == "ping"]
     backend.disconnect()
+
+
+def test_the_watchdog_budget_waits_for_the_firmware_probe(
+    firmware: tuple[FakeFirmware, str],
+) -> None:
+    """Regression: the teach UI E-stopped itself the moment it opened.
+
+    `watchdog timeout (0.500s)` on a robot that had just been recognised as
+    running our firmware, whose budget is 3 s. The budget was taken from the
+    backend before `connect()`, and before connect a backend that probes for
+    its firmware can only report the pessimistic, stock answer -- so a pose,
+    which takes longer than the stock budget, latched an E-stop on a perfectly
+    healthy robot.
+    """
+    from robodog.backends.http import STOCK_WATCHDOG, SUGGESTED_WATCHDOG
+
+    state, host = firmware
+    state.robodog = True
+    backend = HttpBackend(host)
+    # What every caller used to read, and why they all read it wrongly.
+    assert backend.suggested_watchdog == STOCK_WATCHDOG
+
+    client = RobotClient(backend)
+    client.connect()
+    assert client.watchdog_timeout == SUGGESTED_WATCHDOG
+    client.disconnect()
+
+
+def test_an_explicit_budget_is_never_overruled(firmware: tuple[FakeFirmware, str]) -> None:
+    """Bring-up and calibration set their own, for reasons the transport knows
+    nothing about -- a human reading a prompt is not a slow link."""
+    state, host = firmware
+    state.robodog = True
+    client = RobotClient(HttpBackend(host), watchdog_timeout=42.0)
+    client.connect()
+    assert client.watchdog_timeout == 42.0
+    client.disconnect()
+
+
+def test_a_stock_robot_keeps_the_strict_budget(firmware: tuple[FakeFirmware, str]) -> None:
+    """Nothing slow to do there, so nothing to widen the budget for. Widening
+    it everywhere would have 'fixed' this bug by blunting the watchdog."""
+    from robodog.backends.http import STOCK_WATCHDOG
+
+    state, host = firmware
+    state.robodog = False
+    client = RobotClient(HttpBackend(host))
+    client.connect()
+    assert client.watchdog_timeout == STOCK_WATCHDOG
+    client.disconnect()
