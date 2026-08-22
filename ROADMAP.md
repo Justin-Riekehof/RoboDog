@@ -261,12 +261,80 @@ Still open for this milestone:
 **Acceptance:** record a gamepad session → YAML file → replay on sim and
 hardware; git diff of an edited routine is human-readable.
 
+## M8 — Vision-guided behaviours ("Komm zu mir")
+
+**Scheduled ahead of M5/M6 at the owner's request (2026-08-23)**, and to be
+started from the owner's AI machine. This is the first motion with nobody's
+hand on the control: a spoken or typed command, a person found in the camera,
+and the robot walking towards them.
+
+### The constraint that shapes it
+
+This unit has **no PSRAM** (`psram=0`, read back 2026-08-22), so the firmware
+runs `fb_count = 1`: a browser holding `/stream` blocks every other frame grab.
+There can be exactly **one** consumer of the robot's stream.
+
+So the host reads it once and re-serves it: the teach UI's Camera tab shows the
+same frames with detection boxes drawn on them, and the vision loop never
+competes with the browser for the single frame buffer.
+
+### Decided
+
+- **Detector: YOLO via `ultralytics`**, behind a new optional `vision` extra
+  like `sim` and `viz` are. Never imported from a mock/http path, so the
+  no-extras install and CI stay green without it.
+- **LLM: the owner's vLLM server**, an OpenAI-compatible `/v1/chat/completions`
+  endpoint. Base URL and model name configurable; no key assumed.
+- **The model does not drive.** It maps free text to a *named behaviour plus
+  parameters*, once, before anything moves. A deterministic loop then runs the
+  behaviour through `SafetySupervisor`. Two reasons, and the first is the hard
+  rule of this repo: nothing reaches a backend around the supervisor. The
+  second is that an 8B model inside a 10 Hz control loop is latency and
+  non-determinism in the one place neither belongs. Emitting a structured call
+  is also what a coder model is best at.
+
+### Shape
+
+- `robodog.vision` — `Detection(label, bearing, height_fraction, confidence)`
+  and a `Detector` protocol; the YOLO implementation behind the extra. Bearing
+  is normalised (-1 left .. +1 right) so the behaviour never sees pixels.
+- `robodog.vision.stream` — the MJPEG reader (multipart/x-mixed-replace) and
+  the re-broadcaster the UI and the behaviour both read from.
+- `robodog.behaviour` — **pure logic**: detections and a clock in, drive
+  intents out, as a state machine (searching / approaching / arrived / lost).
+  Detector and clock injected, so its tests need no model, no camera and no
+  robot, exactly as the kinematics tests need no hardware.
+- `robodog.ai` — text to behaviour-call, against the vLLM endpoint. Refuses
+  anything not in the behaviour vocabulary rather than improvising.
+
+### Safety, which is new here
+
+The target is a person and the robot has no depth sensor, no bumper and no
+servo feedback. Distance is inferred from bounding-box height, which is a
+guess, so: a conservative stop size, a hard timeout on the whole behaviour, the
+page's dead-man's switch ending it like any run, and STOP/Escape still the
+fastest way out. The on-device watchdog keeps being fed while it walks, as it
+is now.
+
+### Open for whoever implements it
+
+- Box height to distance: needs one calibration session against the real robot.
+- What "searching" does when nothing is found -- turn in place, and for how
+  long before giving up.
+- Whether the behaviour owns a stop distance or the operator sets it per run.
+
+**Acceptance:** "Komm zu mir" typed into the teach UI turns the robot towards a
+person and walks it to a stop at a safe distance; the behaviour's state machine
+is covered headlessly with a scripted detector; CI passes with the `vision`
+extra absent.
+
 ## M7 — Outlook (not scheduled)
 
 - USB-serial backend as a second transport (the serial JSON path accepts
   gestures, LEDs and buzzer, which Wi-Fi does not).
 - URDF/mesh pipeline from the parametric CadQuery leg model (`wavego_leg.py`,
   currently custom/out-of-repo) → higher-fidelity twin.
-- IMU-based closed-loop behaviors; OpenCV via the ESP32 camera stream.
+- IMU-based closed-loop behaviors. (Vision moved out of this list into M8,
+  which is scheduled.)
 - Optional servo feedback if it is ever wanted: potentiometer taps or a swap to
   SC09 bus servos — deliberately **not** on the critical path.
