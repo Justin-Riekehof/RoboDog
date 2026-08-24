@@ -7,7 +7,7 @@ M0 runs entirely without hardware.
 
 Everything that can be built and proven without a robot:
 
-- Repo skeleton: uv/pyproject, ruff, mypy, pytest, GitHub Actions CI, docs.
+- Repo skeleton: uv/pyproject, ruff, mypy, pytest, docs.
 - `robodog.kinematics`: faithful port of the firmware leg IK, closed-form FK,
   servo/PWM mapping, gait generators, easing — all pure functions.
 - `robodog.api` + `Backend` protocol + capability model.
@@ -87,7 +87,8 @@ targets to 0.15 mm under load. 40 headless tests, ~2 s.
 loads are not meaningful yet; no camera or IMU noise model.
 
 **Acceptance:** `robodog play routines/patrol-wifi.yaml --backend sim --viewer`
-shows the robot walking in the MuJoCo viewer; CI runs the headless sim tests.
+shows the robot walking in the MuJoCo viewer; the headless sim tests run in the
+ordinary suite.
 
 This is where virtual teach-in becomes practical: poses and trajectories are
 authored against the twin, validated by the safety layer, and stored as routine

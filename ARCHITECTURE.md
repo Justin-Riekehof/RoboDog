@@ -30,11 +30,12 @@ before it reaches the backend. Backends are swappable at construction time:
         MockBackend      SimBackend       HttpBackend
         (M0, in-proc     (M2, MuJoCo      (M1, /control over
          kinematic        physics +        Wi-Fi to the stock
-         state, CI-safe)  viewer)          firmware)
+         state, no I/O)   viewer)          firmware)
 ```
 
 - The **mock backend** is a deterministic, dependency-free kinematic model.
-  It is the CI reference target and must always work without hardware.
+  It is the reference target for the test suite and must always work without
+  hardware.
 - The **sim backend** (MuJoCo) is the digital twin. It does not reimplement any
   command semantics: it *composes* the mock backend as the command interpreter
   and adds physics, so the ported firmware logic exists exactly once. Its MJCF

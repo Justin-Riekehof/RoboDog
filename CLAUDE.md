@@ -33,8 +33,9 @@ Read in this order when context is needed:
   them earlier has now shipped two bugs, most recently a teach session that
   E-stopped itself on open with a stock-sized budget.
 - **vendor/ is read-only** — pinned upstream reference (MIT), never edited.
-- **No hardware in tests.** CI and the default test suite must pass with no
-  robot attached, ever. Hardware-touching code is exercised via mock/replay.
+- **No hardware in tests.** The default test suite must pass with no robot
+  attached, ever, on any machine. Hardware-touching code is exercised via
+  mock/replay.
 
 ## Conventions
 
@@ -56,9 +57,7 @@ Read in this order when context is needed:
 - **Branch per task, land through a PR.** Several agents work this repo at
   once, so `main` is not a workspace: when the owner asks for a commit, it
   goes on its own branch and lands through a pull request, never straight
-  onto `main`. CI runs on every branch, so a push is how you find out within
-  minutes whether you broke something another agent depends on. Rebase on
-  `main` before asking for a merge.
+  onto `main`. Rebase on `main` before asking for a merge.
 - **`--all-extras` is not optional** locally, despite the name: without it
   `matplotlib` and `mujoco` are uninstalled and the tests that assert the twin's
   geometry fail on a tree that is perfectly fine. Since M8 that sync also pulls
@@ -66,10 +65,11 @@ Read in this order when context is needed:
   gigabytes; `uv sync --all-groups --extra viz --extra sim` passes the whole
   suite without it, because nothing in the vision path needs a model to be
   tested.
-- CI (`.github/workflows/ci.yml`) runs ruff, ruff format, mypy and pytest on
-  **every branch**, so work in parallel gets its own verdict without waiting for
-  a merge. Run the same four locally before pushing -- they are what CI runs,
-  in the same order.
+- **There is no CI.** This repository runs no GitHub Actions by the owner's
+  decision, so nothing catches a broken tree except the person who broke it.
+  Run ruff check, ruff format, mypy and pytest -- in that order -- before every
+  push, and do not report work as done without them. With several agents on
+  this repo at once, a push that skipped them is a trap laid for someone else.
 
 ## Current state
 
@@ -81,7 +81,7 @@ Read in this order when context is needed:
   (sim-to-real calibration) is still open — see ROADMAP for its acceptance list.
 - Optional dependencies stay optional: `matplotlib` (`viz` extra), `mujoco`
   (`sim` extra) and `ultralytics` (`vision` extra) must never be imported from a
-  mock/http code path, so the no-extras install and CI stay green without them.
+  mock/http code path, so the no-extras install stays green without them.
   `robodog.vision.yolo` is the only module that touches ultralytics, and only
   `load_detector("yolo")` reaches it.
 - The owner's parametric CadQuery leg model (`wavego_leg.py`) is intentionally
