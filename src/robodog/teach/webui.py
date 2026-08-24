@@ -287,6 +287,20 @@ class TeachUIServer:
         while not self._quit.is_set():
             self._quit.wait(0.2)
 
+    def wait_for_run(self, timeout: float = 10.0) -> bool:
+        """Block until a running sequence or behaviour has finished.
+
+        Exists because polling `/api/state` to find out is self-defeating: that
+        poll IS the page's heartbeat, so a caller watching for the end of a run
+        keeps feeding the dead-man's switch it may be trying to observe. This
+        waits on the worker itself and touches nothing.
+        """
+        thread = self._run_thread
+        if thread is None:
+            return True
+        thread.join(timeout=timeout)
+        return not thread.is_alive()
+
     def shutdown(self) -> None:
         self.request_quit()
         # Wake anyone blocked waiting for the next frame, or the shutdown waits

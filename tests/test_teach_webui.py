@@ -548,7 +548,12 @@ def test_a_run_nobody_watches_stops_itself(tmp_path: Path) -> None:
         post(url, "seq_add", {"move": "forward", "seconds": 0.2})
         post(url, "seq_config", {"repeat": 0})
         post(url, "seq_run", {})
-        state = wait_idle(url)
+        # Deliberately NOT wait_idle: polling /api/state is the page's
+        # heartbeat, so watching for the end of the run would feed the very
+        # switch this test is about, and whether it tripped would come down to
+        # which thread read the fake clock more often. Wait on the worker.
+        assert server.wait_for_run(), "the run never finished"
+        state = state_of(url)
         assert "the page stopped answering" in state["run"]["message"]
         assert drives(backend)[-1] == Drive(0, 0)
     finally:
