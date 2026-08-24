@@ -202,11 +202,23 @@ class AttitudeEstimator:
         self.samples += 1
 
         if elapsed > 0:
-            # Body rates: the axis along the robot rolls it, the one across it
-            # pitches it, and the vertical one turns it.
-            self.roll += forward_g * elapsed
+            # Body rates, and **every one of them is negated**. That is not
+            # three separate sign errors, it is one fact about the frame: the
+            # gyroscope follows the right-hand rule in the chip's own axes,
+            # while (forward, right, up) is LEFT-handed -- forward x right
+            # points down, not up. Every rate therefore comes out inverted, and
+            # writing the mapping "naturally" gets all three wrong at once.
+            #
+            # Measured rather than reasoned, 2026-08-25, by rotating the robot
+            # by hand and comparing each gyro integral with the attitude change
+            # the accelerometer independently saw over the same window: a
+            # nose-up of +81 deg came with -75 on the chip's x, a right lean of
+            # +152 deg with -150 on its y. Magnitudes agree to a few percent,
+            # so the integration was right all along and only the direction was
+            # not (ASSUMPTIONS G9).
+            self.roll += -forward_g * elapsed
             self.pitch += -lateral_g * elapsed
-            self.turned += vertical_g * elapsed
+            self.turned += -vertical_g * elapsed
 
         measured = accel_attitude(sample, self.frame)
         if measured is not None and elapsed > 0:

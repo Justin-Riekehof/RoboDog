@@ -112,11 +112,17 @@ def test_gravity_pulls_the_estimate_back_to_truth() -> None:
 
 def test_turning_accumulates_and_is_reported_as_a_relative_angle() -> None:
     """What a search needs -- and never a compass heading, which nothing here
-    can honestly provide next to twelve servos (G9)."""
+    can honestly provide next to twelve servos (G9).
+
+    The rate is NEGATIVE because turning right reads negative on the chip's z,
+    measured on the robot 2026-08-25. This test asserted the other sign until
+    then, which is what an unmeasured convention looks like from the inside:
+    entirely self-consistent and wrong.
+    """
     estimator = AttitudeEstimator()
     estimator.update(LEVEL)
     for i in range(1, 101):
-        estimator.update(ImuSample(t=i * 0.02, ax=0, ay=0, az=1.0, gx=0, gy=0, gz=45.0))
+        estimator.update(ImuSample(t=i * 0.02, ax=0, ay=0, az=1.0, gx=0, gy=0, gz=-45.0))
     assert estimator.turned == pytest.approx(90.0, abs=1.0)
     assert estimator.turn_since(30.0) == pytest.approx(60.0, abs=1.0)
 
@@ -291,3 +297,56 @@ def test_leaning_right_is_positive_roll_and_left_is_negative() -> None:
     assert right is not None and left is not None
     assert right[1] > 45.0
     assert left[1] < -45.0
+
+
+# --- the gyroscope, measured the same way ------------------------------------
+
+# A tau this large disables the accelerometer's pull without pretending to:
+# tau <= 0 means the OPPOSITE in this estimator -- trust gravity completely --
+# which is a good default and a bad way to test a gyroscope.
+GYRO_ONLY_TAU = 1e9
+
+
+def integrate(gx: float, gy: float, gz: float, *, steps: int = 11, dt: float = 0.1) -> Attitude:
+    """Hold one body rate for a while and return where it ended up.
+
+    ``steps`` samples produce ``steps - 1`` intervals: the first sample has no
+    predecessor and therefore no elapsed time to integrate over.
+    """
+    estimator = AttitudeEstimator(tau=GYRO_ONLY_TAU)
+    for i in range(steps):
+        estimator.update(ImuSample(t=i * dt, ax=0.0, ay=0.0, az=1.0, gx=gx, gy=gy, gz=gz))
+    assert estimator.attitude is not None
+    return estimator.attitude
+
+
+EXPECTED = 30.0 * 0.1 * 10  # rate x dt x intervals
+
+
+def test_a_nose_up_rotation_integrates_to_positive_pitch() -> None:
+    """Measured on the robot: a nose-up of +81 deg came with **-75** on the
+    chip's x axis, so the rate has to be negated to agree with the attitude the
+    accelerometer sees over the same window (ASSUMPTIONS G9)."""
+    assert integrate(-30.0, 0.0, 0.0).pitch == pytest.approx(EXPECTED, abs=0.5)
+
+
+def test_a_right_lean_rotation_integrates_to_positive_roll() -> None:
+    """And a right lean of +152 deg came with -150 on the chip's y."""
+    assert integrate(0.0, -30.0, 0.0).roll == pytest.approx(EXPECTED, abs=0.5)
+
+
+def test_a_right_turn_integrates_to_positive_turned() -> None:
+    """Turned is positive to the right, and a right turn reads negative on the
+    chip's z -- the same inversion, for the same reason."""
+    assert integrate(0.0, 0.0, -30.0).turned == pytest.approx(EXPECTED, abs=0.5)
+
+
+def test_all_three_rates_are_inverted_together() -> None:
+    """One fact about the frame, not three sign errors.
+
+    (forward, right, up) is left-handed -- forward x right points down -- while
+    the gyroscope follows the right-hand rule in the chip's axes. Writing the
+    mapping "naturally" gets all three wrong at once, which is what happened.
+    """
+    result = integrate(-10.0, -10.0, -10.0)
+    assert result.pitch > 0 and result.roll > 0 and result.turned > 0
