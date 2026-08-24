@@ -31,6 +31,7 @@ from robodog.api.types import (
     SetLegTarget,
     TrimServo,
 )
+from robodog.localization import Attitude
 from robodog.safety.limits import LimitConfig
 from robodog.safety.supervisor import DEFAULT_WATCHDOG_TIMEOUT, SafetySupervisor
 
@@ -129,6 +130,19 @@ class RobotClient:
             return None
         url: str | None = getattr(self._backend, "stream_url", None)
         return url
+
+    @property
+    def attitude(self) -> Attitude | None:
+        """The body's own pitch, roll and turn, or None if nothing measures them.
+
+        Like `stream_url`, this asks the backend rather than assuming: a mock
+        has no IMU, stock firmware has one and never reads it, and only our own
+        fork puts it on the wire. A caller that gets None must behave as it did
+        before there was an IMU at all -- which for the vision geometry means
+        assuming the camera is level.
+        """
+        reader: Attitude | None = getattr(self._backend, "attitude", None)
+        return reader
 
     def read_camera_state(self) -> dict[str, int] | None:
         """What the robot says its camera holds, or None if it cannot say.

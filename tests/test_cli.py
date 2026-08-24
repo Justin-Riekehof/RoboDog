@@ -225,3 +225,30 @@ def test_the_player_tick_follows_the_transport() -> None:
     assert _tick_for(SlowBackend(), None) == 0.1  # the backend knows its rate
     assert _tick_for(SlowBackend(), 0.02) == 0.02  # an explicit --tick still wins
     assert _tick_for(MockBackend(), None) == 0.02  # backends that do not say keep the default
+
+
+def test_intent_prints_the_vocabulary_without_asking_a_model(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The one part of the M8 path that needs neither a robot nor a server."""
+    from robodog.behaviour import VOCABULARY
+
+    assert main(["intent", "--vocabulary"]) == 0
+    out = capsys.readouterr().out
+    for name in VOCABULARY:
+        assert name in out
+
+
+def test_intent_with_nothing_to_map_is_a_usage_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["intent"]) == 2
+    assert "say something" in capsys.readouterr().err
+
+
+def test_vision_needs_a_source_when_the_backend_has_no_camera(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Said before the browser opens, not discovered as an empty Camera tab."""
+    assert main(["teach", "demo", "--backend", "mock", "--vision", "--no-llm", "--yes"]) == 1
+    assert "--vision-source" in capsys.readouterr().err

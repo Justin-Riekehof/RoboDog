@@ -72,6 +72,8 @@ extern void robodogCameraReport();
 extern int robodogCameraJson(char *out, size_t n);
 // RoboDog: how long the next pose should take, defined in WAVEGO.ino.
 extern void robodogApplyMs(int val);
+// RoboDog: the IMU ring, sampled in loop() and formatted here (InitConfig.h).
+extern int robodogImuJson(char *out, size_t n, uint32_t since);
 
 
 extern void getMAC(){
@@ -357,6 +359,26 @@ static esp_err_t cmd_handler(httpd_req_t *req){
   // RoboDog: keep-alive that changes nothing else. The feed above did the work.
   else if (!strcmp(variable, "ping")){
   }
+
+  // === RoboDog: the IMU, buffered =========================================
+  // `val` is the last sequence number the host already has; the reply carries
+  // everything newer. That is what makes 50 Hz of gyroscope survive a link
+  // where a request costs 78-140 ms: the samples accumulate on the device and
+  // travel in batches, instead of one per round trip.
+  //
+  // Reads only the ring, never the chip -- loop() is the single I2C writer
+  // (see the fork's README), and breaking that rule crashes the robot.
+  else if (!strcmp(variable, "imu")){
+    char json[2048];
+    int len = robodogImuJson(json, sizeof(json), (uint32_t)(val < 0 ? 0 : val));
+    if (len < 0) { res = -1; }
+    else {
+      httpd_resp_set_type(req, "application/json");
+      httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+      return httpd_resp_send(req, json, len);
+    }
+  }
+  // === end RoboDog =========================================================
 
   // === RoboDog: camera parameters, cam_<name> ==============================
   // The same names the serial transport takes -- robodogCameraSet has the

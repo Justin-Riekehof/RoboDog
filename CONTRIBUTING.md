@@ -44,6 +44,12 @@ cd RoboDog
 uv sync --all-groups --all-extras
 ```
 
+`--all-extras` pulls `ultralytics` and torch for the `vision` extra -- about
+1.2 GB, since torch is pinned to the CPU wheel index (see the comment in
+`pyproject.toml`). If you would rather not, `uv sync --all-groups --extra viz --extra sim` passes the
+whole suite: nothing in the vision path needs a model to be tested. Leaving out `viz` or `sim` does **not** work — two tests assert the
+twin's geometry and fail on a tree that is perfectly fine.
+
 Before opening a pull request, all four must pass — this is exactly what CI
 runs:
 

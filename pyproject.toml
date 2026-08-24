@@ -31,6 +31,35 @@ Issues = "https://github.com/Justin-Riekehof/RoboDog/issues"
 [project.optional-dependencies]
 viz = ["matplotlib>=3.8"]
 sim = ["mujoco>=3.2"]
+# M8. Heavy -- it pulls torch -- and imported only from robodog.vision.yolo,
+# which nothing reaches unless a YOLO detector is actually asked for. Nothing
+# in the vision path needs it to be tested: a scripted detector stands in, so
+# the suite is green on an install that never fetched torch.
+# torch and torchvision are named here although ultralytics already requires
+# them: `tool.uv.sources` below only redirects a project's own dependencies, so
+# a transitive torch would come from PyPI as the CUDA build regardless.
+vision = ["ultralytics>=8.3", "torch>=2.2", "torchvision>=0.17"]
+
+# torch comes from the CPU wheel index, and that is a deliberate default rather
+# than a limitation. The default (CUDA) build of torch pulls sixteen `nvidia-*`
+# packages and lands at 5-6 GB; the CPU one is about 200 MB. What that buys here
+# is nothing worth having: the detector runs against an ESP32 camera delivering
+# ten-odd frames a second over Wi-Fi, and `yolo11n` on a CPU is 20-50 ms a
+# frame -- faster than the pictures arrive. On the machine this was set up on
+# the GPUs are also serving a language model with about 3.6 GB of headroom
+# each, so keeping the detector off them is the better arrangement anyway.
+#
+# CI never installs the `vision` extra, so none of this reaches it. To go back
+# to CUDA, delete the two blocks below and re-lock -- `--yolo-device` already
+# lets a run choose where it executes.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+torchvision = [{ index = "pytorch-cpu" }]
 
 [project.scripts]
 robodog = "robodog.cli:main"
@@ -81,5 +110,15 @@ mypy_path = "src"
 files = ["src/robodog", "tests"]
 
 [[tool.mypy.overrides]]
-module = ["matplotlib.*", "mujoco.*"]
+module = ["matplotlib.*", "mujoco.*", "ultralytics.*", "PIL.*"]
 ignore_missing_imports = true
+
+# ultralytics re-exports YOLO from its package __init__ without the explicit
+# `as` form that strict mode demands. Only reachable with the `vision` extra
+# installed -- CI does not install it, so there mypy sees a missing module and
+# the rule above applies instead. Which is worth knowing: **type errors inside
+# robodog/vision/yolo.py are invisible to CI**, because the module it talks to
+# is not there. Run mypy locally with the extra after touching that file.
+[[tool.mypy.overrides]]
+module = ["ultralytics"]
+implicit_reexport = true

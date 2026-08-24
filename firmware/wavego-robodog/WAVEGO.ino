@@ -395,6 +395,17 @@ void serialCtrl(){
         robodogApplyMs(val);
         robodogApply();
       }
+
+      // The IMU, as one JSON line. val = the last sequence already seen, so
+      // {"var":"imu","val":0} dumps everything the ring still holds. This is
+      // the bring-up answer to "is the gyroscope alive at all", which nothing
+      // in the vendor firmware could ever be asked.
+      else if(docReceive["var"] == "imu"){
+        char json[2048];
+        int len = robodogImuJson(json, sizeof(json), (uint32_t)(val < 0 ? 0 : val));
+        if(len > 0){Serial.println(json);}
+        else{Serial.println("{\"imu\":false}");}
+      }
       // === end RoboDog ======================================================
     }
 
@@ -435,6 +446,144 @@ void threadingsInit(){
 }
 
 
+
+// === RoboDog: the whole IMU, sampled on the device ==========================
+//
+// Lives here rather than beside the sensor's own setup in InitConfig.h, which
+// stays byte-identical to the vendored reference -- the fork adds, it does not
+// edit (see tests/test_firmware_fork.py).
+//
+// The vendor reads three accelerometer axes into globals and then never calls
+// the function: `accXYZUpdate()` is commented out of loop(). Gyroscope and
+// magnetometer are configured by nobody and read by nobody, so six of the nine
+// axes have never left the chip.
+//
+// Why this is buffered rather than polled a sample at a time: a request over
+// Wi-Fi costs 78-140 ms (measured 2026-08-22), so a host polling for single
+// samples would see about eight a second -- useless for integrating a gyro,
+// which is the only reason to have one. The device samples at a fixed rate
+// into a ring, and one request collects everything since the host's last
+// sequence number. Ten requests a second then carry fifty samples a second.
+//
+// The rule this firmware taught us applies here too (see README): only loop()
+// may touch I2C. robodogImuSample() is called from there and nowhere else; the
+// HTTP handler and the serial console only format what is already in the ring.
+
+#define ROBODOG_IMU_SLOTS 64
+// 50 Hz. Fast enough to integrate a walking gait's rotation, slow enough that
+// the read costs a few percent of a loop that also drives twelve servos over
+// the same I2C bus. If the gait degrades after this lands, this is the first
+// number to raise.
+#define ROBODOG_IMU_PERIOD_MS 20
+// The magnetometer sits behind the auxiliary bus and costs its own
+// transaction, and a heading drifts slowly -- it does not need the gyro's rate.
+#define ROBODOG_IMU_MAG_PERIOD_MS 100
+
+struct RobodogImuSample {
+  uint32_t t;                  // device millis() when the sample was taken
+  float ax, ay, az;            // g
+  float gx, gy, gz;            // deg/s
+};
+
+RobodogImuSample ROBODOG_IMU_RING[ROBODOG_IMU_SLOTS];
+// Sequence of the NEWEST sample written, counting from 1. The host sends back
+// the last one it saw, so nothing has to be acknowledged and a lost reply
+// simply gets the samples again on the next request.
+volatile uint32_t ROBODOG_IMU_SEQ = 0;
+uint32_t ROBODOG_IMU_LAST_MS = 0;
+uint32_t ROBODOG_IMU_MAG_MS = 0;
+float ROBODOG_MAG_X = 0, ROBODOG_MAG_Y = 0, ROBODOG_MAG_Z = 0;
+uint32_t ROBODOG_MAG_T = 0;
+bool ROBODOG_MAG_OK = false;
+float ROBODOG_IMU_TEMP = 0;
+
+// Configure the two sensors the vendor leaves untouched. Called from setup(),
+// straight after InitICM20948().
+void robodogImuInit(){
+  // 500 deg/s: a walking quadruped's body turns far slower, but a footfall is
+  // a jolt, and a gyro that saturates during a step corrupts the integral
+  // exactly when it matters.
+  myIMU.setGyrRange(ICM20948_GYRO_RANGE_500);
+  myIMU.setGyrDLPF(ICM20948_DLPF_6);
+  myIMU.setGyrSampleRateDivider(10);
+  ROBODOG_MAG_OK = myIMU.initMagnetometer();
+  if(ROBODOG_MAG_OK){
+    myIMU.setMagOpMode(AK09916_CONT_MODE_20HZ);
+  }
+}
+
+// Called from loop() only. Rate-gated, so it costs one I2C burst per period
+// rather than one per pass.
+void robodogImuSample(){
+  uint32_t now = millis();
+  if(now - ROBODOG_IMU_LAST_MS < ROBODOG_IMU_PERIOD_MS){return;}
+  ROBODOG_IMU_LAST_MS = now;
+
+  myIMU.readSensor();
+  xyzFloat g = myIMU.getGValues();
+  xyzFloat r = myIMU.getGyrValues();
+
+  uint32_t seq = ROBODOG_IMU_SEQ + 1;
+  RobodogImuSample *slot = &ROBODOG_IMU_RING[seq % ROBODOG_IMU_SLOTS];
+  slot->t = now;
+  slot->ax = g.x; slot->ay = g.y; slot->az = g.z;
+  slot->gx = r.x; slot->gy = r.y; slot->gz = r.z;
+  // Published last, so a reader that sees this sequence sees a whole sample.
+  ROBODOG_IMU_SEQ = seq;
+
+  // The vendor's own globals, kept fed for anything that still reads them.
+  ACC_X = g.x; ACC_Y = g.y; ACC_Z = g.z;
+
+  if(ROBODOG_MAG_OK && (now - ROBODOG_IMU_MAG_MS >= ROBODOG_IMU_MAG_PERIOD_MS)){
+    ROBODOG_IMU_MAG_MS = now;
+    xyzFloat m = myIMU.getMagValues();
+    ROBODOG_MAG_X = m.x; ROBODOG_MAG_Y = m.y; ROBODOG_MAG_Z = m.z;
+    ROBODOG_MAG_T = now;
+    ROBODOG_IMU_TEMP = myIMU.getTemperature();
+  }
+}
+
+// Everything newer than `since`, as JSON, into `out`. Returns the length.
+//
+// Stops early rather than truncating mid-value when the buffer would overflow:
+// the reply says which sequence it ended at, and the host asks again. Samples
+// that fell out of the ring are reported as `dropped` rather than silently
+// missing -- a gap the host does not know about is a gap it integrates
+// straight through.
+extern int robodogImuJson(char *out, size_t n, uint32_t since){
+  uint32_t newest = ROBODOG_IMU_SEQ;
+  uint32_t oldest = (newest > ROBODOG_IMU_SLOTS) ? (newest - ROBODOG_IMU_SLOTS + 1) : 1;
+  uint32_t from = (since + 1 > oldest) ? (since + 1) : oldest;
+  uint32_t dropped = (from > since + 1) ? (from - since - 1) : 0;
+
+  int len = snprintf(out, n,
+    "{\"imu\":true,\"rate\":%d,\"seq\":%lu,\"dropped\":%lu,\"mag_ok\":%d,"
+    "\"mag\":[%.2f,%.2f,%.2f],\"mag_t\":%lu,\"temp\":%.1f,\"s\":[",
+    (int)(1000 / ROBODOG_IMU_PERIOD_MS), (unsigned long)newest,
+    (unsigned long)dropped, ROBODOG_MAG_OK ? 1 : 0,
+    ROBODOG_MAG_X, ROBODOG_MAG_Y, ROBODOG_MAG_Z,
+    (unsigned long)ROBODOG_MAG_T, ROBODOG_IMU_TEMP);
+  if(len < 0 || (size_t)len >= n){return -1;}
+
+  uint32_t last = since;
+  for(uint32_t seq = from; seq <= newest; seq++){
+    RobodogImuSample *s = &ROBODOG_IMU_RING[seq % ROBODOG_IMU_SLOTS];
+    // Slack for one more sample plus the closing brackets.
+    if((size_t)len + 96 >= n){break;}
+    int wrote = snprintf(out + len, n - len,
+      "%s[%lu,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f]",
+      (seq == from) ? "" : ",", (unsigned long)s->t,
+      s->ax, s->ay, s->az, s->gx, s->gy, s->gz);
+    if(wrote < 0 || (size_t)(len + wrote) >= n){break;}
+    len += wrote;
+    last = seq;
+  }
+  int tail = snprintf(out + len, n - len, "],\"last\":%lu}", (unsigned long)last);
+  if(tail < 0 || (size_t)(len + tail) >= n){return -1;}
+  return len + tail;
+}
+// === end RoboDog ============================================================
+
 void setup() {
   Wire.begin(S_SDA, S_SCL);
   Serial.begin(115200);
@@ -471,6 +620,7 @@ void setup() {
 
   // ICM20948 INIT.
   InitICM20948();
+  robodogImuInit();   // RoboDog: gyroscope and magnetometer, which the vendor configures nowhere
 
   // WEBCTRL INIT. WIFI settings included.
   webServerInit();
@@ -494,6 +644,7 @@ void loop() {
   allDataUpdate();
   wireDebugDetect();
   robodogRampStep();        // RoboDog: carry GoalPWM towards the staged pose
+  robodogImuSample();       // RoboDog: the only place the IMU is read (I2C rule)
   robodogWatchdogCheck();   // RoboDog: stop by ourselves if the host went away
 }
 

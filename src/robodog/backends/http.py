@@ -46,6 +46,7 @@ from robodog.api.types import (
     SetCameraParam,
     SetFunction,
     SetLegTarget,
+    Telemetry,
     TrimServo,
 )
 from robodog.backends.base import DEFAULT_TICK
@@ -53,6 +54,7 @@ from robodog.backends.mock import MockBackend
 from robodog.camera import STREAM_PATH, STREAM_PORT
 from robodog.errors import BackendError, CapabilityError
 from robodog.kinematics.constants import SERVO_CHANNELS, SERVO_MIDDLE
+from robodog.localization import Attitude, AttitudeEstimator, ImuBatch, parse_imu_batch
 from robodog.netdiag import diagnose_unreachable
 
 DEFAULT_HOST: Final = "192.168.4.1"
@@ -167,6 +169,11 @@ class HttpBackend:
         # What the robot last said its camera holds. None until asked, and on
         # firmware too old to answer.
         self.camera_state: dict[str, int] | None = None
+        # The IMU, folded in as it arrives. The estimator is pure and lives
+        # here only because this is the object that does the asking.
+        self.imu = AttitudeEstimator()
+        self._imu_seq = 0
+        self.imu_dropped = 0
         # When the last pose went out, so the next one can say how long it has.
         self._last_flush: float | None = None
         self._clock = clock
@@ -304,6 +311,12 @@ class HttpBackend:
         self.capabilities = self.STOCK_CAPABILITIES | (
             ROBODOG_CAPABILITIES if ours else frozenset()
         )
+        if ours and self._detect_imu():
+            # Probed separately, not inferred from the firmware being ours: the
+            # build flashed on 2026-08-22 answers `ping` and has never heard of
+            # `imu`. Claiming a capability an older fork cannot honour is the
+            # same mistake as claiming one the stock firmware cannot.
+            self.capabilities |= {Capability.TELEMETRY}
         if ours:
             # Arm the robot's own watchdog. It only acts while the robot is
             # moving, so a long pause during teach-in never trips it -- but a
@@ -418,6 +431,43 @@ class HttpBackend:
                 self._stop_motion()
         self._connected = False
         self._model.disconnect()
+
+    def _detect_imu(self) -> bool:
+        """Does this build carry the IMU ring? One request, and it moves nothing.
+
+        Asked with the sequence we already have, so the reply is empty and
+        cheap; what is being tested is whether the command exists at all.
+        """
+        try:
+            batch = parse_imu_batch(json.loads(self._control("imu", self._imu_seq)))
+        except (BackendError, ValueError, TypeError):
+            return False
+        self._imu_seq = max(self._imu_seq, batch.last_seq)
+        return batch.rate > 0
+
+    def read_imu(self) -> ImuBatch | None:
+        """Collect every sample the device has taken since the last call.
+
+        Batched by the firmware, because a request costs 78-140 ms on this
+        transport and single samples at eight a second are useless for
+        integrating a gyroscope. Folding them into the estimator here means a
+        caller only ever asks for the answer, never for the arithmetic.
+        """
+        if Capability.TELEMETRY not in self.capabilities:
+            return None
+        try:
+            batch = parse_imu_batch(json.loads(self._control("imu", self._imu_seq)))
+        except (ValueError, TypeError):
+            return None
+        self._imu_seq = max(self._imu_seq, batch.last_seq)
+        self.imu_dropped += batch.dropped
+        self.imu.feed(batch.samples)
+        return batch
+
+    @property
+    def attitude(self) -> Attitude | None:
+        """The body's own attitude, or None before the IMU has said anything."""
+        return self.imu.attitude
 
     def _detect_robodog_firmware(self) -> bool:
         """Ask the robot which firmware it runs, unless we were told.
@@ -555,6 +605,16 @@ class HttpBackend:
             return
         if self._clock() - self._last_sent < FIRMWARE_FEED_INTERVAL:
             return
+        # The feed costs a round trip whether or not it carries anything, so it
+        # may as well carry the IMU: `imu` is accepted like any other command
+        # and therefore feeds the on-device watchdog exactly as `ping` did,
+        # while returning every sample taken since the last feed. A walking
+        # robot is precisely when its attitude matters and precisely when
+        # nothing else is being sent.
+        if Capability.TELEMETRY in self.capabilities:
+            with contextlib.suppress(BackendError):
+                self.read_imu()
+            return
         self._control("ping", 0)
 
     def flush_pose(self) -> None:
@@ -619,7 +679,21 @@ class HttpBackend:
             joint_angles=model_state.joint_angles,
             is_estimated=True,
             busy_until=model_state.busy_until,
-            telemetry=None,  # the HTTP path returns no data at all (D3)
+            telemetry=self._telemetry(),
+        )
+
+    def _telemetry(self) -> Telemetry | None:
+        """What the robot has actually reported. None on stock firmware (D3)."""
+        attitude = self.imu.attitude
+        if attitude is None:
+            return None
+        return Telemetry(
+            voltage=None,
+            acc=None,
+            pitch=attitude.pitch,
+            roll=attitude.roll,
+            turned=attitude.turned,
+            still=attitude.still,
         )
 
     # --- safety ---

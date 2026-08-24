@@ -41,10 +41,25 @@ from robodog.api.types import (
     SafetyState,
     SetCameraParam,
 )
+from robodog.behaviour import (
+    STOP_HEIGHT_MAX,
+    ApproachConfig,
+    BehaviourRunner,
+    ComeToMe,
+    Intent,
+    approach_config,
+    distance_mm_for_height_fraction,
+)
 from robodog.camera import CAMERA_PARAMS
 from robodog.camera import DEFAULTS as CAMERA_DEFAULTS
 from robodog.camera import PARAMS_BY_NAME as CAMERA_PARAMS_BY_NAME
-from robodog.errors import KinematicsError, RobodogError, RoutineError, SafetyError
+from robodog.errors import (
+    AiError,
+    KinematicsError,
+    RobodogError,
+    RoutineError,
+    SafetyError,
+)
 from robodog.kinematics.constants import LINKAGE_W
 from robodog.kinematics.leg import leg_roll_and_depth, leg_target_from_roll
 from robodog.teach.format import (
@@ -64,9 +79,12 @@ from robodog.teach.sequence import (
     SequenceSession,
     list_sequences,
 )
+from robodog.vision.service import VisionService, detection_json
+from robodog.vision.stream import multipart_chunk
 from robodog.viz.stick import HIPS, leg_chain_world, to_world
 
 if TYPE_CHECKING:  # avoids a circular import at runtime
+    from robodog.ai import IntentClient
     from robodog.api.client import RobotClient
     from robodog.teach.session import TeachSession
 
@@ -87,6 +105,12 @@ _MANUAL_WATCH_INTERVAL = 0.2
 _UI_HEARTBEAT_TIMEOUT = 10.0
 # Below this distance from the hip a pointer angle is noise, not an intent.
 _ROLL_DRAG_MIN_RADIUS = 20.0
+# Where the page fetches the picture from. Not the robot: with a single frame
+# buffer (ASSUMPTIONS F4) a browser holding the robot's own stream starves the
+# detector, so the host reads it once and re-serves it here.
+_STREAM_PATH = "/camera/stream"
+_FRAME_PATH = "/camera/frame.jpg"
+_REBROADCAST_BOUNDARY = "robodogframe"
 
 
 def _leg_from_name(name: object) -> LegId:
@@ -161,6 +185,8 @@ class TeachUIServer:
         host: str = "127.0.0.1",
         port: int = 0,
         sequence: SequenceSession | None = None,
+        vision: VisionService | None = None,
+        interpreter: IntentClient | None = None,
         ui_timeout: float = _UI_HEARTBEAT_TIMEOUT,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -179,9 +205,19 @@ class TeachUIServer:
         # Posing needs leg targets; over Wi-Fi the stock firmware has none, so
         # that half of the UI is switched off instead of failing per drag (D2).
         self._pose_enabled = Capability.LEG_TARGET in client.capabilities
-        # Two separate questions: is there a picture to watch, and can the
-        # sensor be told anything. The vendor firmware answers yes and no.
-        self._stream_url = getattr(client, "stream_url", None)
+        self._vision = vision
+        self._interpreter = interpreter
+        # Three separate questions now: is there a picture to watch, can the
+        # sensor be told anything, and is anything looking at the picture. The
+        # vendor firmware answers yes, no, and no.
+        #
+        # With a vision loop running, the page is pointed at *us* rather than at
+        # the robot. That is not a nicety: one frame buffer means one consumer
+        # (ASSUMPTIONS F4/G3), and a browser on the robot's own stream would
+        # blind the detector as long as the tab was open.
+        self._stream_url = (
+            _STREAM_PATH if vision is not None else getattr(client, "stream_url", None)
+        )
         self._camera_tuning = Capability.CAMERA_TUNING in client.capabilities
         # A starting point only: the robot's own answer replaces this as soon
         # as it gives one, and firmware that cannot answer keeps it.
@@ -203,6 +239,15 @@ class TeachUIServer:
         self._manual: str | None = None
         self._manual_note = ""
         self._run: dict[str, Any] = {"active": False, "cycle": 0, "t": 0.0, "message": ""}
+        self._behaviour: dict[str, Any] = {
+            "active": False,
+            "said": "",
+            "call": "",
+            "state": "",
+            "note": "",
+            "message": "",
+            "target": None,
+        }
         self._run_thread: threading.Thread | None = None
         self._httpd = ThreadingHTTPServer((host, port), _make_handler(self))
         self._thread: threading.Thread | None = None
@@ -244,6 +289,10 @@ class TeachUIServer:
 
     def shutdown(self) -> None:
         self.request_quit()
+        # Wake anyone blocked waiting for the next frame, or the shutdown waits
+        # out their timeout for no reason.
+        if self._vision is not None:
+            self._vision.hub.close()
         # Leave no thread driving the robot behind: the caller disarms and
         # disconnects right after this returns.
         if self._run_thread is not None:
@@ -260,6 +309,14 @@ class TeachUIServer:
         self._stop_run.set()
         self._quit.set()
 
+    @property
+    def quitting(self) -> bool:
+        return self._quit.is_set()
+
+    @property
+    def frames(self) -> VisionService | None:
+        return self._vision
+
     # --- state for the page ---
 
     def state_json(self) -> dict[str, Any]:
@@ -272,6 +329,15 @@ class TeachUIServer:
             "busy": self._busy,
             "sequence": self._sequence_json(),
             "run": dict(self._run),
+            "vision": self._vision_json(),
+            "behaviour": dict(self._behaviour),
+            # In the overlay rather than the locked snapshot on purpose: the
+            # body's attitude is most worth watching while a run holds the
+            # session lock, which is exactly when the cached snapshot freezes.
+            "attitude": self._attitude_json(),
+            # Top level, not inside "vision": a language model without a camera
+            # can still be told to stop, and the command box has to know that.
+            "can_talk": self._interpreter is not None,
             "manual": self._manual_json(),
             "safety": {
                 "state": self._client.safety_state.name,
@@ -365,12 +431,18 @@ class TeachUIServer:
         if action in ("stop", "seq_stop"):
             # The one action that must get through while the robot is moving.
             # It never waits behind the session lock for long, and it is the
-            # single stop path for both a running sequence and a hand-driven
+            # single stop path for a sequence, a behaviour and a hand-driven
             # move -- one button, one meaning.
             return self._stop("operator")
         if self._busy is not None:
             return 409, {"ok": False, "message": f"busy: {self._busy}"}
         try:
+            if action == "say":
+                # Deliberately outside the session lock. Asking the language
+                # model is a network round trip, and holding the lock across it
+                # would freeze the page's state polls for as long as the server
+                # takes -- which, if it is down, is the whole request timeout.
+                return self._say(body)
             with self._lock:
                 return self._dispatch(action, body)
         except (ValueError, RoutineError) as exc:
@@ -642,6 +714,25 @@ class TeachUIServer:
             ],
         }
 
+    def _attitude_json(self) -> dict[str, Any] | None:
+        """What the IMU says the body is doing, or None if it cannot say.
+
+        The one genuinely *measured* thing on this transport -- everything else
+        in RobotState is a model of what the robot was told (`is_estimated`).
+        Worth its own line on the page for that reason alone, and needed to
+        check the axis signs at all (ASSUMPTIONS G9): tip the robot nose-down
+        and the pitch must go negative.
+        """
+        telemetry = self._client.state().telemetry
+        if telemetry is None or telemetry.pitch is None:
+            return None
+        return {
+            "pitch": round(telemetry.pitch, 1),
+            "roll": round(telemetry.roll if telemetry.roll is not None else 0.0, 1),
+            "turned": round(telemetry.turned if telemetry.turned is not None else 0.0, 1),
+            "still": bool(telemetry.still),
+        }
+
     def _manual_json(self) -> dict[str, Any]:
         """The hand-driven move, reconciled against the robot's own state.
 
@@ -892,8 +983,15 @@ class TeachUIServer:
         return 200, {"ok": True, "message": f"reset after: {reason}"}
 
     def _stop(self, reason: str) -> tuple[int, dict[str, Any]]:
-        """Stop whatever is moving: a running sequence, or a hand-driven move."""
-        if self._busy == "sequence":
+        """Stop whatever is moving: a run, or a hand-driven move.
+
+        A behaviour run is stopped exactly like a sequence run, through the same
+        event and the same dead-man's switch. That is why it reuses that
+        machinery instead of growing a second one: the STOP button, the Escape
+        key and the page falling silent all end a vision-guided walk by the path
+        that has already been proven on the robot.
+        """
+        if self._busy in ("sequence", "behaviour"):
             self._stop_reason = reason
             self._stop_run.set()
             return 200, {"ok": True, "message": "stopping"}
@@ -911,6 +1009,142 @@ class TeachUIServer:
         finally:
             self._lock.release()
         return 200, {"ok": True, "message": "stopped"}
+
+    # --- vision and behaviours ------------------------------------------
+
+    def _vision_json(self) -> dict[str, Any] | None:
+        """What the vision loop is doing, and what it currently sees."""
+        if self._vision is None:
+            return None
+        status = self._vision.status()
+        status["detections"] = detection_json(
+            self._vision.detections, distance=distance_mm_for_height_fraction
+        )
+        status["stop_height_max"] = STOP_HEIGHT_MAX
+        status["frame_url"] = _FRAME_PATH
+        return status
+
+    def _say(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Operator text -> one behaviour call -> a deterministic run.
+
+        The model is asked once, here, and never again while the robot moves.
+        What it returns is a *name and parameters*, validated against the
+        vocabulary before anything starts; from the next line on this is
+        ordinary code driving the robot through the safety supervisor.
+        """
+        said = str(body.get("text") or "").strip()
+        if not said:
+            raise ValueError("say what the robot should do")
+        if self._interpreter is None:
+            return 400, {
+                "ok": False,
+                "message": "no language model is configured -- start teach with --llm-url",
+            }
+        try:
+            call = self._interpreter.interpret(said)
+        except AiError as exc:
+            return 502, {"ok": False, "message": str(exc)}
+        self._behaviour = {**self._behaviour, "said": said, "call": call.describe()}
+        if not call.understood:
+            return 200, {
+                "ok": False,
+                "message": "I have no behaviour for that. I can come to you, or stop.",
+            }
+        if call.name == "stop":
+            return self._stop("operator asked for a stop")
+        if self._vision is None:
+            return 400, {
+                "ok": False,
+                "message": "that behaviour needs the camera -- start teach with --vision",
+            }
+        config = approach_config(call)
+        with self._lock:
+            return self._start_behaviour(config, said=said, call=call.describe())
+
+    def _start_behaviour(
+        self, config: ApproachConfig, *, said: str, call: str
+    ) -> tuple[int, dict[str, Any]]:
+        """Run a come-to-me in a worker thread, on the sequence run's machinery."""
+        self._busy_guard()
+        if Capability.LOCOMOTION not in self._client.capabilities:
+            raise RoutineError(
+                f"backend {self._client.backend_name!r} cannot walk: it is missing LOCOMOTION"
+            )
+        machine = ComeToMe(config=config)
+        runner = BehaviourRunner(
+            self._client,
+            machine,
+            # A callable, not a snapshot: the control loop runs at the
+            # transport's rate and the detector at its own, and neither waits
+            # for the other.
+            detections=lambda: self._vision.detections if self._vision else (),
+        )
+        self._stop_run.clear()
+        self._stop_reason = ""
+        # Start the dead-man's switch from now, exactly as a sequence run does.
+        self._last_poll = self._clock()
+        self._manual = None
+        self._manual_note = ""
+        self._behaviour = {
+            "active": True,
+            "said": said,
+            "call": call,
+            "state": "SEARCHING",
+            "note": "starting",
+            "message": "",
+            "target": None,
+        }
+        self._busy = "behaviour"
+
+        def worker() -> None:
+            message = ""
+            try:
+                with self._lock:
+                    try:
+                        report = runner.run(
+                            should_stop=self._should_stop_run, on_update=self._on_intent
+                        )
+                        message = (
+                            f"stopped ({self._stop_reason})"
+                            if report.stopped_early
+                            else f"{report.state.name.lower()}: {report.reason}"
+                        )
+                    finally:
+                        # Unconditional, like the sequence run: whatever
+                        # happened, the robot must not be left walking.
+                        with contextlib.suppress(RobodogError):
+                            self._client.stop()
+                        if self._pose_enabled:
+                            with contextlib.suppress(RobodogError):
+                                self._session.reapply_targets()
+            except RobodogError as exc:
+                message = f"behaviour aborted: {exc}"
+            finally:
+                self._behaviour = {
+                    **self._behaviour,
+                    "active": False,
+                    "note": "",
+                    "message": message,
+                }
+                self._busy = None
+
+        self._run_thread = threading.Thread(target=worker, daemon=True, name="teach-behaviour")
+        self._run_thread.start()
+        return 200, {"ok": True, "message": f"{call} -- STOP is always live"}
+
+    def _on_intent(self, intent: Intent) -> None:
+        """One tick of the behaviour, as the page shows it."""
+        target = (
+            detection_json([intent.target], distance=distance_mm_for_height_fraction)[0]
+            if intent.target is not None
+            else None
+        )
+        self._behaviour = {
+            **self._behaviour,
+            "state": intent.state.name,
+            "note": intent.reason,
+            "target": target,
+        }
 
     def _watch_manual(self) -> None:
         """Release a hand-driven move when the page stops answering."""
@@ -961,12 +1195,61 @@ def _make_handler(server: TeachUIServer) -> type[BaseHTTPRequestHandler]:
             self._send(status, "application/json", json.dumps(payload).encode("utf-8"))
 
         def do_GET(self) -> None:
-            if self.path in ("/", "/index.html"):
+            path = self.path.split("?", 1)[0]
+            if path in ("/", "/index.html"):
                 self._send(200, "text/html; charset=utf-8", page_bytes)
-            elif self.path == "/api/state":
+            elif path == "/api/state":
                 self._send_json(200, server.state_json())
+            elif path == _STREAM_PATH:
+                self._rebroadcast()
+            elif path == _FRAME_PATH:
+                self._latest_frame()
             else:
                 self._send_json(404, {"ok": False, "message": "not found"})
+
+        # --- re-serving the camera ---------------------------------------
+        #
+        # The robot has one frame buffer, so it has one viewer (ASSUMPTIONS
+        # F4/G3). The host is that viewer; everyone else -- this page, a second
+        # tab, the detector -- reads the frames again from here. Nothing below
+        # touches the robot.
+
+        def _rebroadcast(self) -> None:
+            vision = server.frames
+            if vision is None:
+                self._send_json(404, {"ok": False, "message": "no vision loop is running"})
+                return
+            self.send_response(200)
+            self.send_header(
+                "Content-Type",
+                f"multipart/x-mixed-replace; boundary={_REBROADCAST_BOUNDARY}",
+            )
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            hub = vision.hub
+            seq = 0
+            try:
+                while not server.quitting and not hub.closed:
+                    seq, frame = hub.wait_for(seq)
+                    if frame is None:
+                        continue  # nothing new yet; the loop re-checks the exits
+                    self.wfile.write(multipart_chunk(frame, _REBROADCAST_BOUNDARY))
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                # The tab was closed or the page navigated away. Ordinary, and
+                # not worth a traceback in the operator's console.
+                return
+
+        def _latest_frame(self) -> None:
+            vision = server.frames
+            if vision is None:
+                self._send_json(404, {"ok": False, "message": "no vision loop is running"})
+                return
+            _seq, frame = vision.hub.latest()
+            if frame is None:
+                self._send_json(503, {"ok": False, "message": "no frame has arrived yet"})
+                return
+            self._send(200, "image/jpeg", frame)
 
         def do_POST(self) -> None:
             if not self.path.startswith("/api/"):
@@ -996,11 +1279,20 @@ def serve_teach_ui(
     port: int = 0,
     open_browser: bool = True,
     sequence: SequenceSession | None = None,
+    vision: VisionService | None = None,
+    interpreter: IntentClient | None = None,
     say: Callable[[str], None] = print,
 ) -> int:
     """Run the web UI until the operator quits from the page (or Ctrl-C)."""
     server = TeachUIServer(
-        session, client, lock=lock, realtime=realtime, port=port, sequence=sequence
+        session,
+        client,
+        lock=lock,
+        realtime=realtime,
+        port=port,
+        sequence=sequence,
+        vision=vision,
+        interpreter=interpreter,
     )
     url = server.start()
     say(f"teach-in UI: {url}")

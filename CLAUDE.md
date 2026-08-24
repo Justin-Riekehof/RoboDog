@@ -59,9 +59,13 @@ Read in this order when context is needed:
   onto `main`. CI runs on every branch, so a push is how you find out within
   minutes whether you broke something another agent depends on. Rebase on
   `main` before asking for a merge.
-- **`--all-extras` is not optional** in that sync, despite the name: without it
+- **`--all-extras` is not optional** locally, despite the name: without it
   `matplotlib` and `mujoco` are uninstalled and the tests that assert the twin's
-  geometry fail on a tree that is perfectly fine.
+  geometry fail on a tree that is perfectly fine. Since M8 that sync also pulls
+  `ultralytics` (and torch) for the `vision` extra, which is a couple of
+  gigabytes; `uv sync --all-groups --extra viz --extra sim` passes the whole
+  suite without it, because nothing in the vision path needs a model to be
+  tested.
 - CI (`.github/workflows/ci.yml`) runs ruff, ruff format, mypy and pytest on
   **every branch**, so work in parallel gets its own verdict without waiting for
   a merge. Run the same four locally before pushing -- they are what CI runs,
@@ -70,11 +74,16 @@ Read in this order when context is needed:
 ## Current state
 
 - M0 (offline foundations), M1 (Wi-Fi bring-up, run on the real robot on
-  2026-08-11) and the core of M2 (MuJoCo digital twin) are done. **M3**
-  (sim-to-real calibration) is next — see ROADMAP for its acceptance list.
-- Optional dependencies stay optional: `matplotlib` (`viz` extra) and `mujoco`
-  (`sim` extra) must never be imported from a mock/http code path, so the
-  no-extras install and CI stay green without them.
+  2026-08-11) and the core of M2 (MuJoCo digital twin) are done, as is most of
+  M4 (our firmware fork). **M8** (vision-guided behaviours) was built
+  2026-08-23 with the robot offline: it is complete and covered headlessly, and
+  everything left on it needs hardware (ASSUMPTIONS G1-G5). **M3**
+  (sim-to-real calibration) is still open — see ROADMAP for its acceptance list.
+- Optional dependencies stay optional: `matplotlib` (`viz` extra), `mujoco`
+  (`sim` extra) and `ultralytics` (`vision` extra) must never be imported from a
+  mock/http code path, so the no-extras install and CI stay green without them.
+  `robodog.vision.yolo` is the only module that touches ultralytics, and only
+  `load_detector("yolo")` reaches it.
 - The owner's parametric CadQuery leg model (`wavego_leg.py`) is intentionally
   **out of scope for now** (custom part from a repair); `cad/` holds only the
   exported STL.

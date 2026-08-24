@@ -216,6 +216,24 @@ commands plus an on-device safety net.
   page says it is remembering rather than reading.
 - Active telemetry: battery voltage and the **full** IMU (the stock firmware
   reads only 2 of the ICM20948's 9 axes) → `TELEMETRY`.
+  ✅ **the IMU, written 2026-08-23, not yet flashed.** All nine axes: the fork
+  configures the gyroscope and magnetometer the vendor leaves untouched, and
+  samples accelerometer and gyroscope at 50 Hz from `loop()` -- the only place
+  allowed to touch I2C -- into a 64-slot ring. `var=imu&val=<last seq>` returns
+  everything since the host's last sequence, on both transports.
+  **Buffered, because it has to be:** a request costs 78-140 ms, so polling for
+  single samples would yield eight a second, which is useless for integrating a
+  gyroscope. Ten requests a second now carry fifty samples a second.
+  And the poll costs nothing extra: it *replaces* the watchdog keep-alive
+  `ping`, which was already a round trip that carried no data, at exactly the
+  moment the attitude matters most -- a robot that is walking is a robot that is
+  being sent nothing else.
+  Host side: `robodog.localization` folds the samples into a complementary
+  filter (pitch, roll, degrees turned, and whether the body is still), which
+  `RobotClient.attitude` exposes and the vision geometry uses to remove body
+  tilt from its distance estimate -- the largest error in it (G2/G8).
+  ⏳ **open:** flashing and the three sign checks in G9; battery voltage from
+  the INA219, which is the same pattern and not yet written.
 - Current-based stall detection from the INA219 as the open-loop safety net.
 - Gestures/LED/buzzer over Wi-Fi too, closing the D2 gap.
 - Stock firmware stays a supported fallback, distinguished by capabilities.
@@ -261,7 +279,7 @@ Still open for this milestone:
 **Acceptance:** record a gamepad session → YAML file → replay on sim and
 hardware; git diff of an edited routine is human-readable.
 
-## M8 — Vision-guided behaviours ("Komm zu mir")
+## M8 — Vision-guided behaviours ("Komm zu mir") ⏳ built, not yet on the robot
 
 **Scheduled ahead of M5/M6 at the owner's request (2026-08-23)**, and to be
 started from the owner's AI machine. This is the first motion with nobody's
@@ -282,7 +300,7 @@ competes with the browser for the single frame buffer.
 
 - **Detector: YOLO via `ultralytics`**, behind a new optional `vision` extra
   like `sim` and `viz` are. Never imported from a mock/http path, so the
-  no-extras install and CI stay green without it.
+  no-extras install stays green without it.
 - **LLM: the owner's vLLM server**, an OpenAI-compatible `/v1/chat/completions`
   endpoint. Base URL and model name configurable; no key assumed.
 - **The model does not drive.** It maps free text to a *named behaviour plus
@@ -316,17 +334,112 @@ page's dead-man's switch ending it like any run, and STOP/Escape still the
 fastest way out. The on-device watchdog keeps being fed while it walks, as it
 is now.
 
-### Open for whoever implements it
+### Built 2026-08-23, with the robot offline
 
-- Box height to distance: needs one calibration session against the real robot.
-- What "searching" does when nothing is found -- turn in place, and for how
-  long before giving up.
-- Whether the behaviour owns a stop distance or the operator sets it per run.
+Everything on the list above exists and is tested; what is missing is a robot to
+point it at. `robodog.vision` (`Box`/`Detection`/`Detector`, the MJPEG parser,
+the frame hub, the YOLO detector behind the extra), `robodog.behaviour` (the
+state machine, its vocabulary, the runner), `robodog.ai`, and the teach UI's
+half: the picture re-served at `/camera/stream` with detection boxes drawn over
+it, and a command box beside both tabs. 67 new headless tests, all green on an
+install that never fetched the extra.
+
+**Measured against the owner's vLLM server** (Qwen3.8-27B FP8, vLLM 0.27.1):
+mapping "Komm zu mir" onto a behaviour call takes **0.68 s with thinking off and
+30.8 s with it on**, for an identical answer -- 23 completion tokens against
+1225. The client therefore sends `chat_template_kwargs: {enable_thinking:
+false}`, constrains the answer with the vocabulary's own JSON schema, and still
+handles a reasoning reply in case a server ignores the switch. Six phrasings
+were mapped correctly end to end, refusal included ("mach einen Rückwärtssalto"
+→ `unknown`).
+
+**The three open questions, answered:**
+
+- *Box height to distance* — the safety path does not wait for it. The
+  behaviour stops on the **height fraction itself**; the conversion to
+  millimetres exists only to turn an operator's "zwei Meter" into a fraction,
+  and its result is clamped. Building it surfaced a real error in the obvious
+  approach: the textbook `size / distance` formula assumes the subject fits in
+  the picture, and with the camera about 140 mm off the floor **a person is
+  clipped by the top of the frame from ~3.4 m inward** — a threshold picked
+  from that formula would never have been crossed. The geometry now models the
+  clipping (ASSUMPTIONS G2).
+- *Searching* — turns in place in **pulses** (0.6 s turning, 0.5 s looking) so
+  the detector gets an unsmeared frame, and gives up after 12 s. A duration and
+  not an angle, because the robot's turn rate is unmeasured (G4).
+- *Stop distance* — **both.** The behaviour owns a hard ceiling nothing can
+  raise; the operator sets the value inside it per run, spoken or typed (G5).
+
+**The detector, measured on the AI machine 2026-08-23** against real photographs
+(the robot being offline): `yolo11n` on **CPU** takes 40-51 ms a frame, 20-25
+fps against a camera that delivers ten-odd — so torch is pinned to the CPU wheel
+index, which is 200 MB rather than the CUDA build's 5-6 GB, and leaves both
+3090s to the language model. On `bus.jpg` the pipeline found four people and
+chose the *nearest* rather than the most central, then turned in place towards
+it without walking, because its bearing was outside the walk-at band. That is
+the whole chain except the two halves that need hardware.
+
+### First run on the robot, 2026-08-23
+
+Detection worked and **G1 is closed**: a person to one side, "Komm zu mir" typed
+into the teach UI, and the robot turned towards them. Two defects showed up in
+the approach itself, and both are fixed:
+
+- **It rocked left and right and closed on nothing.** The box centre jitters
+  more than the steering law tolerated, and a latched turn always overshoots
+  centre because the picture is tens of milliseconds old. The bearing is now
+  low-passed (0.35 s) and each steering band has separate entry and exit
+  thresholds. Measured in closed-loop simulation at 0.25 of jitter: **68 turn
+  reversals per approach before, 0 after**, and 4 of 4 approaches reaching the
+  target instead of 2. Worth recording which half did the work -- hysteresis
+  alone only got to 42, so **the filter is the fix and the hysteresis is the
+  belt to its braces**, the opposite of the order they were written in
+  (ASSUMPTIONS G7).
+- **It gave up exactly when it arrived.** Up close the detector stops calling a
+  fraction of a person a person, and losing the target was read as "go and
+  look for it". A target being approached is now kept at confidence 0.25 where
+  acquiring one needs 0.40, and a target lost while it filled more than 30% of
+  the frame ends the run as ARRIVED, reporting the size it was lost at so the
+  threshold can be calibrated (ASSUMPTIONS G6). Deliberately not a tracker:
+  a tracker keeps reporting a box after it drifts, and the robot then walks at
+  a guess of a person it cannot see.
+
+**Then it stopped too far away, and the cause was the fix above.** The
+loss-is-arrival threshold had been written as an absolute 0.30 of frame height,
+which under the geometry is **6.25 m** -- so every detection dropout anywhere in
+the approach counted as arrival and ended the run. It is now a *margin* below
+the stop size (0.10) rather than an independent number, because the two describe
+the same event. With that, plus the default stop raised from 0.60 to 0.66 and
+the ceiling from 0.70 to 0.80 on the owner's instruction, the robot closes to
+**0.95 m by default and 0.5 m on request**, against a flat 1.5 m before -- and in
+simulation it now gets as near as the detector allows rather than to a fixed
+distance. The ceiling's honest meaning is recorded in ASSUMPTIONS G5: the robot
+may touch you.
+
+A third defect turned up in the same round and is worth keeping: the detector's
+own confidence floor sat at 0.35, *above* the behaviour's 0.25 keep threshold,
+so "hold a faint target" was unreachable code. The floor is now 0.20 -- though
+measurement (2026-08-23) says that was not the binding constraint either: YOLO
+names a person from feet and shins alone at 0.70 confidence, so whatever made
+the robot lose its target up close, it was not the partial view. Most likely the
+person left the frame sideways -- at 0.5 m a 65-degree lens sees 0.64 m across.
+The Camera tab settles it at the next run (G6).
+
+The same simulation also found that the 12 s search **could not complete a
+revolution** -- at a plausible turn rate the pulsing needs some 16 s -- so a
+target behind the robot was never found. Now 20 s (G4).
+
+**Still to do, and all of it needs the robot:** the G2 calibration session, the
+frame rate against the real MJPEG stream rather than files, calibrating G6's
+threshold from a few approaches, and the acceptance run itself.
 
 **Acceptance:** "Komm zu mir" typed into the teach UI turns the robot towards a
 person and walks it to a stop at a safe distance; the behaviour's state machine
-is covered headlessly with a scripted detector; CI passes with the `vision`
-extra absent.
+is covered headlessly with a scripted detector; the suite passes with the
+`vision` extra absent. — *The second and third are met: the state machine, the
+runner, the parser, the vocabulary and the whole teach-UI path are covered
+against a scripted detector and a fake model server, none of which needs the
+extra. The first waits for the robot.*
 
 ## M7 — Outlook (not scheduled)
 

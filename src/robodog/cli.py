@@ -1,4 +1,4 @@
-"""`robodog` command-line interface: info, validate, play, teach, viz, bringup, calibrate."""
+"""`robodog` CLI: info, validate, play, teach, intent, viz, bringup, calibrate."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from datetime import date
 from pathlib import Path
 
 from robodog import __version__
+from robodog.ai import DEFAULT_BASE_URL, ENV_URL, IntentClient, LlmConfig
 from robodog.api.client import RobotClient
 from robodog.api.types import LegId, RobotState
 from robodog.backends.base import Backend, tick_for
@@ -21,6 +22,12 @@ from robodog.backends.http import (
     HttpBackend,
 )
 from robodog.backends.mock import MockBackend
+from robodog.behaviour import (
+    STOP_HEIGHT_MAX,
+    approach_config,
+    distance_mm_for_height_fraction,
+    system_prompt,
+)
 from robodog.bringup import run_bringup, write_report
 from robodog.calibrate import (
     DEFAULT_COARSE_STEP,
@@ -42,10 +49,12 @@ from robodog.calibration import (
     load_calibration_or_default,
     save_calibration,
 )
-from robodog.errors import BackendError, RobodogError
+from robodog.errors import AiError, BackendError, RobodogError
 from robodog.kinematics.poses import crouch_pose, stand_pose
 from robodog.teach.format import load_routine
 from robodog.teach.player import PlayEvent, play_routine
+from robodog.vision import load_detector
+from robodog.vision.service import VisionService
 
 BACKENDS = ("mock", "http", "sim", "serial")
 BRINGUP_REPORT_DIR = Path("docs/bringup")
@@ -448,6 +457,8 @@ def cmd_teach(args: argparse.Namespace) -> int:
             print("      tab is off. The Sequence tab drives the robot with forward/left/")
             print("      right/backward moves -- keep the Stop button in reach.")
 
+        vision = _open_vision(args, client)
+        interpreter = _open_interpreter(args)
         lock = threading.Lock()
         # The ticker both feeds the watchdog and flushes staged poses, so it is
         # paced by the transport too: at 50 Hz over Wi-Fi it would spend nearly
@@ -472,12 +483,102 @@ def cmd_teach(args: argparse.Namespace) -> int:
                     port=args.port,
                     open_browser=not args.no_browser,
                     sequence=sequence,
+                    vision=vision,
+                    interpreter=interpreter,
                     say=print,
                 )
         finally:
             ticker.stop()
+            if vision is not None:
+                vision.stop()
             client.disarm()
     return result
+
+
+def _open_vision(args: argparse.Namespace, client: RobotClient) -> VisionService | None:
+    """Start the vision loop, if it was asked for. It owns the robot's stream.
+
+    Only one thing may read that stream (ASSUMPTIONS F4/G3), so starting this
+    means the browser must NOT be pointed at the robot -- the teach UI re-serves
+    what is read here, and does that by itself once a service exists.
+    """
+    if not (args.vision or args.vision_source):
+        return None
+    source = args.vision_source or client.stream_url
+    if not source:
+        raise BackendError(
+            f"backend {client.backend_name!r} has no camera stream, so --vision needs "
+            f"--vision-source (an MJPEG URL, or a .jpg / folder of them to loop)"
+        )
+    detector = (
+        None
+        if args.detector == "none"
+        else load_detector(args.detector, model=args.yolo_model, device=args.yolo_device)
+    )
+    service = VisionService(source, detector=detector)
+    service.start()
+    print(f"vision: reading {source}")
+    print(f"        detector {detector.name if detector else 'none'}; the page reads the")
+    print("        picture from this process, never from the robot directly")
+    return service
+
+
+def _open_interpreter(args: argparse.Namespace) -> IntentClient | None:
+    """Build the intent client, and say at once whether it can be reached.
+
+    Not fatal when it cannot: the server may be started after the session, and
+    everything else in the UI works without it. What is fatal is finding out
+    only when the operator first types a command at a robot on a stand.
+    """
+    if args.no_llm:
+        return None
+    config = LlmConfig.from_env(base_url=args.llm_url, model=args.llm_model)
+    interpreter = IntentClient(config)
+    try:
+        print(f"language model: {interpreter.model()} at {config.url}")
+    except AiError as exc:
+        print(f"warning: {exc}")
+        print("         the command box will report this if you use it")
+    return interpreter
+
+
+def cmd_intent(args: argparse.Namespace) -> int:
+    """Map one sentence onto a behaviour call, and show what it would run.
+
+    The whole language-model path, with no robot and no camera in it. It is how
+    the vocabulary and the prompt get exercised -- and how you find out that a
+    phrasing you meant to work does not, without a robot on a stand to find out
+    in front of.
+    """
+    if args.vocabulary:
+        print(system_prompt())
+        return 0
+    if not args.text:
+        print("error: say something, or pass --vocabulary", file=sys.stderr)
+        return 2
+    config = LlmConfig.from_env(base_url=args.llm_url, model=args.llm_model)
+    client = IntentClient(config)
+    said = " ".join(args.text)
+    call = client.interpret(said)
+    print(f"said:      {said!r}")
+    print(f"model:     {client.model()} at {config.url}")
+    print(f"behaviour: {call.describe()}")
+    if not call.understood:
+        print("           -- not in the vocabulary; nothing would run")
+        return 0
+    if call.name != "come_to_me":
+        return 0
+    approach = approach_config(call)
+    distance = distance_mm_for_height_fraction(approach.stop_height_fraction)
+    print(f"target:    {approach.target}")
+    print(
+        f"stops at:  {approach.stop_height_fraction:.2f} of frame height "
+        f"(about {distance:.0f} mm, ASSUMPTIONS G2 -- uncalibrated)"
+    )
+    if approach.stop_height_fraction >= STOP_HEIGHT_MAX:
+        print("           clamped to the behaviour's own ceiling: it comes no closer")
+    print(f"gives up:  after {approach.timeout:.0f}s, or {approach.search_seconds:.0f}s searching")
+    return 0
 
 
 def cmd_viz(args: argparse.Namespace) -> int:
@@ -675,7 +776,62 @@ def build_parser() -> argparse.ArgumentParser:
     p_teach.add_argument(
         "--no-browser", action="store_true", help="do not open the browser automatically"
     )
+    p_teach.add_argument(
+        "--vision",
+        action="store_true",
+        help="run the vision loop: read the camera here, re-serve it to the page "
+        "with detection boxes, and enable vision-guided behaviours (M8)",
+    )
+    p_teach.add_argument(
+        "--vision-source",
+        default=None,
+        help="what to read instead of the robot's camera: an MJPEG URL, a .jpg, "
+        "or a folder of them played in a loop (implies --vision)",
+    )
+    p_teach.add_argument(
+        "--detector",
+        choices=("yolo", "scripted", "none"),
+        default="yolo",
+        help="yolo needs the 'vision' extra; scripted finds nothing and needs "
+        "nothing; none just re-serves the picture",
+    )
+    p_teach.add_argument(
+        "--yolo-model", default=None, help="ultralytics model file (default yolo11n.pt)"
+    )
+    p_teach.add_argument(
+        "--yolo-device",
+        default=None,
+        help="where to run the detector ('cpu', 'cuda:0', ...). Default: whatever "
+        "ultralytics picks -- which is the GPU, and on a machine also serving a "
+        "language model that is a decision worth being able to make by hand",
+    )
+    p_teach.add_argument(
+        "--llm-url",
+        default=None,
+        help=f"OpenAI-compatible base URL (default ${ENV_URL} or {DEFAULT_BASE_URL})",
+    )
+    p_teach.add_argument(
+        "--llm-model", default=None, help="model name (default: whatever the server serves first)"
+    )
+    p_teach.add_argument(
+        "--no-llm", action="store_true", help="no language model; the command box is off"
+    )
     p_teach.set_defaults(func=cmd_teach)
+
+    p_intent = sub.add_parser(
+        "intent", help="map a sentence onto a behaviour call (no robot, no camera)"
+    )
+    p_intent.add_argument("text", nargs="*", help="what the operator would say")
+    p_intent.add_argument(
+        "--vocabulary", action="store_true", help="print what the model is told, and exit"
+    )
+    p_intent.add_argument(
+        "--llm-url",
+        default=None,
+        help=f"OpenAI-compatible base URL (default ${ENV_URL} or {DEFAULT_BASE_URL})",
+    )
+    p_intent.add_argument("--llm-model", default=None, help="model name")
+    p_intent.set_defaults(func=cmd_intent)
 
     p_viz = sub.add_parser("viz", help="render a stick-figure pose (needs viz extra)")
     p_viz.add_argument("--pose", choices=("stand", "crouch"), default="stand")

@@ -39,3 +39,15 @@ class CapabilityError(RobodogError):
 
 class RoutineError(RobodogError):
     """A teach-in routine file is invalid."""
+
+
+class VisionError(RobodogError):
+    """A camera stream or a detector is unusable."""
+
+
+class AiError(RobodogError):
+    """The language model could not be reached, or answered outside the vocabulary."""
+
+
+class BehaviourError(RobodogError):
+    """A behaviour was asked for that does not exist, or with impossible parameters."""
