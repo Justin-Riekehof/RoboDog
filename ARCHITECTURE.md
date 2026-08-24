@@ -19,6 +19,7 @@ before it reaches the backend. Backends are swappable at construction time:
 
 ```
  apps:      CLI · teach player/recorder · gamepad teleop (M5) · viewer
+            behaviours (M8: vision in, drive intents out)
                               │
                         RobotClient  ──────────  robodog.kinematics
                               │                   (pure functions: IK/FK,
@@ -29,11 +30,12 @@ before it reaches the backend. Backends are swappable at construction time:
         MockBackend      SimBackend       HttpBackend
         (M0, in-proc     (M2, MuJoCo      (M1, /control over
          kinematic        physics +        Wi-Fi to the stock
-         state, CI-safe)  viewer)          firmware)
+         state, no I/O)   viewer)          firmware)
 ```
 
 - The **mock backend** is a deterministic, dependency-free kinematic model.
-  It is the CI reference target and must always work without hardware.
+  It is the reference target for the test suite and must always work without
+  hardware.
 - The **sim backend** (MuJoCo) is the digital twin. It does not reimplement any
   command semantics: it *composes* the mock backend as the command interpreter
   and adds physics, so the ported firmware logic exists exactly once. Its MJCF
@@ -51,6 +53,33 @@ before it reaches the backend. Backends are swappable at construction time:
   what that handler accepts, and because the firmware returns no data at all,
   the state it reports is a *model* flagged `is_estimated=True`. A later
   serial backend can add the commands that only the UART path exposes.
+
+### Autonomy sits above the client, never beside it (M8)
+
+A vision-guided behaviour is an *application* in the diagram above, not a
+backend and not a shortcut past one. It reads detections, decides a drive, and
+sends it through the same `RobotClient` — so the supervisor's E-stop, watchdog,
+limits and capability gate apply to a robot walking at a person exactly as they
+apply to a keyframe played from a file. Three splits keep it that way:
+
+- `robodog.vision` — frames and detections. `Detection` is normalised (a box in
+  frame *fractions*), so nothing downstream knows a resolution and the camera's
+  frame size can change mid-session. The YOLO implementation lives behind the
+  optional `vision` extra; a `Detector` protocol and a scripted stand-in are
+  what everything else depends on. **One process reads the robot's stream** and
+  re-serves it, because with `psram=0` the firmware has a single frame buffer
+  and a second viewer blinds the first (ASSUMPTIONS F4/G3).
+- `robodog.behaviour` — pure logic: detections and a clock in, drive intents
+  out, as a state machine (searching / approaching / arrived / lost). No
+  camera, no model, no robot, no sleeping, exactly like the kinematics. Its
+  runner is a separate, thin file that does the I/O.
+- `robodog.ai` — free text to *one named behaviour with parameters*, asked
+  once, before anything moves. **The model does not drive.** It cannot: it
+  emits a call from a fixed vocabulary, which is validated before a loop
+  starts, and that loop is ordinary deterministic code. An 8B-plus model inside
+  a 10 Hz control loop would be latency and non-determinism in the one place
+  neither belongs — and a model that can steer is a model that can steer around
+  the supervisor.
 
 ### Capability model
 
@@ -262,6 +291,13 @@ src/robodog/          Python package (src layout)
   backends/           base protocol + mock/ (M0), http/ (M1), sim/ (M2)
   kinematics/         linkage constants, IK/FK, servo map, gait, easing
   safety/             SafetySupervisor, limits, watchdog
+  vision/             frames and detections (M8): MJPEG parser, frame hub,
+                      Detector protocol + scripted stand-in, YOLO behind the
+                      optional `vision` extra
+  behaviour/          vision-guided behaviours (M8): the pure state machine,
+                      the vocabulary the model may speak, the runner
+  ai.py               free text -> one behaviour call, against an
+                      OpenAI-compatible endpoint (M8)
   teach/              routine schema, loader/validator, player, teach-in
                       session (poses) + sequence session (drive moves)
                       + web UI + scriptable console

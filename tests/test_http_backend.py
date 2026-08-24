@@ -50,6 +50,10 @@ KNOWN_VARS = {"framesize", "funcMode", "sconfig", "sset", "move"}
 # What firmware/wavego-robodog adds on top. A fake that speaks them stands in
 # for a flashed robot; one that does not stands in for a stock one.
 ROBODOG_VARS = {"ping", "watchdog", "pose"}
+# The IMU ring is newer than the rest of the fork: the build flashed on
+# 2026-08-22 answers `ping` and has never heard of `imu`, so it is opt-in here
+# too, and a robot without it must still connect and drive.
+IMU_VAR = "imu"
 # ...plus everything matching `cam_*`, which the fork resolves by prefix.
 
 
@@ -67,6 +71,8 @@ class FakeFirmware:
         # one value no host can work out for itself (ASSUMPTIONS F4).
         self.camera: dict[str, int] = {**CAMERA_DEFAULTS, "size_max": 8, "psram": 0}
         self.camera_answers = True  # False = firmware too old to reply with a body
+        self.imu = False  # True = the build also carries the IMU ring
+        self.imu_seq = 0  # samples taken so far, as the device counts them
         self.connections = 0  # TCP connections accepted, not requests served
         self.drop_next = False  # hang up after the next response, as an ESP32 does
 
@@ -114,6 +120,8 @@ def make_handler(state: FakeFirmware) -> type[BaseHTTPRequestHandler]:
             var = query["var"][0]
             state.queries.append(parsed.query)
             known = KNOWN_VARS | (ROBODOG_VARS if state.robodog else set())
+            if state.robodog and state.imu:
+                known = known | {IMU_VAR}
             # The camera family is matched by prefix in the firmware too: the
             # names are the sensor driver's, and listing two dozen of them here
             # would be the same table in two places, drifting apart.
@@ -127,6 +135,34 @@ def make_handler(state: FakeFirmware) -> type[BaseHTTPRequestHandler]:
                 return
 
             state.calls.append((var, int(query["val"][0]), int(query["cmd"][0])))
+            if var == IMU_VAR:
+                since = int(query["val"][0])
+                # Everything the device has taken since the host's sequence, at
+                # the firmware's own 50 Hz -- which is the point of the ring.
+                samples = [
+                    [(seq * 20), 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+                    for seq in range(since + 1, state.imu_seq + 1)
+                ]
+                body = json.dumps(
+                    {
+                        "imu": True,
+                        "rate": 50,
+                        "seq": state.imu_seq,
+                        "dropped": 0,
+                        "mag_ok": 1,
+                        "mag": [1.0, 2.0, 3.0],
+                        "mag_t": state.imu_seq * 20,
+                        "temp": 31.5,
+                        "s": samples,
+                        "last": state.imu_seq,
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if camera:
                 name, value = var[4:], int(query["val"][0])
                 if name == "reset":
@@ -972,3 +1008,95 @@ def test_a_closed_connection_is_reopened_once(firmware: tuple[FakeFirmware, str]
         backend.send(Drive(forward=1, turn=0))
     assert state.fail_next == 0, "a refusal was retried"
     backend.disconnect()
+
+
+# --- the IMU, which is newer than the rest of the fork ----------------------
+
+
+def test_the_imu_is_probed_separately_from_the_firmware(
+    firmware: tuple[FakeFirmware, str],
+) -> None:
+    """Our own firmware answers `ping` since 2026-08-22 and has only carried the
+    IMU since 2026-08-23. Inferring one capability from the other would claim a
+    command an installed robot cannot honour."""
+    state, host = firmware
+    state.robodog = True
+    state.imu = False
+    backend = HttpBackend(host)
+    backend.connect()
+    try:
+        assert Capability.LEG_TARGET in backend.capabilities
+        assert Capability.TELEMETRY not in backend.capabilities
+        assert backend.read_imu() is None
+        assert backend.attitude is None
+    finally:
+        backend.disconnect()
+
+
+def test_a_robot_with_the_imu_reports_telemetry(firmware: tuple[FakeFirmware, str]) -> None:
+    state, host = firmware
+    state.robodog = True
+    state.imu = True
+    backend = HttpBackend(host)
+    backend.connect()
+    try:
+        assert Capability.TELEMETRY in backend.capabilities
+        state.imu_seq = 25  # half a second of samples accumulated on the device
+        batch = backend.read_imu()
+        assert batch is not None
+        assert len(batch.samples) == 25
+        assert batch.rate == 50
+        attitude = backend.attitude
+        assert attitude is not None and attitude.trusted
+        assert attitude.pitch == pytest.approx(0.0, abs=0.5)
+        telemetry = backend.state().telemetry
+        assert telemetry is not None and telemetry.pitch is not None
+        assert telemetry.still is True
+    finally:
+        backend.disconnect()
+
+
+def test_samples_are_asked_for_once_and_only_once(firmware: tuple[FakeFirmware, str]) -> None:
+    """The sequence number is what makes 50 Hz survive a link where a request
+    costs a tenth of a second: each reply carries only what is new."""
+    state, host = firmware
+    state.robodog = True
+    state.imu = True
+    backend = HttpBackend(host)
+    backend.connect()
+    try:
+        state.imu_seq = 10
+        first = backend.read_imu()
+        state.imu_seq = 14
+        second = backend.read_imu()
+        assert first is not None and second is not None
+        assert len(first.samples) == 10
+        assert len(second.samples) == 4  # not 14
+    finally:
+        backend.disconnect()
+
+
+def test_the_keepalive_carries_the_imu_instead_of_a_bare_ping(
+    firmware: tuple[FakeFirmware, str],
+) -> None:
+    """The feed costs a round trip whether or not it carries anything, and a
+    walking robot is exactly when its attitude matters and when nothing else is
+    being sent."""
+    state, host = firmware
+    state.robodog = True
+    state.imu = True
+    clock = FakeClock()
+    backend = HttpBackend(host, clock=clock)
+    backend.connect()
+    try:
+        backend.send(Drive(forward=1, turn=0))
+        state.imu_seq = 30
+        # Connect probes with both `ping` and `imu`; only what follows is a feed.
+        state.calls.clear()
+        clock.advance(1.0)
+        backend.tick(0.1)
+        assert [c[0] for c in state.calls] == ["imu"]
+        assert backend.attitude is not None
+        assert backend.imu.samples == 30
+    finally:
+        backend.disconnect()

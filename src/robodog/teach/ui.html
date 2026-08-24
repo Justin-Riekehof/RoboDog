@@ -105,6 +105,25 @@
             display: flex; align-items: center; justify-content: center; }
   .stream img { max-width: 100%; display: block; image-rendering: pixelated; }
   .stream.empty::after { content: "stream stopped"; color: var(--dim); font-size: 12px; }
+  /* The boxes are drawn OVER the picture rather than into it: the server sends
+     rectangles in frame fractions, the browser positions divs at those
+     percentages. Nothing decodes a JPEG on either side, and the boxes land
+     correctly whatever resolution the camera is set to. */
+  .frame { position: relative; display: inline-block; line-height: 0; }
+  .frame .boxes { position: absolute; inset: 0; pointer-events: none; }
+  .det { position: absolute; box-sizing: border-box; border: 2px solid var(--accent);
+         border-radius: 2px; }
+  .det.target { border-color: var(--bad); border-width: 3px; }
+  .det span { position: absolute; left: -2px; top: -17px; font-size: 11px;
+              line-height: 15px; padding: 0 4px; border-radius: 3px;
+              background: var(--accent); color: #0b1016; white-space: nowrap; }
+  .det.target span { background: var(--bad); color: #fff; }
+  .vision-row { display: flex; justify-content: space-between; gap: 8px;
+                font-size: 12px; padding: 2px 0; }
+  .vision-row b { font-weight: 600; color: var(--text); }
+  .say { display: flex; gap: 6px; }
+  .say input { flex: 1; }
+  .behaving { color: var(--accent); font-weight: 600; }
   .cam-group { margin-top: 12px; }
   .cam-group h3 { margin: 0 0 6px; font-size: 11px; text-transform: uppercase;
                   letter-spacing: .08em; color: var(--dim); font-weight: 600; }
@@ -271,12 +290,14 @@
 <main id="view-camera" hidden>
   <div class="col-views">
     <div class="panel">
-      <h2>Live feed <span class="hint">(MJPEG straight from the robot; only
-        one viewer at a time)</span></h2>
+      <h2>Live feed <span class="hint" id="stream-hint"></span></h2>
       <!-- The src is set when this tab opens and cleared when it closes: an
-           <img> on a hidden tab holds the connection open, and the robot has
-           one stream to give. -->
-      <div class="stream empty" id="stream-box"><img id="cam-image" alt=""></div>
+           <img> on a hidden tab holds the connection open. Without the vision
+           loop that connection is to the robot, which has exactly one stream to
+           give; with it, the host holds that one and this is a copy. -->
+      <div class="stream empty" id="stream-box">
+        <div class="frame"><img id="cam-image" alt=""><div class="boxes" id="cam-boxes"></div></div>
+      </div>
       <div class="row" style="margin-top:8px">
         <button id="cam-toggle" class="primary">Start</button>
         <button id="cam-reset">Reset to defaults</button>
@@ -286,6 +307,13 @@
   </div>
 
   <div class="col-ctrl">
+    <div class="panel" id="vision-panel" hidden>
+      <h2>Vision <span class="hint">(read here, not in the browser)</span></h2>
+      <div id="vision-status"></div>
+      <div class="row" style="margin-top:8px"><span class="hint" id="vision-note"></span></div>
+      <div id="vision-list" style="margin-top:8px"></div>
+    </div>
+
     <div class="panel">
       <h2>Sensor</h2>
       <div class="row"><span class="hint" id="cam-source"></span></div>
@@ -296,6 +324,19 @@
 </main>
 
 <aside class="console" id="console">
+  <div class="panel" id="say-panel" hidden>
+    <h2>Say what to do <span class="hint">(a behaviour, not a chat)</span></h2>
+    <!-- The model is asked once, here, and maps this to one named behaviour
+         with parameters. It never drives: from that point a deterministic loop
+         runs, through the same safety supervisor as every other command. -->
+    <div class="row say">
+      <input id="say-text" placeholder="Komm zu mir" autocomplete="off">
+      <button id="say-send" class="primary">Go</button>
+    </div>
+    <div class="row"><span class="hint" id="say-note"></span></div>
+    <div class="row"><span class="hint" id="behaviour-note"></span></div>
+  </div>
+
   <div class="panel">
     <h2>Drive by hand &mdash; on both tabs</h2>
     <!-- The eight directions of the move vocabulary, laid out as the
@@ -317,6 +358,7 @@
       <button id="btn-home" class="primary disable-when-busy">Home</button>
       <span class="hint" id="home-note"></span>
     </div>
+    <div class="row"><span class="hint" id="attitude-note"></span></div>
     <div class="row keys"><span class="hint">Keyboard &mdash;
       <b>W&nbsp;A&nbsp;S&nbsp;D</b> hold to walk;
       numpad <b>8</b>/<b>2</b> extend/crouch, <b>4</b>/<b>6</b> lean left/right,
@@ -558,6 +600,11 @@ function selectTab(name) {
   // connection open, and the robot serves one viewer at a time -- so a glance
   // at the camera would otherwise cost the next person the whole feed.
   if (name !== "camera") stopStream();
+  // With the vision loop running the picture is already being read here, so a
+  // viewer costs the robot nothing and there is no reason to make the operator
+  // press Start. Without it, this <img> IS the robot's one viewer -- so it
+  // stays a deliberate click.
+  else if (state && state.vision && !streaming) startStream();
   for (const button of document.querySelectorAll("nav.tabs button"))
     button.classList.toggle("active", button.dataset.tab === name);
   if (name === "sequence") refreshFiles();
@@ -589,9 +636,117 @@ function render() {
   $("backend-label").textContent =
     `backend: ${state.backend}` + (unsaved.length ? ` -- unsaved ${unsaved.join(" + ")}` : "");
   renderConsole();
+  renderSay();
+  // The boxes ride on the state poll rather than on the frames, so they keep
+  // updating whichever tab is open -- and the Camera tab is the only place
+  // they are visible.
+  if (tab === "camera") renderVision();
   if (tab === "sequence") renderSequence();
   else if (tab === "camera") renderCamera();
   else renderPose();
+}
+
+/* ---------- vision: boxes over the picture, and what was found ---------- */
+
+function detLabel(det) {
+  const parts = [det.label, det.confidence.toFixed(2)];
+  if (det.distance_mm) parts.push("~" + (det.distance_mm / 1000).toFixed(1) + " m");
+  return parts.join("  ");
+}
+
+// The rectangles the server computed, positioned as percentages of the picture.
+// Same arrangement as the leg polylines: the server owns every number, the page
+// owns none of them.
+function renderBoxes(vision, chosen) {
+  const host = $("cam-boxes");
+  const found = (vision && vision.detections) || [];
+  host.replaceChildren(...found.map((det) => {
+    const box = document.createElement("div");
+    box.className = "det";
+    if (chosen && chosen.label === det.label &&
+        Math.abs(chosen.bearing - det.bearing) < 0.02) box.classList.add("target");
+    box.style.left = (det.box.left * 100).toFixed(2) + "%";
+    box.style.top = (det.box.top * 100).toFixed(2) + "%";
+    box.style.width = ((det.box.right - det.box.left) * 100).toFixed(2) + "%";
+    box.style.height = ((det.box.bottom - det.box.top) * 100).toFixed(2) + "%";
+    const tag = document.createElement("span");
+    tag.textContent = detLabel(det);
+    box.appendChild(tag);
+    return box;
+  }));
+}
+
+function renderVision() {
+  const vision = state.vision;
+  $("vision-panel").hidden = !vision;
+  const behaviour = state.behaviour || {};
+  renderBoxes(vision, behaviour.target);
+  if (!vision) return;
+  const rows = [
+    ["source", vision.source],
+    ["detector", vision.detector || "none -- picture only"],
+    ["frames", `${vision.frames} at ${vision.fps.toFixed(1)}/s`],
+  ];
+  if (vision.detect_seconds !== null && vision.detect_seconds !== undefined)
+    rows.push(["detection", (vision.detect_seconds * 1000).toFixed(0) + " ms/frame"]);
+  const status = $("vision-status");
+  status.replaceChildren(...rows.map(([name, value]) => {
+    const row = document.createElement("div");
+    row.className = "vision-row";
+    const key = document.createElement("span");
+    key.textContent = name;
+    const val = document.createElement("b");
+    val.textContent = String(value);
+    row.append(key, val);
+    return row;
+  }));
+  // A stalled detector is the one vision failure that looks like success:
+  // the picture may still be moving while nothing is looking at it.
+  $("vision-note").textContent = vision.stale
+    ? "the detector has stopped answering -- nothing is being recognised. "
+      + "Is something else holding the robot's stream? (ASSUMPTIONS G3)"
+    : vision.note || "";
+  const list = $("vision-list");
+  const found = vision.detections || [];
+  list.replaceChildren(...(found.length ? found : [null]).map((det) => {
+    const row = document.createElement("div");
+    row.className = det ? "vision-row" : "hint";
+    if (!det) { row.textContent = "nothing detected"; return row; }
+    const key = document.createElement("span");
+    key.textContent = detLabel(det);
+    const val = document.createElement("b");
+    val.textContent = det.bearing > 0.02 ? "right" : det.bearing < -0.02 ? "left" : "ahead";
+    row.append(key, val);
+    return row;
+  }));
+}
+
+/* ---------- the command box ---------- */
+
+function renderSay() {
+  const behaviour = state.behaviour || {};
+  $("say-panel").hidden = !state.can_talk;
+  if (!state.can_talk) return;
+  // Anything running refuses a new command, so the button says so rather than
+  // posting one that comes back 409. Stopping is NOT done from here: the STOP
+  // button and Escape are, and neither waits for a model to answer.
+  $("say-send").disabled = !!state.busy;
+  $("say-note").textContent = behaviour.call
+    ? `understood as: ${behaviour.call}`
+    : state.vision
+    ? "plain words -- \"Komm zu mir\". Anything outside the vocabulary is refused."
+    : "no camera: only stop can be asked for (start teach with --vision for the rest)";
+  const note = $("behaviour-note");
+  if (behaviour.active) {
+    note.className = "behaving";
+    note.textContent = `${behaviour.state}: ${behaviour.note} -- STOP or Esc ends it`;
+  } else if (state.busy) {
+    note.className = "hint";
+    note.textContent = `${state.busy} is running -- STOP (or Esc) ends it`;
+  } else {
+    note.className = "hint";
+    note.textContent = behaviour.message || "";
+  }
 }
 
 function renderPose() {
@@ -899,10 +1054,15 @@ function camControl(param, values) {
 function renderCamera() {
   const cam = state.camera;
   if (!cam) return;
+  $("stream-hint").textContent = state.vision
+    ? "(read once by the teach session and re-served here, so the detector "
+      + "and this tab never compete for the robot's single frame buffer)"
+    : "(MJPEG straight from the robot; only one viewer at a time)";
   if (camControlsBuilt) syncCamControls(cam);
   $("cam-note").textContent = cam.tuning
     ? ""
-    : "this robot runs the stock firmware: the picture is all it offers";
+    : "the picture is all this backend offers -- the sensor's own controls need "
+      + "our firmware (ASSUMPTIONS D2)";
   $("cam-reset").hidden = !cam.tuning;
   // Which of the two these controls are is worth saying plainly: a value read
   // back from the sensor is the truth, a remembered one is only our side of a
@@ -947,9 +1107,25 @@ function renderCamera() {
 function renderConsole() {
   renderPad(state.sequence);
   renderFunctions();
+  renderAttitude();
   $("home-note").textContent = state.pose_enabled
     ? "stops, then stands in the pose the session opened in"
     : "stops the robot (this one takes no leg targets, so there is no pose)";
+}
+
+// The only measured thing on this transport. Nose-down must show a negative
+// pitch -- that single observation settles the axis signs (ASSUMPTIONS G9).
+function renderAttitude() {
+  const a = state.attitude;
+  const note = $("attitude-note");
+  if (!a) {
+    note.textContent = "";
+    return;
+  }
+  const sign = (v) => (v >= 0 ? "+" : "") + v.toFixed(1);
+  note.textContent =
+    `body: pitch ${sign(a.pitch)} deg, roll ${sign(a.roll)} deg, ` +
+    `turned ${sign(a.turned)} deg -- ${a.still ? "still" : "moving"}`;
 }
 
 function renderPad(seq) {
@@ -1191,6 +1367,23 @@ $("seq-stop").addEventListener("click", () => api("stop", {}));
 $("btn-reset").addEventListener("click", () => api("reset", {}));
 $("btn-home").addEventListener("click", () => api("home", {}));
 $("cam-toggle").addEventListener("click", () => (streaming ? stopStream() : startStream()));
+
+function sendSaid() {
+  const input = $("say-text");
+  const text = input.value.trim();
+  if (!text) return;
+  $("say-send").disabled = true;
+  api("say", {text: text}).then((data) => {
+    $("say-send").disabled = false;
+    if (data.ok) input.value = "";
+    render();
+  });
+}
+$("say-send").addEventListener("click", sendSaid);
+$("say-text").addEventListener("keydown", (event) => {
+  // Enter sends; Escape is the global stop and must not be swallowed here.
+  if (event.key === "Enter") { event.preventDefault(); sendSaid(); }
+});
 $("cam-reset").addEventListener("click", () => {
   api("camera", {name: "reset", value: 0}).then(() => {
     camControlsBuilt = false;   // the values moved, so the controls must be redrawn

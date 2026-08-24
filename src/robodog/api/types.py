@@ -203,8 +203,25 @@ Command = (
 
 @dataclass(frozen=True, slots=True)
 class Telemetry:
+    """What the robot has reported about itself, as opposed to been told.
+
+    Attitude is derived rather than raw -- the estimator that produces it lives
+    in `robodog.localization` and is fed by whichever backend does the asking.
+    It is here because it is the one part of the robot's own state that is
+    genuinely *measured*: every other field of RobotState on this transport is
+    a model of what the robot was asked to do (`is_estimated=True`).
+    """
+
     voltage: float | None = None
     acc: tuple[float, float, float] | None = None
+    pitch: float | None = None
+    """Degrees, positive nose-up."""
+    roll: float | None = None
+    """Degrees, positive leaning right."""
+    turned: float | None = None
+    """Degrees turned since the connection was made; positive to the right."""
+    still: bool | None = None
+    """True while the body is neither accelerating nor turning."""
 
 
 @dataclass(frozen=True, slots=True)

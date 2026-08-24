@@ -28,8 +28,8 @@ them.
    "fix" to the port.
 4. **`vendor/` is read-only.** It is a pinned upstream reference copy
    (MIT, Waveshare). Never edit those files.
-5. **No hardware in tests.** CI and the default test suite must pass with no
-   robot attached, ever. Hardware-touching code is exercised through the mock
+5. **No hardware in tests.** The default test suite must pass with no
+   robot attached, ever, on any machine. Hardware-touching code is exercised through the mock
    backend or recorded replays.
 6. **English everywhere** in the repository — code, comments, docs, commit
    messages.
@@ -44,8 +44,15 @@ cd RoboDog
 uv sync --all-groups --all-extras
 ```
 
-Before opening a pull request, all four must pass — this is exactly what CI
-runs:
+`--all-extras` pulls `ultralytics` and torch for the `vision` extra -- about
+1.2 GB, since torch is pinned to the CPU wheel index (see the comment in
+`pyproject.toml`). If you would rather not, `uv sync --all-groups --extra viz --extra sim` passes the
+whole suite: nothing in the vision path needs a model to be tested. Leaving out `viz` or `sim` does **not** work — two tests assert the
+twin's geometry and fail on a tree that is perfectly fine.
+
+Before opening a pull request, all four must pass. There is no CI to catch
+them for you — this repository deliberately runs no GitHub Actions, so these
+four commands are the whole gate and running them is not optional:
 
 ```console
 uv run ruff check .

@@ -1,6 +1,5 @@
 # RoboDog
 
-[![CI](https://github.com/Justin-Riekehof/RoboDog/actions/workflows/ci.yml/badge.svg)](https://github.com/Justin-Riekehof/RoboDog/actions/workflows/ci.yml)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -42,6 +41,9 @@ uv run robodog play routines/patrol-loop.yaml --backend mock
 
 # validate a routine file without running it
 uv run robodog validate routines/bow.yaml
+
+# map what you would say onto a behaviour call (needs an LLM endpoint, no robot)
+uv run robodog intent "Komm zu mir"
 
 # render the robot as a 3D stick figure (needs the `viz` extra)
 uv run robodog viz --pose stand --out stand.png
@@ -94,6 +96,25 @@ uv run robodog teach patrol --backend http         # ... or on the real robot
 uv run robodog play routines/patrol-loop.yaml --backend http
 ```
 
+## Vision-guided behaviours ("Komm zu mir")
+
+The same teach UI grows a command box and a Camera tab with detection boxes on
+it. Type plain words; a language model maps them to **one named behaviour with
+parameters**, once, before anything moves, and a deterministic loop then runs it
+through the safety supervisor. The model never drives.
+
+```console
+uv run robodog teach patrol --backend http --vision   # the real thing
+uv run robodog teach demo --backend mock \
+    --vision-source ~/frames --detector yolo          # ... or with no robot at all
+```
+
+The host reads the robot's MJPEG stream **once** and re-serves it, because with
+no PSRAM the firmware has a single frame buffer and a browser watching the robot
+directly would blind the detector (ASSUMPTIONS F4/G3). YOLO lives behind the
+optional `vision` extra; the behaviour, the page and the model all work without
+it. Full guide: [docs/vision.md](docs/vision.md).
+
 ## On the real robot (Wi-Fi, stock firmware)
 
 Join the robot's access point (SSID `WAVESHARE Robot`, password `1234567890`),
@@ -138,8 +159,11 @@ uv run mypy
 ## Status
 
 **M0** (offline foundations), **M1** (Wi-Fi bring-up, run on the real robot on
-2026-08-11) and the core of **M2** (MuJoCo digital twin) are done. Next: **M3**
-sim-to-real calibration, then **M4** custom firmware. See
+2026-08-11) and the core of **M2** (MuJoCo digital twin) are done, as are the
+first two thirds of **M4** (our firmware fork: on-device watchdog, pose commands
+and camera tuning, all measured on the robot 2026-08-22). **M8**
+(vision-guided behaviours) is built and covered headlessly, but has not met a
+robot yet. Still open: **M3** sim-to-real calibration, and the rest of M4. See
 [ROADMAP.md](ROADMAP.md) and [ASSUMPTIONS.md](ASSUMPTIONS.md).
 
 One open hardware issue: our robot walks skewed because its repaired hind-right
@@ -154,6 +178,8 @@ leg deviates from the firmware's link geometry (ASSUMPTIONS F1/F3).
 | [ASSUMPTIONS.md](ASSUMPTIONS.md) | Every unverified claim about the hardware and firmware, with its source and current status |
 | [docs/bringup.md](docs/bringup.md) | Guided first contact with the real robot, and why each step is in that order |
 | [docs/teach-in.md](docs/teach-in.md) | Authoring routines: web UI, scriptable console, the routine file format |
+| [docs/vision.md](docs/vision.md) | Vision-guided behaviours: the one-viewer camera, what the behaviour does, why the model does not drive |
+| [docs/localization.md](docs/localization.md) | The IMU: what it corrects and why it is batched, and the honest case for stop-and-shoot visual odometry |
 | [docs/calibration.md](docs/calibration.md) | Servo zero calibration: the reference, the procedure, what the numbers do and do not say |
 | [docs/firmware.md](docs/firmware.md) | Flashing the ESP32: the pristine baseline, then the fork with the link watchdog |
 | [docs/research/](docs/research/) | Phase-0 source research on the WAVEGO and WAVEGO Pro, with citations |

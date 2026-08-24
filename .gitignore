@@ -32,3 +32,8 @@ out/
 
 # Claude Code local settings (machine-specific paths)
 .claude/settings.local.json
+
+# Detector weights (M8). ultralytics downloads these into the working directory
+# on first use and caches them there; they are a few megabytes of binary that
+# the tool re-fetches by itself, so they never belong in the history.
+*.pt
