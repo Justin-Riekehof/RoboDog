@@ -16,6 +16,19 @@ something unchanging to be line-faithful to.
 > **Flashed and measured on the robot, 2026-08-22.** Built with PlatformIO Core
 > 6.1.19 against the same `common.ini` as the baseline: 850,144 bytes of flash
 > and 53,324 of RAM, **+384 B / +16 B** over the untouched upstream sketch.
+> Those were the watchdog's numbers alone. With the camera controls, the pose
+> command and the IMU on top, both sketches rebuilt on 2026-08-24:
+>
+> | | baseline | fork | delta |
+> |---|---|---|---|
+> | Flash | 849,632 | 863,252 | **+13,620 B** (1.0% of the slot) |
+> | RAM | 53,308 | 55,460 | **+2,152 B** |
+>
+> Most of that RAM is the IMU ring: 64 samples of 28 bytes is 1,792 B, chosen so
+> a host polling ten times a second has more than a second of slack.
+>
+> **The IMU code has been compiled but never run.** Everything below the camera
+> section is untested on the device.
 >
 > The watchdog was verified on the device: armed at 2000 ms, robot walking, fed
 > with `ping` every 400 ms for 3.5 s without tripping; then silence produced
@@ -23,6 +36,32 @@ something unchanging to be line-faithful to.
 > Everything else behaves as the baseline does, because the watchdog stays off
 > until a host arms it. This closes ASSUMPTIONS B9/D10 for robots running this
 > firmware.
+
+## Building it anywhere but where it was written
+
+Two things stopped a fresh machine from building this at all, both found the
+first time anyone tried on Linux (2026-08-24) and both fixed:
+
+* **`#include <arduino.h>`** — upstream's spelling, and the Arduino core ships
+  the header capitalised. That resolves only on a case-insensitive filesystem,
+  so the sketch had never been built anywhere but Windows or macOS; on Linux it
+  failed at line 1, and so did the baseline it is supposed to be compared
+  against. Fixed **without touching either source file**: `firmware/compat/`
+  holds a one-line `arduino.h` that includes the real one, and `common.ini`
+  puts it on the include path for both sketches. Correcting the include instead
+  was the obvious move and the wrong one — the fork's own tests refused it,
+  because the baseline must stay byte-identical to `vendor/` to be worth
+  calling a baseline and the fork may only ever add lines.
+* **`wollewald/ICM20948_WE@1.2.1` had vanished from the registry.** PlatformIO
+  keeps only a library's last five versions, and by 2026-08-24 it served 1.2.5
+  upwards. The 2026-08-22 build had succeeded on a machine that still held the
+  package in its cache — a fresh clone could not build at all, which is exactly
+  what pinning was meant to prevent. `common.ini` now takes that library from
+  its git tag instead, which is not pruned. `INA219_WE` is three versions from
+  the same edge and is the next to move.
+
+Neither was our code. Both are the kind of thing that stays invisible until
+somebody builds on a machine that was not there when it was written.
 
 ## What is changed
 
