@@ -132,7 +132,17 @@ def accel_attitude(sample: ImuSample, frame: ImuFrame) -> tuple[float, float] | 
     # positive nose-up, matching BodyPose.pitch. Whether the chip's axis really
     # points that way is unverified (G9); `forward_sign` is how that is fixed
     # without touching this arithmetic.
-    pitch = math.degrees(math.atan2(forward, math.sqrt(lateral**2 + up**2)))
+    # The minus is the whole convention, and it was missing until the robot
+    # said so (2026-08-25): an accelerometer at rest reads the reaction to
+    # gravity, so tilting the nose UP by theta puts **-sin(theta)** on the
+    # forward axis, not +sin(theta). Measured with the nose 83 deg up, the
+    # forward axis reads -0.990 g. Without the sign, a robot looking up
+    # reported that it was looking down -- and the vision geometry would then
+    # have corrected the distance the wrong way, doubling the error it exists
+    # to remove instead of cancelling it.
+    pitch = math.degrees(math.atan2(-forward, math.sqrt(lateral**2 + up**2)))
+    # Roll needs no such sign and was right first time: leaning right puts
+    # +sin(phi) on the lateral axis, measured +0.979 g at 85 deg right.
     roll = math.degrees(math.atan2(lateral, up))
     return pitch, roll
 

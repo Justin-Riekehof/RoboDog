@@ -33,12 +33,20 @@ def at_rest(t: float, pitch_deg: float = 0.0, roll_deg: float = 0.0) -> ImuSampl
 
     Default frame: the chip's y lies along the robot and x across it, which is
     read out of the vendor's balance code rather than assumed (G9).
+
+    Note the **minus on the forward axis**. An accelerometer at rest reads the
+    reaction to gravity, so a nose-up tilt puts a negative value there -- and
+    this helper had it the other way round until the robot was asked
+    (2026-08-25), which made every test built on it agree with a sign error in
+    `accel_attitude`. Two wrongs looked like a green suite. The measured poses
+    at the bottom of this file are the fixture that could not do that, because
+    nobody chose their numbers.
     """
     p, r = math.radians(pitch_deg), math.radians(roll_deg)
     return ImuSample(
         t=t,
         ax=math.sin(r) * math.cos(p),
-        ay=math.sin(p),
+        ay=-math.sin(p),
         az=math.cos(p) * math.cos(r),
         gx=0.0,
         gy=0.0,
@@ -229,3 +237,57 @@ def test_a_clipped_person_reads_nearer_when_the_nose_is_up() -> None:
 def test_the_correction_cannot_leave_the_frame() -> None:
     assert level_height_fraction(person(0.0, 0.2), 40.0) == 0.0
     assert level_height_fraction(person(0.0, 0.99), -40.0) == 1.0
+
+
+# --- measured on the robot over USB, 2026-08-25 ------------------------------
+#
+# Four held poses from one recording, each averaged over three seconds of
+# stillness with |a| = 1.00 g. These are not invented numbers: they are what
+# this robot's ICM20948 reports, and they are what settled ASSUMPTIONS G9.
+
+MEASURED_POSES = (
+    ("level", 0.000, 0.000, 1.000, 0.0, 0.0),
+    ("nose up 83 deg", 0.021, -0.990, 0.118, 83.1, 10.1),
+    ("nose down 55 deg", -0.151, 0.823, 0.558, -54.9, -15.1),
+    ("leaning left 85 deg", -1.006, -0.107, 0.081, 6.1, -85.4),
+    ("leaning right 85 deg", 0.979, -0.015, 0.084, 0.9, 85.1),
+)
+
+
+@pytest.mark.parametrize(
+    ("name", "ax", "ay", "az", "pitch", "roll"),
+    MEASURED_POSES,
+    ids=[p[0] for p in MEASURED_POSES],
+)
+def test_the_estimator_agrees_with_the_robot(
+    name: str, ax: float, ay: float, az: float, pitch: float, roll: float
+) -> None:
+    """The frame's default signs, checked against the machine they describe."""
+    measured = accel_attitude(ImuSample(t=0.0, ax=ax, ay=ay, az=az, gx=0, gy=0, gz=0), ImuFrame())
+    assert measured is not None, f"{name}: gravity should be all there is here"
+    assert measured[0] == pytest.approx(pitch, abs=0.2)
+    assert measured[1] == pytest.approx(roll, abs=0.2)
+
+
+def test_nose_up_is_positive_pitch_and_nose_down_is_negative() -> None:
+    """The sign that was wrong until the robot said so.
+
+    An accelerometer at rest reads the reaction to gravity, so a nose-up tilt
+    puts a NEGATIVE value on the forward axis. Without the minus in
+    `accel_attitude` a robot looking up reported that it was looking down --
+    and the vision geometry would then have corrected the distance the wrong
+    way, doubling the error it exists to remove.
+    """
+    up = accel_attitude(ImuSample(0.0, 0.021, -0.990, 0.118, 0, 0, 0), ImuFrame())
+    down = accel_attitude(ImuSample(0.0, -0.151, 0.823, 0.558, 0, 0, 0), ImuFrame())
+    assert up is not None and down is not None
+    assert up[0] > 45.0
+    assert down[0] < -45.0
+
+
+def test_leaning_right_is_positive_roll_and_left_is_negative() -> None:
+    right = accel_attitude(ImuSample(0.0, 0.979, -0.015, 0.084, 0, 0, 0), ImuFrame())
+    left = accel_attitude(ImuSample(0.0, -1.006, -0.107, 0.081, 0, 0, 0), ImuFrame())
+    assert right is not None and left is not None
+    assert right[1] > 45.0
+    assert left[1] < -45.0
