@@ -506,10 +506,26 @@ void robodogImuInit(){
   myIMU.setGyrRange(ICM20948_GYRO_RANGE_500);
   myIMU.setGyrDLPF(ICM20948_DLPF_6);
   myIMU.setGyrSampleRateDivider(10);
-  ROBODOG_MAG_OK = myIMU.initMagnetometer();
-  if(ROBODOG_MAG_OK){
-    myIMU.setMagOpMode(AK09916_CONT_MODE_20HZ);
-  }
+
+  // The magnetometer is deliberately NOT initialised, and both halves of that
+  // decision were measured on this robot on 2026-08-24/25:
+  //
+  //  * `myIMU.initMagnetometer()` **hangs setup() forever**, intermittently.
+  //    It succeeded on the first boot of the evening and blocked on every one
+  //    after, with no watchdog, no panic and no output -- the robot simply
+  //    never finished starting. The AK09916 sits behind the ICM20948's own
+  //    auxiliary I2C master, and the library's init spins waiting for it.
+  //  * It would buy nothing if it worked. The one reading we got measured
+  //    about 200 uT, against an earth field of 25-65: the robot's own magnets
+  //    and motor currents dominate it, so it is not a compass here without a
+  //    hard-iron calibration nobody has done (ASSUMPTIONS G9).
+  //
+  // Trading a guaranteed boot for a reading known to be useless is not a
+  // trade. Yaw comes from the gyroscope alone and is reported as "turned since
+  // the run started" rather than as a heading, which is what the behaviour
+  // needs anyway. Reviving this means reading the aux bus by hand with a
+  // timeout -- not calling a library function that cannot fail safely.
+  ROBODOG_MAG_OK = false;
 }
 
 // Called from loop() only. Rate-gated, so it costs one I2C burst per period
@@ -534,11 +550,12 @@ void robodogImuSample(){
   // The vendor's own globals, kept fed for anything that still reads them.
   ACC_X = g.x; ACC_Y = g.y; ACC_Z = g.z;
 
-  if(ROBODOG_MAG_OK && (now - ROBODOG_IMU_MAG_MS >= ROBODOG_IMU_MAG_PERIOD_MS)){
+  // Temperature on its own schedule. It used to ride along with the
+  // magnetometer read, which meant switching that off silently switched this
+  // off too -- and the gyroscope's bias drifts with temperature, so it is the
+  // one of the two actually worth having.
+  if(now - ROBODOG_IMU_MAG_MS >= ROBODOG_IMU_MAG_PERIOD_MS){
     ROBODOG_IMU_MAG_MS = now;
-    xyzFloat m = myIMU.getMagValues();
-    ROBODOG_MAG_X = m.x; ROBODOG_MAG_Y = m.y; ROBODOG_MAG_Z = m.z;
-    ROBODOG_MAG_T = now;
     ROBODOG_IMU_TEMP = myIMU.getTemperature();
   }
 }
@@ -592,6 +609,7 @@ void setup() {
   wireDebugInit();
   
   // INA219 INIT.
+  Serial.println("ROBODOG: setup ina219");
   InitINA219();
 
   // BUZZER INIT.
@@ -601,9 +619,11 @@ void setup() {
   InitRGB();
 
   // PCA9685 INIT.
+  Serial.println("ROBODOG: setup pca9685");
   ServoSetup();
 
   // SSD1306 INIT.
+  Serial.println("ROBODOG: setup oled");
   InitScreen();
 
   // EEPROM INIT.
@@ -613,14 +633,18 @@ void setup() {
   delay(100);
   setSingleLED(0,matrix.Color(0, 128, 255));
   setSingleLED(1,matrix.Color(0, 128, 255));
+  Serial.println("ROBODOG: setup standup");
   standMassCenter(0, 0);GoalPosAll();delay(1000);
   setSingleLED(0,matrix.Color(255, 128, 0));
   setSingleLED(1,matrix.Color(255, 128, 0));
   delay(500);
 
   // ICM20948 INIT.
+  Serial.println("ROBODOG: setup imu (autoOffsets -- hold still)");
   InitICM20948();
+  Serial.println("ROBODOG: setup imu gyro+mag");
   robodogImuInit();   // RoboDog: gyroscope and magnetometer, which the vendor configures nowhere
+  Serial.println("ROBODOG: setup wifi");
 
   // WEBCTRL INIT. WIFI settings included.
   webServerInit();
