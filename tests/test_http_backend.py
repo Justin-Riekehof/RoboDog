@@ -43,7 +43,7 @@ from robodog.backends.http import (
     HttpBackend,
 )
 from robodog.camera import DEFAULTS as CAMERA_DEFAULTS
-from robodog.errors import BackendError, CapabilityError
+from robodog.errors import BackendError, CapabilityError, TransportError
 from tests.conftest import FakeClock
 
 KNOWN_VARS = {"framesize", "funcMode", "sconfig", "sset", "move"}
@@ -1100,3 +1100,51 @@ def test_the_keepalive_carries_the_imu_instead_of_a_bare_ping(
         assert backend.imu.samples == 30
     finally:
         backend.disconnect()
+
+
+def test_a_link_that_dies_mid_connect_is_not_a_firmware_verdict() -> None:
+    """The message this replaced sent an operator to reflash a robot whose only
+    problem was Wi-Fi.
+
+    Seen on 2026-08-25: the stop commands and the firmware probe both got
+    through, and the watchdog request found no route to the host. The old text
+    read "this robot refused the watchdog command, so it is not running 'auto'
+    firmware -- drop --firmware, or flash firmware/wavego-robodog", which is
+    wrong twice over: nothing was refused, and 'auto' is a request to probe
+    rather than an assertion anybody made.
+    """
+
+    class DiesAfterTheProbe(HttpBackend):
+        def _control(self, var: str, val: int, cmd: int = 0, **kwargs: object) -> bytes:
+            if var == "watchdog":
+                raise TransportError(
+                    "cannot reach robot at http://192.168.4.1/control: [Errno 113] No route to host"
+                )
+            return b""
+
+    backend = DiesAfterTheProbe(host="127.0.0.1:1")
+    with pytest.raises(TransportError) as failure:
+        backend.connect()
+    message = str(failure.value)
+    assert "lost the robot while arming its watchdog" in message
+    assert "No route to host" in message
+    assert "flash" not in message, "a dead link is no reason to suspect the firmware"
+
+
+def test_a_robot_that_really_refuses_the_watchdog_still_says_reflash() -> None:
+    """The other half: an answer of 500 IS a statement about the firmware."""
+
+    class ProbesButRefuses(HttpBackend):
+        def _control(self, var: str, val: int, cmd: int = 0, **kwargs: object) -> bytes:
+            if var == "watchdog":
+                raise BackendError("http://192.168.4.1/control returned HTTP 500")
+            return b""
+
+    backend = ProbesButRefuses(host="127.0.0.1:1")
+    with pytest.raises(BackendError) as failure:
+        backend.connect()
+    message = str(failure.value)
+    assert "older" in message and "reflash" in message
+    # `auto` is a request to probe; nobody asserted it, so nobody is told to
+    # drop a flag they never passed.
+    assert "--firmware" not in message
