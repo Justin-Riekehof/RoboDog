@@ -9,6 +9,7 @@ all, shared by the language model's schema, its prompt and the validator.
 """
 
 from robodog.behaviour.machine import (
+    ATTITUDE_HUNGRY,
     STOP_HEIGHT_DEFAULT,
     STOP_HEIGHT_MAX,
     STOP_HEIGHT_MIN,
@@ -34,6 +35,7 @@ from robodog.behaviour.vocabulary import (
 )
 
 __all__ = [
+    "ATTITUDE_HUNGRY",
     "STOP_HEIGHT_DEFAULT",
     "STOP_HEIGHT_MAX",
     "STOP_HEIGHT_MIN",

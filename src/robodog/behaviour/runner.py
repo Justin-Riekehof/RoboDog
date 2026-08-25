@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 from robodog.api.client import RobotClient
 from robodog.api.types import Capability, Drive
-from robodog.behaviour.machine import BehaviourState, ComeToMe, Intent
+from robodog.behaviour.machine import ATTITUDE_HUNGRY, BehaviourState, ComeToMe, Intent
 from robodog.errors import CapabilityError, RobodogError
 from robodog.vision import Detection
 
@@ -66,18 +66,19 @@ class BehaviourRunner:
         self._sleep = sleep
         self.last_intent: Intent | None = None
 
-    def _pitch(self) -> float:
-        """The body's pitch, or zero where nothing measures it.
+    def _attitude(self) -> tuple[float, float | None]:
+        """(pitch_deg, turned_deg), degraded honestly where nothing measures.
 
-        Zero is not a guess dressed up as a measurement -- it is the assumption
-        every caller made before the IMU existed, and the behaviour is exactly
-        as good as it was without one. What it removes when it IS measured is
-        the largest error in the distance estimate (ASSUMPTIONS G2/G9).
+        Pitch degrades to zero -- the assumption every caller made before the
+        IMU existed, correcting nothing and breaking nothing (G2/G9). Turned
+        degrades to None, NOT zero: the machine treats None as "align by timed
+        pulses", and a fabricated 0.0 would instead promise it a gyro that
+        never moves -- an alignment that can never finish.
         """
         attitude = self._client.attitude
         if attitude is None or not attitude.trusted:
-            return 0.0
-        return attitude.pitch
+            return 0.0, None
+        return attitude.pitch, attitude.turned
 
     def run(
         self,
@@ -103,7 +104,17 @@ class BehaviourRunner:
                     report.stopped_early = True
                     report.reason = "stopped"
                     break
-                intent = self._machine.update(self._detections(), self._clock(), self._pitch())
+                # Blind motion steers by the gyro: while aligning or advancing
+                # the machine wants a reading fresher than the watchdog feed's
+                # 500 ms cadence -- a 42 deg/s turn quantised to half-second
+                # polls is 21-degree steps, far too coarse to stop on. Those
+                # ticks pay one extra round trip for it.
+                if self._machine.state in ATTITUDE_HUNGRY:
+                    self._client.poll_imu()
+                pitch_deg, turned_deg = self._attitude()
+                intent = self._machine.update(
+                    self._detections(), self._clock(), pitch_deg, turned_deg
+                )
                 self.last_intent = intent
                 if intent.drive != last:
                     self._client.send(intent.drive)

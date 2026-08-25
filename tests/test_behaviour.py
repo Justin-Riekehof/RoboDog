@@ -8,20 +8,18 @@ moves time and nothing waits on a wall clock.
 
 from __future__ import annotations
 
-import itertools
-
 import pytest
 
 from robodog.api.client import RobotClient
 from robodog.api.types import Capability, Command, Drive
 from robodog.backends.mock import MockBackend
 from robodog.behaviour import (
-    STOP_HEIGHT_DEFAULT,
     STOP_HEIGHT_MAX,
     ApproachConfig,
     BehaviourRunner,
     BehaviourState,
     ComeToMe,
+    Intent,
     approach_config,
     distance_mm_for_height_fraction,
     height_fraction_for_distance,
@@ -117,81 +115,233 @@ def test_a_different_label_or_a_weak_detection_is_not_a_target() -> None:
     assert pick_target(unsure, label="person", min_confidence=0.4) is None
 
 
-# --- the state machine ------------------------------------------------------
+# --- the state machine: look, align on the spot, advance straight -----------
+#
+# The regime is the operator's, designed after the first stop-and-look drive
+# on the robot (2026-08-25): blind turning at the measured 42.7 deg/s swung
+# the person out of a ~65 deg FOV inside one burst. Nothing here ever walks
+# and turns at once.
 
 
-def test_it_starts_by_searching_and_turns_in_pulses() -> None:
-    """Turning without pause never gets a clean look: the picture is blurred."""
-    config = ApproachConfig(search_turn_seconds=0.4, search_look_seconds=0.2)
-    machine = ComeToMe(config=config)
-    turns = [machine.update([], t / 10).drive for t in range(10)]
-    assert machine.state is BehaviourState.SEARCHING
-    assert Drive(0, 1) in turns and Drive(0, 0) in turns
+def look_at(
+    machine: ComeToMe, target: Detection | None, t: float, turned: float | None = None
+) -> Intent:
+    return machine.update([target] if target else [], t, 0.0, turned)
 
 
-def test_searching_gives_up_on_its_own() -> None:
-    machine = ComeToMe(config=ApproachConfig(search_seconds=3.0))
-    assert machine.update([], 0.0).state is BehaviourState.SEARCHING
-    intent = machine.update([], 3.0)
+def instant(**overrides: object) -> ApproachConfig:
+    """A config that decides on the first frame.
+
+    The settle dwell exists so several frames feed the smoothed bearing before
+    anything moves (G7); unit tests that probe the decision itself set it to
+    zero and probe the dwell separately.
+    """
+    return ApproachConfig(look_settle_seconds=0.0, **overrides)  # type: ignore[arg-type]
+
+
+def test_it_starts_by_looking_not_searching() -> None:
+    """The robot stands at behaviour start, which is when the gated stream
+    flows -- burning that first look on a blind search would be backwards."""
+    machine = ComeToMe()
+    intent = machine.update([], 0.0)
+    assert intent.state is BehaviourState.LOOKING
+    assert intent.drive == Drive(0, 0)
+
+
+def test_an_empty_look_becomes_a_search_and_gives_up_on_its_own() -> None:
+    machine = ComeToMe(config=ApproachConfig(look_patience=1.0, search_seconds=3.0))
+    machine.update([], 0.0)
+    assert machine.update([], 1.5).state is BehaviourState.SEARCHING
+    intent = machine.update([], 5.0)
     assert intent.state is BehaviourState.LOST
     assert intent.drive == Drive(0, 0)
-    assert "no person found" in intent.reason
 
 
-def test_a_target_well_off_to_the_side_is_turned_towards_not_walked_at() -> None:
-    right = ComeToMe().update([person(0.8, 0.2)], 0.0)
-    assert right.state is BehaviourState.APPROACHING
-    assert right.drive == Drive(0, 1)  # turn right, no forward
-    assert ComeToMe().update([person(-0.8, 0.2)], 0.0).drive == Drive(0, -1)
+def test_searching_turns_in_pulses_with_look_pauses() -> None:
+    """The pauses are where the gated stream flows -- built in from the start."""
+    machine = ComeToMe(config=ApproachConfig(look_patience=0.5))
+    machine.update([], 0.0)
+    drives = [machine.update([], 1.0 + 0.1 * i).drive for i in range(15)]
+    assert Drive(0, 1) in drives and Drive(0, 0) in drives
+    assert all(d.forward == 0 for d in drives), "a search must never walk"
 
 
-def test_a_target_slightly_off_is_walked_at_while_correcting() -> None:
-    intent = ComeToMe().update([person(0.28, 0.2)], 0.0)
-    assert intent.drive == Drive(1, 1)
+def test_a_target_off_centre_starts_a_turn_on_the_spot() -> None:
+    machine = ComeToMe(config=instant())
+    intent = look_at(machine, person(0.6, 0.2), 0.0, turned=0.0)
+    assert intent.state is BehaviourState.ALIGNING
+    assert intent.drive == Drive(0, 1)
 
 
-def test_a_centred_target_is_simply_walked_at() -> None:
-    intent = ComeToMe().update([person(0.0, 0.2)], 0.0)
+def test_a_centred_target_starts_a_straight_burst() -> None:
+    machine = ComeToMe(config=instant())
+    intent = look_at(machine, person(0.0, 0.2), 0.0)
+    assert intent.state is BehaviourState.ADVANCING
     assert intent.drive == Drive(1, 0)
-    assert intent.target is not None
 
 
-def test_it_stops_when_the_target_is_big_enough() -> None:
-    """Held for the confirmation window -- one frame is not evidence."""
-    machine = ComeToMe()
-    near = [person(0.0, STOP_HEIGHT_DEFAULT + 0.05)]
-    machine.update(near, 0.0)
-    intent = machine.update(near, 0.5)
-    assert intent.state is BehaviourState.ARRIVED
+def test_nothing_ever_walks_and_turns_at_once() -> None:
+    """The invariant that replaced the whole steering regime."""
+    scenarios = []
+    for bearing in (-0.9, -0.4, -0.1, 0.0, 0.1, 0.4, 0.9):
+        machine = ComeToMe()
+        for i in range(40):
+            seen = [person(bearing, 0.2 + 0.01 * i)] if i % 3 == 0 else []
+            intent = machine.update(seen, 0.15 * i, 0.0, 2.0 * i)
+            scenarios.append(intent.drive)
+    assert all(not (d.forward != 0 and d.turn != 0) for d in scenarios)
+
+
+# --- aligning: closed-loop on the gyro --------------------------------------
+
+
+def test_alignment_stops_when_the_gyro_says_so() -> None:
+    """Bearing +0.6 of a 65 deg lens is +19.5 deg. The turn must end when
+    `turned` has covered that, not when a timer guesses it has."""
+    machine = ComeToMe(config=instant())
+    assert look_at(machine, person(0.6, 0.2), 0.0, turned=0.0).drive == Drive(0, 1)
+    turned, t = 0.0, 0.0
+    while machine.state is BehaviourState.ALIGNING and t < 4.0:
+        t += 0.2
+        turned += 5.0  # a fresh gyro reading per tick, mid-turn
+        intent = machine.update([], t, 0.0, turned)
+    assert machine.state is BehaviourState.LOOKING
     assert intent.drive == Drive(0, 0)
-    assert "fills" in intent.reason
+    # 19.5 deg wanted, 7 deg tolerance: it must stop by 20 deg turned, not
+    # sail on to the 30+ the old blind burst would have covered.
+    assert turned <= 20.0
 
 
-def test_arrival_wins_even_when_the_target_is_off_to_the_side() -> None:
-    """Near is near; turning towards something that close is not an improvement."""
-    machine = ComeToMe()
-    near = [person(0.9, STOP_HEIGHT_DEFAULT + 0.1)]
-    machine.update(near, 0.0)
-    assert machine.update(near, 0.5).state is BehaviourState.ARRIVED
-
-
-def test_losing_sight_stops_the_robot_rather_than_carrying_on() -> None:
-    """The invariant: never walk towards something you cannot currently see."""
-    machine = ComeToMe(config=ApproachConfig(lost_grace=1.0))
-    assert machine.update([person(0.0, 0.25)], 0.0).drive == Drive(1, 0)
-    intent = machine.update([], 0.5)
+def test_alignment_survives_an_overshoot_reading() -> None:
+    """One coarse gyro sample can jump past the target; the sign of the
+    remaining angle, not its size, ends the turn."""
+    machine = ComeToMe(config=instant())
+    look_at(machine, person(0.6, 0.2), 0.0, turned=0.0)
+    intent = machine.update([], 0.5, 0.0, 35.0)  # way past the ~19.5 target
+    assert machine.state is BehaviourState.LOOKING
     assert intent.drive == Drive(0, 0)
-    assert intent.state is BehaviourState.APPROACHING
-    assert "lost sight" in intent.reason
 
 
-def test_after_the_grace_period_it_goes_looking_where_it_last_saw_it() -> None:
-    """Only when it was lost far away -- see the close-range case below."""
-    machine = ComeToMe(config=ApproachConfig(lost_grace=0.5))
-    machine.update([person(-0.7, 0.2)], 0.0)
+def test_a_gyro_that_goes_quiet_ends_the_turn_rather_than_dead_reckoning() -> None:
+    machine = ComeToMe(config=instant())
+    look_at(machine, person(0.6, 0.2), 0.0, turned=0.0)
+    intent = machine.update([], 0.4, 0.0, None)
+    assert machine.state is BehaviourState.LOOKING
+    assert intent.drive == Drive(0, 0)
+
+
+def test_without_a_gyro_alignment_is_a_short_timed_pulse() -> None:
+    """Mock and sim have no IMU. The fallback turns for |bearing|/rate, capped,
+    then looks again -- iterative, bounded, honest."""
+    machine = ComeToMe(config=instant())
+    intent = look_at(machine, person(0.6, 0.2), 0.0)  # no turned anywhere
+    assert intent.state is BehaviourState.ALIGNING
+    # The pulse may not exceed the cap, however large the bearing.
+    assert machine.update([], ApproachConfig().align_max_pulse + 0.01, 0.0).state is (
+        BehaviourState.LOOKING
+    )
+
+
+def test_the_timed_pulse_respects_the_measured_asymmetry() -> None:
+    """Left turns 2.4x faster than right on this robot (G4/F1), so the same
+    bearing needs a shorter pulse to the left."""
+    config = instant()
+    to_deg = config.hfov_deg / 2.0
+    bearing = 10.0 / to_deg  # exactly 10 degrees, either side
+
+    def pulse_length(sign: float) -> float:
+        machine = ComeToMe(config=instant())
+        look_at(machine, person(sign * bearing, 0.2), 0.0)
+        t = 0.0
+        while machine.state is BehaviourState.ALIGNING:
+            t += 0.05
+            machine.update([], t, 0.0)
+        return t
+
+    assert pulse_length(-1.0) < pulse_length(+1.0)
+
+
+def test_alignment_never_outlives_its_timeout() -> None:
+    machine = ComeToMe(config=instant(align_timeout=1.0))
+    look_at(machine, person(0.9, 0.2), 0.0, turned=0.0)
+    # The gyro reports but never moves -- a robot stuck against a wall.
+    intent = machine.update([], 1.2, 0.0, 0.0)
+    assert machine.state is BehaviourState.LOOKING
+    assert intent.drive == Drive(0, 0)
+
+
+# --- advancing: straight, bounded, watched ----------------------------------
+
+
+def test_a_burst_ends_on_its_clock_and_stands_to_look() -> None:
+    machine = ComeToMe(config=instant(walk_burst_seconds=1.0))
+    look_at(machine, person(0.0, 0.2), 0.0)
+    assert machine.update([], 0.5).drive == Drive(1, 0)
+    intent = machine.update([], 1.1)
+    assert machine.state is BehaviourState.LOOKING
+    assert intent.drive == Drive(0, 0)
+
+
+def test_a_burst_never_steers_even_when_it_can_see() -> None:
+    """Continuous vision (sim, streamgate=0): a drifting target ends the burst
+    for a re-align. It never turns the wheel mid-walk."""
+    machine = ComeToMe(config=instant())
+    look_at(machine, person(0.0, 0.2), 0.0)
+    drives = []
+    intent = None
+    for i in range(1, 8):
+        intent = machine.update([person(0.5, 0.2)], 0.1 * i)  # way off centre
+        drives.append(intent.drive)
+        if machine.state is not BehaviourState.ADVANCING:
+            break
+    assert machine.state is BehaviourState.LOOKING
+    assert all(d.turn == 0 for d in drives)
+
+
+def test_heading_drift_aborts_the_burst() -> None:
+    """The robot veers when it walks (F1); the gyro sees it long before the
+    next scheduled look would."""
+    machine = ComeToMe(config=instant(drift_abort_deg=15.0))
+    look_at(machine, person(0.0, 0.2), 0.0, turned=100.0)
+    assert machine.update([], 0.2, 0.0, 104.0).drive == Drive(1, 0)
+    intent = machine.update([], 0.4, 0.0, 117.0)  # 17 deg off the reference
+    assert machine.state is BehaviourState.LOOKING
+    assert intent.drive == Drive(0, 0)
+
+
+def test_blind_advance_is_bounded_by_the_burst_not_by_hope() -> None:
+    """However long the stream stays dark, blind walking totals at most one
+    burst before the robot stands and waits to see."""
+    machine = ComeToMe(config=ApproachConfig(walk_burst_seconds=1.2))
+    machine.update([person(0.0, 0.3)], 0.0)
+    blind_walk, now = 0.0, 0.0
+    while now < 10.0:
+        now += 0.1
+        if machine.update([], now).drive.forward == 1:
+            blind_walk += 0.1
+    assert blind_walk <= 1.2 + 0.11, f"walked blind for {blind_walk:.1f}s"
+
+
+# --- looking, losing, arriving ----------------------------------------------
+
+
+def test_losing_the_target_means_standing_and_waiting_first() -> None:
+    machine = ComeToMe(config=ApproachConfig(look_patience=2.0, walk_burst_seconds=0.4))
+    machine.update([person(0.0, 0.2)], 0.0)
+    machine.update([], 0.5)  # burst over -> LOOKING
     intent = machine.update([], 1.0)
+    assert intent.state is BehaviourState.LOOKING
+    assert intent.drive == Drive(0, 0)
+
+
+def test_after_its_patience_the_look_becomes_a_search_towards_the_last_bearing() -> None:
+    machine = ComeToMe(config=ApproachConfig(look_patience=0.5, walk_burst_seconds=0.4))
+    machine.update([person(-0.7, 0.2)], 0.0, 0.0, 0.0)
+    # Alignment (left), then let everything expire without a sighting.
+    machine.update([], 0.3, 0.0, -25.0)
+    intent = machine.update([], 1.5, 0.0, -25.0)
     assert intent.state is BehaviourState.SEARCHING
-    assert intent.drive == Drive(0, -1)  # back towards where it was
+    assert intent.drive in (Drive(0, -1), Drive(0, 0))
 
 
 def test_the_whole_run_is_bounded_by_a_timeout() -> None:
@@ -212,39 +362,19 @@ def test_a_finished_run_stays_finished() -> None:
     assert later.drive == Drive(0, 0)
 
 
-def test_it_never_commands_forward_without_a_target_in_that_very_update() -> None:
-    """The invariant, over a script rather than a single call."""
-    machine = ComeToMe(config=ApproachConfig(lost_grace=0.4, search_seconds=30.0))
-    script: list[list[Detection]] = [
-        [person(0.0, 0.2)],
-        [],
-        [],
-        [person(0.4, 0.3)],
-        [],
-        [person(0.0, 0.35)],
-        [],
-        [],
-        [],
-    ]
-    for tick, detections in enumerate(script):
-        intent = machine.update(detections, tick * 0.2)
-        if intent.drive.forward != 0:
-            assert detections, f"tick {tick} walked with nothing in frame"
-
-
 def test_impossible_configurations_are_refused() -> None:
     with pytest.raises(ValueError, match="stop_height_fraction"):
         ApproachConfig(stop_height_fraction=STOP_HEIGHT_MAX + 0.1)
     with pytest.raises(ValueError, match="default_search_turn"):
         ApproachConfig(default_search_turn=0)
-    with pytest.raises(ValueError, match="correct bearings"):
-        ApproachConfig(correct_enter_bearing=0.1, correct_exit_bearing=0.4)
-    with pytest.raises(ValueError, match="turn bearings"):
-        ApproachConfig(turn_enter_bearing=0.1, turn_exit_bearing=0.4)
-    with pytest.raises(ValueError, match="further out than steering"):
-        ApproachConfig(turn_enter_bearing=0.1, turn_exit_bearing=0.05)
     with pytest.raises(ValueError, match="confidences"):
         ApproachConfig(acquire_confidence=0.2, keep_confidence=0.5)
+    with pytest.raises(ValueError, match="plausible lens"):
+        ApproachConfig(hfov_deg=200.0)
+    with pytest.raises(ValueError, match="turn rates"):
+        ApproachConfig(turn_rate_left_dps=0.0)
+    with pytest.raises(ValueError, match="walk_burst_seconds"):
+        ApproachConfig(walk_burst_seconds=30.0)
 
 
 # --- the parameters an operator may set -------------------------------------
@@ -286,7 +416,7 @@ def make_runner(
 
     runner = BehaviourRunner(
         client,
-        ComeToMe(config=config if config is not None else ApproachConfig()),
+        ComeToMe(config=config if config is not None else ApproachConfig(look_settle_seconds=0.0)),
         detections=detections,
         clock=clock,
         # Sleeping IS how time passes here: the loop paces itself, and the fake
@@ -394,115 +524,55 @@ def test_a_failed_stop_does_not_mask_what_went_wrong_first() -> None:
         runner.run()
 
 
-# --- what the first run on the robot found (2026-08-23) ---------------------
-
-
-def test_a_turn_does_not_reverse_the_moment_it_overshoots_centre() -> None:
-    """The rocking observed on the robot: one threshold, so any overshoot of
-    centre immediately commanded the opposite turn and nothing ever closed."""
-    machine = ComeToMe()
-    # Well off to the right: turn in place.
-    assert machine.update([person(0.7, 0.2)], 0.0).drive == Drive(0, 1)
-    # It turns, and by the time the picture catches up it has gone past centre.
-    overshot = machine.update([person(-0.22, 0.2)], 0.2).drive
-    assert overshot != Drive(0, -1), "turned straight back -- this is the rocking"
-
-
-def test_a_turn_is_held_until_the_target_is_properly_centred() -> None:
-    """Entering at 0.35 and leaving at 0.15: inside the gap the turn continues,
-    so the robot commits to the turn instead of abandoning it half way."""
-    machine = ComeToMe()
-    assert machine.update([person(0.5, 0.2)], 0.0).drive == Drive(0, 1)
-    assert machine.update([person(0.25, 0.2)], 0.1).drive == Drive(0, 1)
-    # Centred and held there: the turn ends, and it never turns back.
-    drives = [machine.update([person(0.0, 0.2)], 0.2 + 0.1 * i).drive for i in range(8)]
-    assert drives[-1] == Drive(1, 0)
-    assert Drive(0, -1) not in drives
-
-
-def test_steering_does_not_chatter_around_its_own_threshold() -> None:
-    """A bearing hovering on the boundary must not flip the drive every tick."""
-    machine = ComeToMe()
-    machine.update([person(0.0, 0.2)], 0.0)  # walking straight
-    drives = [
-        machine.update([person(b, 0.2)], 0.1 * (i + 1)).drive
-        for i, b in enumerate((0.19, 0.21, 0.19, 0.21, 0.19))
-    ]
-    # Entering needs 0.20 and leaving needs 0.08, so this whole wobble is one
-    # decision, not five.
-    assert len({(d.forward, d.turn) for d in drives}) <= 2
+# --- what the runs on the robot taught (2026-08-23/25) -----------------------
 
 
 def test_a_target_being_approached_is_kept_on_weaker_evidence() -> None:
     """Walking at a person fills the frame with a fraction of one, and a
-    fraction of a person scores far below a whole one."""
+    fraction of a person scores far below a whole one (G6)."""
     machine = ComeToMe()
     faint = [person(0.0, 0.3, confidence=0.30)]
-    # Not enough to start on.
-    assert machine.update(faint, 0.0).state is BehaviourState.SEARCHING
-    # But once acquired, enough to hold.
+    intent = machine.update(faint, 0.0)
+    assert intent.state is BehaviourState.LOOKING and intent.target is None
     machine = ComeToMe()
     machine.update([person(0.0, 0.3, confidence=0.9)], 0.0)
-    assert machine.update(faint, 0.1).state is BehaviourState.APPROACHING
+    machine.update([], 1.0)  # burst runs dry
+    assert machine.update(faint, 2.0).state in (
+        BehaviourState.ADVANCING,
+        BehaviourState.ALIGNING,
+        BehaviourState.LOOKING,
+    )
+    assert machine._holding  # the faint sighting was accepted
 
 
 def test_losing_a_target_that_had_grown_large_is_arrival_not_loss() -> None:
-    """The robot turned away at exactly the point it had succeeded: the
-    detector stops calling a fraction of a person a person."""
-    config = ApproachConfig(lost_grace=0.5)
+    """The robot used to turn away at exactly the point it had succeeded (G6)."""
+    config = ApproachConfig(look_patience=0.5, walk_burst_seconds=0.4)
     machine = ComeToMe(config=config)
-    # Lost just short of the stop size: it was there.
     machine.update([person(0.0, config.stop_height_fraction - 0.02)], 0.0)
-    intent = machine.update([], 1.0)
+    machine.update([], 0.5)  # burst over, looking
+    intent = machine.update([], 1.2)  # patience over, still nothing
     assert intent.state is BehaviourState.ARRIVED
-    assert intent.drive == Drive(0, 0)
-    assert "% of the frame" in intent.reason  # the size it was lost at, for calibrating
+    assert "% of the frame" in intent.reason
 
 
 def test_losing_a_target_that_was_still_small_is_still_loss() -> None:
-    machine = ComeToMe(config=ApproachConfig(lost_grace=0.5))
+    machine = ComeToMe(config=ApproachConfig(look_patience=0.5, walk_burst_seconds=0.4))
     machine.update([person(0.0, 0.15)], 0.0)
-    assert machine.update([], 1.0).state is BehaviourState.SEARCHING
+    machine.update([], 0.5)
+    assert machine.update([], 1.2).state is BehaviourState.SEARCHING
 
 
-def test_a_search_starts_from_fresh_steering_latches() -> None:
-    """Which side of a threshold the robot was on before it lost the target
-    says nothing about the one it finds next."""
-    machine = ComeToMe(config=ApproachConfig(lost_grace=0.1))
-    machine.update([person(0.8, 0.2)], 0.0)  # latched into turn-in-place
-    machine.update([], 1.0)  # lost, searching
-    # Re-acquired near centre: it walks, rather than resuming the old turn.
-    assert machine.update([person(0.05, 0.2)], 2.0).drive == Drive(1, 0)
-
-
-def test_the_steered_bearing_is_filtered_not_the_raw_one() -> None:
-    """A jumpy box centre must not become a jumpy robot."""
+def test_the_bearing_is_smoothed_while_looking() -> None:
+    """The box centre jitters (G7); alignment steers by the smoothed number."""
     machine = ComeToMe(config=ApproachConfig(bearing_tau=0.5))
     machine.update([person(0.0, 0.2)], 0.0)
-    # A single wild frame, one tick later: the filter absorbs most of it.
-    machine.update([person(0.9, 0.2)], 0.1)
+    machine.update([person(0.9, 0.2)], 0.1)  # one wild frame
     assert machine._steered_bearing is not None
     assert 0.0 < machine._steered_bearing < 0.3
 
 
-def test_noise_around_centre_does_not_flip_the_turn_every_tick() -> None:
-    """The symptom reported from the robot: the bearing wobbles across centre
-    and the drive rocks left-right instead of closing on anything."""
-    machine = ComeToMe()
-    wobble = (0.0, 0.22, -0.19, 0.24, -0.21, 0.18, -0.23, 0.20)
-    turns = [machine.update([person(b, 0.2)], 0.1 * i).drive.turn for i, b in enumerate(wobble)]
-    reversals = sum(
-        1 for before, after in itertools.pairwise(turns) if before and after and before != after
-    )
-    assert reversals == 0, f"rocked {reversals} times: {turns}"
-
-
-def test_arrival_is_never_delayed_by_the_filter() -> None:
-    """The size decides the stop, and a stop must not be *smoothed*.
-
-    Confirmation is a separate, deliberate delay (see below); the bearing
-    filter must add none of its own, which is why it is switched off here.
-    """
+def test_arrival_is_never_delayed_by_the_smoothing() -> None:
     machine = ComeToMe(config=ApproachConfig(bearing_tau=2.0, stop_confirm_seconds=0.0))
     machine.update([person(-0.8, 0.2)], 0.0)
     intent = machine.update([person(-0.8, 0.95)], 0.1)
@@ -511,44 +581,30 @@ def test_arrival_is_never_delayed_by_the_filter() -> None:
 
 
 def test_the_search_is_long_enough_to_turn_all_the_way_round() -> None:
-    """A search that cannot complete a circle gives up facing away from a
-    target that was there the whole time."""
     config = ApproachConfig()
     duty = config.search_turn_seconds / (config.search_turn_seconds + config.search_look_seconds)
-    # The rate is unmeasured (ASSUMPTIONS G4); 40 deg/s is what the closed-loop
-    # simulation used, and at 12 s the search could not come round at all.
-    assumed_turn_rate = 40.0
+    assumed_turn_rate = 40.0  # deg/s; G4's stand numbers straddle this
     assert config.search_seconds * duty * assumed_turn_rate >= 360.0
 
 
 def test_a_single_frame_at_the_stop_size_does_not_end_the_run() -> None:
-    """A walking body pitches, and two degrees of it move the estimate by half
-    a metre (ASSUMPTIONS G2). One frame is not evidence."""
+    """One frame is not evidence: a walking body pitches (G2/G10)."""
     machine = ComeToMe()
     big = person(0.0, 0.95)
     first = machine.update([big], 0.0)
-    assert first.state is BehaviourState.APPROACHING
+    assert first.state is BehaviourState.LOOKING
     assert first.drive == Drive(0, 0), "it must hold still while confirming"
     assert "confirming" in first.reason
-
-
-def test_the_stop_size_held_long_enough_does_end_the_run() -> None:
-    machine = ComeToMe()
-    big = person(0.0, 0.95)
-    machine.update([big], 0.0)
-    assert machine.update([big], 0.2).state is BehaviourState.APPROACHING
     assert machine.update([big], 0.4).state is BehaviourState.ARRIVED
 
 
 def test_a_spike_that_does_not_hold_leaves_the_run_going() -> None:
-    """The gait phase passes, the box shrinks again, and the robot walks on."""
     machine = ComeToMe()
     machine.update([person(0.0, 0.30)], 0.0)
     machine.update([person(0.0, 0.95)], 0.1)  # one bad frame
     resumed = machine.update([person(0.0, 0.30)], 0.2)
-    assert resumed.state is BehaviourState.APPROACHING
-    assert resumed.drive == Drive(1, 0)
-    assert machine.update([person(0.0, 0.30)], 0.6).state is BehaviourState.APPROACHING
+    assert resumed.state in (BehaviourState.ADVANCING, BehaviourState.LOOKING)
+    assert machine.state is not BehaviourState.ARRIVED
 
 
 def test_confirmation_can_be_switched_off() -> None:
@@ -556,22 +612,19 @@ def test_confirmation_can_be_switched_off() -> None:
     assert machine.update([person(0.0, 0.95)], 0.0).state is BehaviourState.ARRIVED
 
 
-def test_stop_and_look_emerges_without_any_new_machinery() -> None:
-    """The firmware streams only while the robot is stopped (the operator's
-    own design, 2026-08-25). Nothing in this state machine was changed for it:
-    walking blanks the detections, the never-walk-blind invariant halts the
-    robot within its grace, the halt restarts the stream, the next look
-    re-acquires -- and the approach advances as walk-bursts strung between
-    looks, arriving exactly as before.
-    """
-    machine = ComeToMe(config=ApproachConfig(lost_grace=0.6))
+# --- stop-and-look under the gated stream ------------------------------------
+
+
+def test_stop_and_look_advances_and_arrives_with_a_gated_stream() -> None:
+    """The full rhythm against the firmware's stream gate: detections exist
+    only while the previous intent left the robot standing, and the approach
+    still closes -- as walk-bursts strung between looks, never steering."""
+    machine = ComeToMe(config=ApproachConfig(walk_burst_seconds=0.8, look_patience=1.5))
     now, size = 0.0, 0.25
-    walked = holds = 0
+    walked = looks = 0
     arrived = None
     last_drive = Drive(0, 0)
-    for _ in range(400):
-        # The gate, modelled: frames -- and so detections -- exist only while
-        # the previous intent left the robot standing.
+    for _ in range(600):
         seen = [person(0.0, size)] if last_drive == Drive(0, 0) else []
         intent = machine.update(seen, now)
         if intent.state is BehaviourState.ARRIVED:
@@ -579,26 +632,11 @@ def test_stop_and_look_emerges_without_any_new_machinery() -> None:
             break
         if intent.drive.forward == 1:
             walked += 1
-            size = min(size + 0.004, 0.9)  # walking closes the distance
-        elif last_drive.forward == 1:
-            holds += 1  # the blind-grace stop between bursts
+            size = min(size + 0.004, 0.9)
+        elif intent.state is BehaviourState.LOOKING and last_drive.forward == 1:
+            looks += 1
+        assert not (intent.drive.forward and intent.drive.turn)
         last_drive = intent.drive
         now += 0.1
     assert arrived is not None, "stop-and-look never arrived"
-    assert walked > 10, "it should spend real time walking"
-    assert holds >= 3, "the walk must be bursts strung between looks"
-
-
-def test_stop_and_look_never_overruns_the_blind_grace() -> None:
-    """Bounded blindness: between two sightings the robot walks at most
-    lost_grace long, then stands until it has seen the target again."""
-    machine = ComeToMe(config=ApproachConfig(lost_grace=0.6))
-    now = 0.0
-    machine.update([person(0.0, 0.3)], now)
-    blind_walk = 0.0
-    while now < 10.0:
-        now += 0.1
-        intent = machine.update([], now)  # the stream never comes back
-        if intent.drive.forward == 1:
-            blind_walk += 0.1
-    assert blind_walk <= 0.6 + 0.11, f"walked blind for {blind_walk:.1f}s"
+    assert walked > 10 and looks >= 3

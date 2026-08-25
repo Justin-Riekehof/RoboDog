@@ -95,62 +95,44 @@ that stays smooth and pictures that tell the truth. `streamgate=0` over
 ## What the behaviour actually does
 
 ```
-        no target            target off to the side       target centred
-   ┌── SEARCHING ──────────►  APPROACHING ──────────────►  APPROACHING
-   │   turn 0.6 s,            turn in place                walk (and correct)
-   │   look 0.5 s,            (no forward)                       │
-   │   give up at 12 s                                           ▼
-   │        ▲                       ▲                        box big enough
-   │        │ lost > 0.8 s          │ target seen again          │
-   │        └───────────────────────┘                            ▼
-   ▼                                                          ARRIVED
- LOST  ◄── the 60 s run timeout, from any state                (stopped)
+             nichts gefunden                  Person gesehen
+   SEARCHING ──────────────► LOOKING ◄───────────────────────────┐
+   dreht in Pulsen,          steht still, Stream fliesst,        │
+   schaut dazwischen         glaettet die Peilung (~0.35 s)      │
+        ▲                       │                                │
+        │ look_patience         │ Peilung > 7 deg   Peilung klein│
+        │ abgelaufen            ▼                                │
+        │                    ALIGNING ────────────► ADVANCING ───┘
+        │                    dreht AUF DER STELLE,  geht NUR geradeaus,
+        │                    gyro-geregelt bis zum  max. 1.2 s pro Schub,
+        │                    Zielwinkel (±7 deg)    Gyro wacht ueber Drift
+        │                                                │
+      LOST ◄── 60 s Timeout, aus jedem Zustand           ▼ gross genug, 0.3 s
+                                                      ARRIVED
 ```
 
-Steering is not a fresh comparison per tick. The bearing is **low-passed**
-(0.35 s) before anything reads it, and each band has a separate **entry and
-exit** threshold. Both exist because of the first run on the robot, where
-neither did: the box centre jitters enough that a bang-bang law turns the
-jitter itself into alternating left/right commands, and a latched turn always
-overshoots centre because the picture it steers by is tens of milliseconds old.
-In simulation with realistic jitter that was 68 turn reversals per approach;
-the filter alone takes it to zero, the hysteresis keeps an overshoot from
-starting a turn back (ASSUMPTIONS G7).
+The regime is the operator's, designed after the first stop-and-look drive on
+the robot (2026-08-25). The robot had been allowed to walk and turn at once,
+and one blind burst of turning at the measured 42.7 deg/s (G4) swung the
+person clean out of a ~65 deg field of view -- overshoot, lost target, a
+search that had to start over. Hence three rules, each pinned by tests:
 
-**Losing the target close in is arrival, not loss.** The robot used to turn
-away at exactly the point it had succeeded. Now: a target already being
-approached is kept on weaker evidence than an unknown one is acquired on (0.25
-against 0.40, and the detector's own floor sits below both so the weaker one is
-reachable), and a target lost within `lost_close_margin` of the stop size ends
-the run as ARRIVED, reporting the size it was lost at (ASSUMPTIONS G6).
+1. **Nothing ever walks and turns at once.** Turning happens standing, walking
+   happens dead straight. The steering bands, their hysteresis and the whole
+   walk-while-correcting mode are gone.
+2. **Blind rotation is closed-loop on the gyro.** A look yields a bearing; the
+   turn runs until `turned` has covered it (±7 deg) -- not until a timer
+   guesses it has. Overshoot in a single coarse reading ends the turn; a gyro
+   that goes silent ends it too, because steering by a remembered angle is
+   dead reckoning wearing a sensor's badge. Without any IMU (mock, sim) the
+   fallback is short timed pulses at the measured, asymmetric rates.
+3. **Blind advance is a bounded burst.** At most `walk_burst_seconds` (1.2 s,
+   ~11 cm) between looks -- the "regularly check" half of the design -- and
+   the gyro aborts the burst early if the heading drifts (the robot veers
+   when walking, F1).
 
-That margin is worth understanding before changing it, because the height curve
-is nearly flat here — 0.55 is 3 m and 0.59 is 1.5 m — so a small change in the
-threshold is a large one in metres. Both ways of getting it wrong stop the
-robot, but they are not equally good: too large calls a genuine mid-range loss
-an arrival, which is merely wrong; too small sends the robot turning away to
-search for someone standing right in front of it. It errs towards arrival.
-
-That is deliberately *not* a tracker seeded from the last box. A tracker's
-failure mode is to keep reporting a box after it has drifted, and the robot
-then walks at a guess of a person it can no longer see; stopping early is the
-failure this design would rather have. A tracker earns its place in a
-`follow_me` behaviour, where the target stays at distance and the point is to
-keep up — not in one whose whole purpose is to end in front of someone.
-
-Two invariants, and they are why this is safe to point at a person with no
-depth sensor, no bumper and no servo feedback:
-
-1. **The robot never walks forward without a detection in that very tick.**
-   Losing sight of the target stops it immediately — during the grace period it
-   stands still rather than carrying on blind, and after it, it turns in place.
-2. **Every run is bounded.** A hard timeout ends it wherever it got to, and the
-   search gives up on its own.
-
-On top of that the ordinary teach-UI safety applies unchanged, because the run
-uses the same machinery a drive sequence does: the STOP button, Escape, the
-page's dead-man's switch (close the tab and the robot stops), and the on-device
-watchdog being fed while and only while a move is latched.
+On top of that the ordinary teach-UI safety applies unchanged: STOP button,
+Escape, the page's dead-man's switch, the on-device watchdog.
 
 ### Distance is a guess, and the stop does not depend on it
 
