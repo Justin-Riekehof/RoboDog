@@ -473,11 +473,18 @@ void threadingsInit(){
 // HTTP handler and the serial console only format what is already in the ring.
 
 #define ROBODOG_IMU_SLOTS 64
-// 50 Hz. Fast enough to integrate a walking gait's rotation, slow enough that
-// the read costs a few percent of a loop that also drives twelve servos over
-// the same I2C bus. If the gait degrades after this lands, this is the first
-// number to raise.
-#define ROBODOG_IMU_PERIOD_MS 20
+// This was 20 ms ("a few percent of the loop") and both halves of that
+// sentence were wrong, reported by the operator on the robot's first Wi-Fi
+// drive with the IMU aboard (2026-08-25): the gait was visibly slower and
+// jerkier than the 08-22 firmware. Measured, the read costs ~12 ms of I2C on
+// the servos' own bus -- at a 20 ms gate that is a third of the loop, not a
+// few percent. And the cost lands twice: every HTTP poll formats the
+// accumulated samples on the httpd task, which outranks loop() and preempts
+// the gait precisely while the robot drives, since driving is when the host
+// polls. Both scale with this one number. 100 ms cuts them 5x; ~10 Hz still
+// oversamples a gait whose pitch swings at about 2 Hz, and the host filter
+// weighs by per-sample timestamps, so it does not care about the rate.
+#define ROBODOG_IMU_PERIOD_MS 100
 // The magnetometer sits behind the auxiliary bus and costs its own
 // transaction, and a heading drifts slowly -- it does not need the gyro's rate.
 #define ROBODOG_IMU_MAG_PERIOD_MS 100
