@@ -396,6 +396,18 @@ void serialCtrl(){
         robodogApply();
       }
 
+      // Battery voltage and current, as one JSON line. The vendor measures
+      // both every pass (INA219, allDataUpdate) and then shows them only on
+      // the OLED -- jsonSend() would have exported them but is never called.
+      // First asked for on 2026-08-25, chasing a POWERON_RESET mid-session:
+      // whether the rail sags under load is exactly the question a battery
+      // answer settles. {"var":"vol","val":0}
+      else if(docReceive["var"] == "vol"){
+        Serial.print("{\"vol\":");Serial.print(loadVoltage_V);
+        Serial.print(",\"ma\":");Serial.print(current_mA);
+        Serial.println("}");
+      }
+
       // The IMU, as one JSON line. val = the last sequence already seen, so
       // {"var":"imu","val":0} dumps everything the ring still holds. This is
       // the bring-up answer to "is the gyroscope alive at all", which nothing
@@ -698,6 +710,26 @@ void setup() {
 
   // WEBCTRL INIT. WIFI settings included.
   webServerInit();
+
+  // === RoboDog: the gait outranks the web servers ==========================
+  // loop() -- where robotCtrl() computes the gait and writes all twelve
+  // servos -- runs in loopTask at priority 1. The two httpd tasks run at 5,
+  // unpinned, and the MJPEG stream handler is a near-continuous worker: with
+  // a client attached it loops fb_get -> chunk-send at full tilt, preempting
+  // the gait at will. Measured by elimination 2026-08-25: every session that
+  // held the stream walked slow and hitching, the same session without it was
+  // smooth, and a serial-driven gait with no Wi-Fi client ran clean 114 ms
+  // loop intervals all along.
+  //
+  // This IDF's httpd_config_t has no core_id yet, so the servers cannot be
+  // pinned away. Raising loopTask above them inverts the preemption instead:
+  // the gait computes whenever it needs to, and the servers run in the gaps
+  // the loop's own I2C waits leave open -- which on a pass that spends most
+  // of its time on the servo bus is most of the time -- and in core 0's
+  // leftovers beside Wi-Fi. The stream loses frames under load; the walk
+  // does not lose steps. That is the right direction for a robot.
+  vTaskPrioritySet(NULL, 7);
+  // === end RoboDog ==========================================================
 
   // RGB LEDs on.
   delay(500);
