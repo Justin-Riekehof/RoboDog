@@ -457,6 +457,11 @@ class HttpBackend:
         """
         try:
             batch = parse_imu_batch(json.loads(self._control("imu", self._imu_seq)))
+        except TransportError:
+            # No answer is not "no IMU". Swallowing this classified a dying
+            # link as an old firmware and let connect() stumble on to fail one
+            # request later with the blame in the wrong place (2026-08-25).
+            raise
         except (BackendError, ValueError, TypeError):
             return False
         self._imu_seq = max(self._imu_seq, batch.last_seq)
@@ -502,6 +507,11 @@ class HttpBackend:
             return self.firmware == "robodog"
         try:
             self._control("ping", 0)
+        except TransportError:
+            # A link that died is an answer about the network, not about the
+            # firmware -- reading it as "stock" would quietly strip LEG_TARGET
+            # from a robot that has it.
+            raise
         except BackendError:
             return False
         return True

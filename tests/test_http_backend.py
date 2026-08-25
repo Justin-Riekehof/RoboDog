@@ -1148,3 +1148,32 @@ def test_a_robot_that_really_refuses_the_watchdog_still_says_reflash() -> None:
     # `auto` is a request to probe; nobody asserted it, so nobody is told to
     # drop a flag they never passed.
     assert "--firmware" not in message
+
+
+def test_a_dead_link_during_the_firmware_probe_is_not_read_as_stock() -> None:
+    """Swallowing the transport failure would quietly strip LEG_TARGET from a
+    robot that has it -- and let connect() stumble on to fail one request
+    later, with the blame in the wrong place."""
+
+    class LinkDiesAtThePing(HttpBackend):
+        def _control(self, var: str, val: int, cmd: int = 0, **kwargs: object) -> bytes:
+            if var == "ping":
+                raise TransportError("cannot reach robot: No route to host")
+            return b""
+
+    with pytest.raises(TransportError):
+        LinkDiesAtThePing(host="127.0.0.1:1").connect()
+
+
+def test_a_dead_link_during_the_imu_probe_is_not_read_as_no_imu() -> None:
+    """The request that measurably killed the robot's IP stack (2026-08-25) is
+    exactly the one whose failure used to be swallowed as 'old firmware'."""
+
+    class LinkDiesAtTheImu(HttpBackend):
+        def _control(self, var: str, val: int, cmd: int = 0, **kwargs: object) -> bytes:
+            if var == "imu":
+                raise TransportError("cannot reach robot: No route to host")
+            return b""
+
+    with pytest.raises(TransportError):
+        LinkDiesAtTheImu(host="127.0.0.1:1").connect()

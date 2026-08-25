@@ -401,7 +401,10 @@ void serialCtrl(){
       // the bring-up answer to "is the gyroscope alive at all", which nothing
       // in the vendor firmware could ever be asked.
       else if(docReceive["var"] == "imu"){
-        char json[2048];
+        // static: this task has 4000 bytes of stack (xTaskCreate below), and
+        // the HTTP twin of this buffer measurably overflowed httpd's 4096 --
+        // see app_httpd.cpp. One task, one caller, no reentrancy.
+        static char json[2048];
         int len = robodogImuJson(json, sizeof(json), (uint32_t)(val < 0 ? 0 : val));
         if(len > 0){Serial.println(json);}
         else{Serial.println("{\"imu\":false}");}

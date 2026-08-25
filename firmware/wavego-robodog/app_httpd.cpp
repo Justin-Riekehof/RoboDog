@@ -369,7 +369,19 @@ static esp_err_t cmd_handler(httpd_req_t *req){
   // Reads only the ring, never the chip -- loop() is the single I2C writer
   // (see the fork's README), and breaking that rule crashes the robot.
   else if (!strcmp(variable, "imu")){
-    char json[2048];
+    // `static`, and that is a bug fix, not a style choice. This handler runs
+    // on the httpd task, whose stack is HTTPD_DEFAULT_CONFIG()'s 4096 bytes --
+    // a 2 KB buffer here, plus this frame, plus snprintf's float formatting,
+    // overflows it. Measured on the robot 2026-08-25: the first HTTP `imu`
+    // request ever made killed the IP stack mid-connect, twice, identically --
+    // ARP went silent while the 802.11 association stayed up for another five
+    // minutes, which is what a corrupted neighbour task looks like, not a
+    // panic (a panic reboots, and a reboot drops the association). The serial
+    // path had worked for a whole evening because it runs on a different task;
+    // its buffer is now static too, since 4000 bytes of stack is the same
+    // cliff. Not reentrant, and does not need to be: httpd serialises its
+    // handlers on one task.
+    static char json[2048];
     int len = robodogImuJson(json, sizeof(json), (uint32_t)(val < 0 ? 0 : val));
     if (len < 0) { res = -1; }
     else {
