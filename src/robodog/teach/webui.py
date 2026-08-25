@@ -49,6 +49,7 @@ from robodog.behaviour import (
     Intent,
     approach_config,
     distance_mm_for_height_fraction,
+    validate_call,
 )
 from robodog.camera import CAMERA_PARAMS
 from robodog.camera import DEFAULTS as CAMERA_DEFAULTS
@@ -457,6 +458,12 @@ class TeachUIServer:
                 # would freeze the page's state polls for as long as the server
                 # takes -- which, if it is down, is the whole request timeout.
                 return self._say(body)
+            if action == "behaviour":
+                # The direct path: a named call, no language model anywhere.
+                # The model was only ever a translator in front of this -- the
+                # vocabulary validation is identical, so a button and a typed
+                # sentence start exactly the same deterministic run.
+                return self._behaviour_direct(body)
             with self._lock:
                 return self._dispatch(action, body)
         except (ValueError, RoutineError) as exc:
@@ -1082,6 +1089,34 @@ class TeachUIServer:
         config = approach_config(call)
         with self._lock:
             return self._start_behaviour(config, said=said, call=call.describe())
+
+    def _behaviour_direct(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Start a behaviour from explicit parameters -- the no-model path.
+
+        Exists because the command box used to be the only trigger, which
+        quietly made the language model load-bearing: --no-llm switched off
+        the whole feature instead of just the translator. The model maps words
+        to a call; this takes the call directly, through the same validation.
+        """
+        from robodog.errors import BehaviourError
+
+        try:
+            call = validate_call(body.get("name"), {k: v for k, v in body.items() if k != "name"})
+        except BehaviourError as exc:
+            return 400, {"ok": False, "message": str(exc)}
+        self._behaviour = {**self._behaviour, "said": "", "call": call.describe()}
+        if not call.understood:
+            return 400, {"ok": False, "message": "unknown is not startable"}
+        if call.name == "stop":
+            return self._stop("operator asked for a stop")
+        if self._vision is None:
+            return 400, {
+                "ok": False,
+                "message": "that behaviour needs the camera -- start teach with --vision",
+            }
+        config = approach_config(call)
+        with self._lock:
+            return self._start_behaviour(config, said="", call=call.describe())
 
     def _start_behaviour(
         self, config: ApproachConfig, *, said: str, call: str

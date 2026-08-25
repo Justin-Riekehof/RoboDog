@@ -174,6 +174,21 @@ Field of view, camera height and pitch are all assumptions (ASSUMPTIONS G2).
 Calibrating them is one session with a tape measure: stand at 1, 2 and 3 m and
 read the fraction off the Camera tab.
 
+## The language model is optional, and here is the proof
+
+The control loop never contained it -- "the model does not drive" has been the
+design rule since the first sketch -- but for a while the command box was the
+only *trigger*, which quietly made the model load-bearing. No longer: the
+**Komm zu mir button** starts the behaviour as a named call with explicit
+parameters, through exactly the same vocabulary validation, with no model
+configured at all. `--no-llm` now costs you free-text parsing and nothing
+else.
+
+What the model still buys, when it is there: turning words into parameters --
+"bleib zwei Meter weg" becomes `stop_distance_mm=2000` -- once, before
+anything moves. One request per typed command, one model-list probe at session
+start, zero traffic otherwise.
+
 ## The language model
 
 Any OpenAI-compatible `/v1/chat/completions` endpoint. Configure it with
