@@ -660,17 +660,26 @@ function detLabel(det) {
   return parts.join("  ");
 }
 
+// Boxes below this confidence are not drawn -- display only, the operator's
+// request (2026-08-25): the overlay got cluttered with weak guesses. The
+// behaviour's own thresholds (acquire 0.40, keep 0.25) are untouched, which is
+// why the current target is always drawn even below this line: a robot
+// following something the page refuses to show would be debugging blindfolded.
+const DISPLAY_MIN_CONFIDENCE = 0.60;
+
 // The rectangles the server computed, positioned as percentages of the picture.
 // Same arrangement as the leg polylines: the server owns every number, the page
 // owns none of them.
 function renderBoxes(vision, chosen) {
   const host = $("cam-boxes");
-  const found = (vision && vision.detections) || [];
+  const isChosen = (det) => chosen && chosen.label === det.label &&
+      Math.abs(chosen.bearing - det.bearing) < 0.02;
+  const found = ((vision && vision.detections) || [])
+      .filter((det) => det.confidence >= DISPLAY_MIN_CONFIDENCE || isChosen(det));
   host.replaceChildren(...found.map((det) => {
     const box = document.createElement("div");
     box.className = "det";
-    if (chosen && chosen.label === det.label &&
-        Math.abs(chosen.bearing - det.bearing) < 0.02) box.classList.add("target");
+    if (isChosen(det)) box.classList.add("target");
     box.style.left = (det.box.left * 100).toFixed(2) + "%";
     box.style.top = (det.box.top * 100).toFixed(2) + "%";
     box.style.width = ((det.box.right - det.box.left) * 100).toFixed(2) + "%";

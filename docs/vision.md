@@ -95,62 +95,87 @@ that stays smooth and pictures that tell the truth. `streamgate=0` over
 ## What the behaviour actually does
 
 ```
-        no target            target off to the side       target centred
-   ┌── SEARCHING ──────────►  APPROACHING ──────────────►  APPROACHING
-   │   turn 0.6 s,            turn in place                walk (and correct)
-   │   look 0.5 s,            (no forward)                       │
-   │   give up at 12 s                                           ▼
-   │        ▲                       ▲                        box big enough
-   │        │ lost > 0.8 s          │ target seen again          │
-   │        └───────────────────────┘                            ▼
-   ▼                                                          ARRIVED
- LOST  ◄── the 60 s run timeout, from any state                (stopped)
+             nichts gefunden                  Person gesehen
+   SEARCHING ──────────────► LOOKING ◄───────────────────────────┐
+   dreht in Pulsen,          steht still, Stream fliesst,        │
+   schaut dazwischen         glaettet die Peilung (~0.35 s)      │
+        ▲                       │                                │
+        │ look_patience         │ Peilung > 7 deg   Peilung klein│
+        │ abgelaufen            ▼                                │
+        │                    ALIGNING ────────────► ADVANCING ───┘
+        │                    dreht AUF DER STELLE,  geht NUR geradeaus,
+        │                    gyro-geregelt bis zum  max. 1.2 s pro Schub,
+        │                    Zielwinkel (±7 deg)    Gyro wacht ueber Drift
+        │                                                │
+      LOST ◄── 60 s Timeout, aus jedem Zustand           ▼ gross genug, 0.3 s
+                                                      ARRIVED
 ```
 
-Steering is not a fresh comparison per tick. The bearing is **low-passed**
-(0.35 s) before anything reads it, and each band has a separate **entry and
-exit** threshold. Both exist because of the first run on the robot, where
-neither did: the box centre jitters enough that a bang-bang law turns the
-jitter itself into alternating left/right commands, and a latched turn always
-overshoots centre because the picture it steers by is tens of milliseconds old.
-In simulation with realistic jitter that was 68 turn reversals per approach;
-the filter alone takes it to zero, the hysteresis keeps an overshoot from
-starting a turn back (ASSUMPTIONS G7).
+The regime is the operator's, designed after the first stop-and-look drive on
+the robot (2026-08-25). The robot had been allowed to walk and turn at once,
+and one blind burst of turning at the measured 42.7 deg/s (G4) swung the
+person clean out of a ~65 deg field of view -- overshoot, lost target, a
+search that had to start over. Hence three rules, each pinned by tests:
 
-**Losing the target close in is arrival, not loss.** The robot used to turn
-away at exactly the point it had succeeded. Now: a target already being
-approached is kept on weaker evidence than an unknown one is acquired on (0.25
-against 0.40, and the detector's own floor sits below both so the weaker one is
-reachable), and a target lost within `lost_close_margin` of the stop size ends
-the run as ARRIVED, reporting the size it was lost at (ASSUMPTIONS G6).
+1. **Nothing ever walks and turns at once.** Turning happens standing, walking
+   happens dead straight. The steering bands, their hysteresis and the whole
+   walk-while-correcting mode are gone.
+2. **Rotation is one short nudge, then walking -- never turn-until-centred.**
+   A real control tick (HTTP plus the IMU poll) covers more degrees of turn
+   than any sane tolerance, so a centring loop ping-pongs past the target
+   forever while the robot "focuses" without approaching. Instead the bearing
+   is remembered, at most one 0.2 s pulse is spent on it (the gyro can only
+   END the pulse early -- covered or overshot), and the robot walks
+   regardless; the next check corrects. Only bearings past 35 deg earn a
+   second look before walking.
+3. **Blind advance is a bounded burst.** At most `walk_burst_seconds` (1.2 s,
+   ~11 cm) between looks -- the "regularly check" half of the design -- and
+   the gyro aborts the burst early if the heading drifts (the robot veers
+   when walking, F1).
 
-That margin is worth understanding before changing it, because the height curve
-is nearly flat here — 0.55 is 3 m and 0.59 is 1.5 m — so a small change in the
-threshold is a large one in metres. Both ways of getting it wrong stop the
-robot, but they are not equally good: too large calls a genuine mid-range loss
-an arrival, which is merely wrong; too small sends the robot turning away to
-search for someone standing right in front of it. It errs towards arrival.
+**The last stretch is walked kneeling.** The robot approaches the box until a
+level look loses it entirely -- which on this camera means the person is
+towering over the lens -- then kneels, pitches the camera up, and checks. If
+the person is found but still short of the stop size, it presses on, and from
+that point every standing check is taken kneeling: walk, kneel, look up,
+walk. The trigger is deliberately the loss, not the clipped box edge -- a
+top-clipped box is true from 3.4 m inward here (the camera rides a hand's
+width off the floor), so as a nearness signal the edge alone fires half a
+room too early, which one afternoon on the robot demonstrated. Stepping
+clearly back out of the close band stands it tall again.
 
-That is deliberately *not* a tracker seeded from the last box. A tracker's
-failure mode is to keep reporting a box after it has drifted, and the robot
-then walks at a guess of a person it can no longer see; stopping early is the
-failure this design would rather have. A tracker earns its place in a
-`follow_me` behaviour, where the target stays at distance and the point is to
-keep up — not in one whose whole purpose is to end in front of someone.
+The overlay only draws boxes above 60% confidence (the operator's request --
+weak guesses cluttered the picture), with one exception: the box the robot is
+actually following is always drawn, whatever its score, because a robot
+following something the page refuses to show would be debugging blindfolded.
 
-Two invariants, and they are why this is safe to point at a person with no
-depth sensor, no bumper and no servo feedback:
+**And when it gets so close that a level lens loses you entirely, the same
+kneel becomes the verdict.** The operator's observation: at arrival distance a standing person's
+torso is far above the camera's view, so "lost close in" used to be settled
+by a heuristic. Now the robot drops its hindquarters, pitches the camera up
+~15 deg (the vendor's own `pitchYawRollHeightCtrl` port supplies the pose),
+and checks. Finding you turns a guess into a visual arrival -- and it stays
+kneeling, looking up at you, which is the right ending for "Komm zu mir".
+Finding nobody falls back to the old heuristic, saying so. The IMU measures
+the commanded tilt and the distance correction absorbs it, so the size
+reading stays honest while tilted; the pose itself is validated against the
+leg workspace with margin (a first draft was refused by the supervisor --
+pitching from full stand exceeds the reach envelope, which is why the kneel
+is not decoration).
 
-1. **The robot never walks forward without a detection in that very tick.**
-   Losing sight of the target stops it immediately — during the grace period it
-   stands still rather than carrying on blind, and after it, it turns in place.
-2. **Every run is bounded.** A hard timeout ends it wherever it got to, and the
-   search gives up on its own.
+On top of that the ordinary teach-UI safety applies unchanged: STOP button,
+Escape, the page's dead-man's switch, the on-device watchdog.
 
-On top of that the ordinary teach-UI safety applies unchanged, because the run
-uses the same machinery a drive sequence does: the STOP button, Escape, the
-page's dead-man's switch (close the tab and the robot stops), and the on-device
-watchdog being fed while and only while a move is latched.
+### The default run has no stop distance at all
+
+"Komm zu mir" without a distance means *come all the way*: the robot
+approaches until even the kneeling, camera-up look no longer finds a person
+-- which at that range means it is standing at your feet -- and it ends
+there, kneeling, looking up. The operator defined this terminal after the
+uncalibrated size threshold halted a run half a metre out. A run WITH a
+distance ("bleib zwei Meter weg") keeps the size stop, ceiling-clamped as
+ever. What bounds the default run instead: 11 cm bursts with a look between
+each, a stop on any loss of sight, and the 60 s timeout.
 
 ### Distance is a guess, and the stop does not depend on it
 

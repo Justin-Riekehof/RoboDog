@@ -189,15 +189,31 @@ def level_height_fraction(
 
 
 class BehaviourState(Enum):
-    """Where a run has got to. ARRIVED and LOST are terminal."""
+    """Where a run has got to. ARRIVED and LOST are terminal.
 
-    SEARCHING = auto()  # turning in place, nothing to approach
-    APPROACHING = auto()  # the target is visible and the robot is closing on it
+    The states are the phases of an approach that never moves two ways at
+    once: LOOKING stands and watches, ALIGNING turns on the spot towards a
+    bearing the last look produced, ADVANCING walks dead straight, SEARCHING
+    turn-pulses for a target it has not got. There is deliberately no state
+    that walks and turns together -- that combination is what produced the
+    overshoot this design replaced (see ComeToMe).
+    """
+
+    SEARCHING = auto()  # no target: turn in pulses, look between them
+    LOOKING = auto()  # standing still, waiting for the camera to speak
+    ALIGNING = auto()  # turning on the spot towards the last seen bearing
+    ADVANCING = auto()  # walking straight ahead, a bounded burst
+    PEEKING = auto()  # kneeling hind legs, camera pitched up: is someone there?
     ARRIVED = auto()  # near enough, stopped -- the successful end
     LOST = auto()  # gave up: the search found nothing, or the run timed out
 
 
 _TERMINAL: Final = frozenset({BehaviourState.ARRIVED, BehaviourState.LOST})
+# The states in which the machine wants a fresh gyro reading each tick: blind
+# rotation is closed-loop on `turned`, and blind advance watches it for drift.
+ATTITUDE_HUNGRY: Final = frozenset(
+    {BehaviourState.ALIGNING, BehaviourState.ADVANCING, BehaviourState.PEEKING}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +224,11 @@ class Intent:
     state: BehaviourState
     reason: str
     target: Detection | None = None
+    stance: str = "stand"
+    """The whole-body pose this tick wants: "stand", or "peek" -- hind legs
+    kneeling, camera pitched up. Declarative on purpose: the machine stays
+    pure, and the runner maps the word onto leg targets (or ignores it on a
+    backend without LEG_TARGET)."""
 
     @property
     def finished(self) -> bool:
@@ -218,101 +239,110 @@ class Intent:
 class ApproachConfig:
     """Everything the approach is allowed to argue about, in one place.
 
-    Defaults are deliberately timid. Every one of them is a guess about a robot
-    nobody has run this on yet -- the turn rate in particular is unmeasured
-    (ASSUMPTIONS G4), so `search_seconds` is a duration, not "one full circle".
+    The shape of these numbers changed on 2026-08-25, after the first real
+    approach on the robot: the old steering regime (walk and turn at once,
+    hysteresis bands on the bearing) overshot so badly under stop-and-look
+    that the person left the field of view in a single blind burst -- the
+    robot turns at up to 42.7 deg/s (G4) and half the FOV is ~32 deg. The
+    operator's redesign: turn ONLY on the spot, closed-loop on the gyro;
+    advance ONLY dead straight, in bounded bursts; look between the two.
     """
 
     target: str = "person"
     stop_height_fraction: float = STOP_HEIGHT_DEFAULT
-    # Two confidences, not one, and the gap is deliberate: a target that is
-    # ALREADY being approached is worth keeping on much weaker evidence than an
-    # unknown one is worth acquiring on. Walking towards a person fills the
-    # frame with a fraction of them, and a fraction of a person scores far below
-    # a whole one -- so a single threshold high enough to acquire cleanly is
-    # also high enough to drop the target exactly when the robot arrives.
+    # The operator's definition of done (2026-08-25): by default "Komm zu
+    # mir" means COME ALL THE WAY -- approach until even the kneeling,
+    # camera-up look no longer finds a person. The size threshold then never
+    # declares arrival; it only shapes the close band (lost_close_height) and
+    # the kneel trigger. An explicit requested distance ("bleib 2 Meter weg")
+    # flips this off and the size stop applies, ceiling-clamped as ever.
+    approach_until_blind: bool = True
+    # Two confidences, not one: a target already being approached is kept on
+    # weaker evidence than an unknown one is acquired on. Walking towards a
+    # person fills the frame with a fraction of them, and a fraction scores
+    # far below a whole one (G6).
     acquire_confidence: float = 0.40
     keep_confidence: float = 0.25
-    # --- steering, with hysteresis ---------------------------------------
-    #
-    # Every threshold below is a *pair*, because a single one chatters. The
-    # robot turns by latching a move and the picture it steers by is tens of
-    # milliseconds old, so it always turns a little past centre; with one
-    # threshold that overshoot re-triggers the opposite turn and the robot
-    # rocks left-right without closing on anything. Observed on the robot,
-    # 2026-08-23.
-    #
-    # Turn on the spot above this -- a target well off to the side is not in
-    # front of the robot in any useful sense, and walking at it would describe
-    # an arc through whatever is there.
-    turn_enter_bearing: float = 0.35
-    # ...and keep turning until it is this well centred. The gap is what the
-    # overshoot is allowed to use up: coming to rest anywhere inside +/-0.35
-    # cannot start a turn back.
-    turn_exit_bearing: float = 0.15
-    # While walking, start steering above this...
-    correct_enter_bearing: float = 0.20
-    # ...and stop steering below this.
-    correct_exit_bearing: float = 0.08
-    # How long the steered bearing takes to follow the measured one, in
-    # seconds. The detector's box centre jitters -- limbs move, the box snaps
-    # between poses, and the picture from a walking robot is blurred
-    # (ASSUMPTIONS F6) -- and steering on the raw value turns that jitter
-    # straight into left-right commands. Hysteresis alone does not fix this:
-    # it bounds the overshoot, while this bounds the *noise*, and the rocking
-    # observed on 2026-08-23 needed both. Zero disables the filter.
+    # Smoothing time constant for the bearing while LOOKING: the detector
+    # answers several times during one look, and the box centre jitters (G7).
+    # Only ever applied while standing -- there is no steering to smooth any
+    # more, this steadies the number one alignment is based on.
     bearing_tau: float = 0.35
-    # How far short of the stop size a target may be lost and still count as
-    # arrival rather than as loss (see ComeToMe._without_target). Relative to
-    # `stop_height_fraction` rather than absolute, because the two describe the
-    # same event -- being there -- and an independent number drifts away from
-    # it the moment the operator asks for a different stop distance.
+    # --- geometry ---------------------------------------------------------
+    # Assumed horizontal field of view; turns a normalised bearing into the
+    # degrees the gyro must see. Same assumption family as G2's vertical FOV.
+    hfov_deg: float = 65.0
+    # --- aligning ---------------------------------------------------------
+    # The regime here changed twice on the robot, and the second lesson is
+    # the operator's (2026-08-25 evening): DO NOT centre before walking. A
+    # control tick on the real link is 0.2-0.3 s (HTTP plus the IMU poll),
+    # which at 42.7 deg/s of left turn is 8-13 deg per tick -- more than any
+    # sane tolerance, so a turn-until-centred loop ping-pongs past the target
+    # forever and the robot "focuses" without ever advancing. Instead:
+    # remember the direction, spend AT MOST ONE short pulse on it, then walk;
+    # the next check corrects. Walking 1.2 s with 15 deg of bearing error is
+    # ~3 cm of lateral miss -- noise against an 11 cm stride.
     #
-    # Sized against where the detector plausibly gives up, not picked round.
-    # With the default stop at 0.66 this covers a target lost anywhere inside
-    # about 2.8 m, because the height curve is nearly flat there (0.55 at 3 m,
-    # 0.59 at 1.5 m) and a tighter margin stops covering the case it exists for.
-    #
-    # Both ways of getting this wrong stop the robot, but they are not equally
-    # good: too large and a genuine loss at middle distance is called arrival,
-    # which is merely wrong; too small and the robot turns away to search for
-    # someone standing right in front of it, which is the behaviour that made
-    # this rule necessary. It errs towards arrival deliberately. An absolute
-    # 0.30 -- **6.25 m** under the geometry -- erred there far too hard for one
-    # day, and every dropout in the whole approach counted as arrival.
-    lost_close_margin: float = 0.10
-    # How long the stop size must hold before the run ends. One frame is not
-    # evidence: a walking body pitches, and two degrees of pitch move the
-    # estimate from 0.94 m to between 0.76 and 1.22 m (ASSUMPTIONS G2), so a
-    # single bad gait phase could end a run half a metre early. The robot holds
-    # still while it confirms -- if the reading was real it has already stopped
-    # where it meant to, and if it was a bob it carries on having lost 0.3 s.
-    #
-    # This costs nothing in safety: it can only make the robot stop LATER, by
-    # at most 3 cm at 9 cm/s, and it stands still for the whole of it. With the
-    # pitch correction fed by a real IMU the spikes get rarer, but they do not
-    # vanish -- the correction is only exact while the robot is still (G10).
-    stop_confirm_seconds: float = 0.3
-    # A search turns in pulses rather than continuously: the picture from a
-    # walking robot is blurred (ASSUMPTIONS F6) and the detector runs at a few
-    # frames a second, so a robot that never stops turning never gets a clean
-    # look at anything.
+    # No turn at all below this bearing:
+    align_tolerance_deg: float = 10.0
+    # One pulse is at most this long -- at the measured rates that is ~8.5 deg
+    # of left turn or ~3.6 deg of right, the operator's "kleinere Schritte":
+    align_max_pulse: float = 0.2
+    # Above this bearing walking would carry the robot PAST the person, so the
+    # pulse is followed by another look instead of a burst. Between tolerance
+    # and here: pulse, then walk regardless.
+    align_only_above_deg: float = 35.0
+    # The measured turn rates (G4, on the stand -- revise after a floor
+    # measurement). Asymmetric because the robot is (F1): left is 2.4x right.
+    turn_rate_left_dps: float = 42.7
+    turn_rate_right_dps: float = 17.9
+    # --- advancing --------------------------------------------------------
+    # How long one straight blind burst may last. At ~9 cm/s this is ~11 cm
+    # per burst -- the "regularly check" half of the operator's design.
+    walk_burst_seconds: float = 1.2
+    # Abort the burst early when the gyro says the heading has drifted this
+    # far: the robot veers when walking (F1), and a veer the next look would
+    # have to hunt for is better cut short.
+    drift_abort_deg: float = 15.0
+    # A fresh detection mid-burst (continuous vision: sim, or streamgate=0)
+    # this far off centre ends the burst for a re-align rather than steering.
+    realign_bearing_deg: float = 14.0
+    # --- looking ----------------------------------------------------------
+    # How long a look dwells on a target before committing to a turn or a
+    # burst. The detector answers several times a second while the robot
+    # stands; deciding on the very first frame would make the smoothing above
+    # decorative -- one jittery box centre would steer the whole alignment
+    # (G7). Raised from 0.35 on the operator's instruction: longer evaluation
+    # pauses, smaller turns. Zero decides immediately (tests use that).
+    look_settle_seconds: float = 0.6
+    # How long a look waits for the camera before concluding the target is
+    # gone. Covers the stream restarting after a stop (~1 s) plus a detector
+    # pass; the blind-walk bound is walk_burst_seconds, not this.
+    look_patience: float = 2.5
+    # --- searching (unchanged: the one state that must rotate) ------------
     search_turn_seconds: float = 0.6
     search_look_seconds: float = 0.5
-    # Long enough to come round once, which 12 s was not: pulsing spends about
-    # 55% of the time turning, so at a plausible 40 deg/s a full revolution
-    # needs some 16 s. A search that cannot complete a circle gives up facing
-    # away from a target that was there all along -- reproduced in simulation
-    # 2026-08-23, and the reason this is 20 rather than 12. The turn rate is
-    # still unmeasured (ASSUMPTIONS G4); measure it and this becomes an angle.
     search_seconds: float = 20.0
-    # How long a target may be missing before the robot goes looking. Under it
-    # the robot stands still -- it does not keep walking at something it can no
-    # longer see.
-    lost_grace: float = 0.8
+    # --- arrival ----------------------------------------------------------
+    # Losing the target while it filled at least stop - margin of the frame is
+    # arrival, not loss (G6).
+    lost_close_margin: float = 0.10
+    # The stop size must hold this long; one frame is not evidence (G2/G10).
+    stop_confirm_seconds: float = 0.3
+    # --- peeking ----------------------------------------------------------
+    # When the target is lost close in, kneel the hind legs and pitch the
+    # camera up before declaring arrival: at half a metre a standing person's
+    # torso is far above a level lens, and the operator's observation is that
+    # the robot could simply look up (2026-08-25). The IMU measures the
+    # commanded pitch and the size correction absorbs it, so the reading
+    # stays honest while tilted. False disables (backends without
+    # LEG_TARGET cannot change stance).
+    peek: bool = True
+    # How long the upward look waits for the person to reappear before
+    # falling back to arrival-by-loss (G6), which was previously immediate.
+    peek_seconds: float = 2.5
     # The whole run, however it is going.
     timeout: float = 60.0
-    # Which way to turn when there is no last known bearing to turn towards.
     default_search_turn: int = 1  # +1 right, -1 left
 
     def __post_init__(self) -> None:
@@ -323,10 +353,20 @@ class ApproachConfig:
             )
         if self.default_search_turn not in (-1, 1):
             raise ValueError("default_search_turn must be -1 (left) or +1 (right)")
-        if not 0.0 <= self.correct_exit_bearing <= self.correct_enter_bearing <= 1.0:
-            raise ValueError("correct bearings must satisfy 0 <= exit <= enter <= 1")
-        if not 0.0 <= self.turn_exit_bearing <= self.turn_enter_bearing <= 1.0:
-            raise ValueError("turn bearings must satisfy 0 <= exit <= enter <= 1")
+        if not 0.0 < self.keep_confidence <= self.acquire_confidence <= 1.0:
+            raise ValueError("confidences must satisfy 0 < keep <= acquire <= 1")
+        if not 20.0 <= self.hfov_deg <= 120.0:
+            raise ValueError(f"hfov_deg {self.hfov_deg} is not a plausible lens")
+        if self.align_tolerance_deg <= 0 or self.align_max_pulse <= 0:
+            raise ValueError("alignment needs a positive tolerance and pulse")
+        if self.align_only_above_deg <= self.align_tolerance_deg:
+            raise ValueError("align_only_above_deg must exceed align_tolerance_deg")
+        if self.turn_rate_left_dps <= 0 or self.turn_rate_right_dps <= 0:
+            raise ValueError("turn rates must be positive")
+        if not 0.0 <= self.look_settle_seconds <= 2.0:
+            raise ValueError("look_settle_seconds must be within 0..2")
+        if not 0.2 <= self.walk_burst_seconds <= 5.0:
+            raise ValueError("walk_burst_seconds must be within 0.2..5")
         if self.stop_confirm_seconds < 0.0:
             raise ValueError("stop_confirm_seconds must be >= 0")
         if not 0.0 <= self.lost_close_margin < self.stop_height_fraction:
@@ -334,10 +374,6 @@ class ApproachConfig:
                 f"lost_close_margin {self.lost_close_margin} must be >= 0 and smaller "
                 f"than stop_height_fraction {self.stop_height_fraction}"
             )
-        if self.turn_enter_bearing < self.correct_enter_bearing:
-            raise ValueError("turning on the spot must start further out than steering does")
-        if not 0.0 < self.keep_confidence <= self.acquire_confidence <= 1.0:
-            raise ValueError("confidences must satisfy 0 < keep <= acquire <= 1")
 
 
 def pick_target(
@@ -357,209 +393,358 @@ def pick_target(
 
 @dataclass(slots=True)
 class ComeToMe:
-    """Turn towards the target, walk to it, stop at a safe size. Then stay stopped.
+    """Look, align on the spot, advance dead straight, look again.
 
-    ``update`` is the whole behaviour. Call it once per tick with everything the
-    detector last saw and the current time; it returns the drive to send. Once
-    it reports a terminal state it keeps reporting it, and keeps commanding a
-    stop, so a caller that ticks one more time cannot restart anything.
+    The regime the operator designed after the first stop-and-look drive
+    (2026-08-25): the robot had been allowed to walk and turn at once, and a
+    blind burst of that at 42.7 deg/s swung the person out of the field of
+    view faster than any look could recover. Now no intent ever combines
+    forward with turn:
+
+    * **LOOKING** stands still -- which is also what lets the gated camera
+      stream flow -- and smooths the bearing the detector reports.
+    * **ALIGNING** turns on the spot towards that bearing, closed-loop on the
+      gyro when one is reporting (`turned_deg`), in short timed pulses when
+      not. Either way the rotation is bounded and verified, never dead
+      reckoned on time alone at an unmeasured rate.
+    * **ADVANCING** walks straight ahead for a bounded burst, watching the
+      gyro only for drift (the robot veers, F1); any needed correction is a
+      stop and a fresh look, never a turn on the move.
+    * **SEARCHING** is unchanged: it is the one state whose job is rotation,
+      and it always pulsed with look-pauses built in.
+
+    ``update`` is the whole behaviour: detections, the clock, and optionally
+    the body's pitch and accumulated yaw in; one drive intent out. Terminal
+    states latch and keep commanding a stop.
     """
 
     config: ApproachConfig = field(default_factory=ApproachConfig)
-    state: BehaviourState = BehaviourState.SEARCHING
+    state: BehaviourState = BehaviourState.LOOKING
     reason: str = ""
     started_at: float | None = None
     _last_seen: float | None = None
-    _last_bearing: float = 0.0
-    # The bearing actually steered by: the measured one, low-passed. None until
-    # a target is acquired, and cleared again whenever one is lost.
-    _steered_bearing: float | None = None
+    _last_bearing_deg: float = 0.0
     _last_height: float = 0.0
+    _steered_bearing: float | None = None
+    _holding: bool = False
+    _look_since: float | None = None
+    _look_target_since: float | None = None
+    # Whether THIS tick brought a gyro reading. `_last_turned` remembers the
+    # newest value ever seen, which is exactly wrong for closed-loop turning:
+    # steering by a stale angle is dead reckoning wearing a sensor's badge.
+    _turned_fresh: bool = False
+    _align_since: float | None = None
+    _align_dir: int = 0
+    _align_target_deg: float | None = None
+    _align_pulse_until: float | None = None
+    _align_walk_after: bool = True
+    _last_turned: float | None = None
+    _walk_since: float | None = None
+    _walk_heading_ref: float | None = None
+    _peek_since: float | None = None
+    _peeked: bool = False
+    # True from the first close loss until the target reads clearly far
+    # again: in this mode every standing check is taken kneeling, camera up.
+    # The trigger is deliberately the LOSS, not the clipped box edge -- a
+    # top-clipped box is true from 3.4 m inward on this camera (G2), so as a
+    # nearness signal the edge alone fires half a room too early, which the
+    # operator watched it do (2026-08-25). The gait stands the robot back up
+    # whenever it moves, so the runner re-kneels at every halt.
+    _near: bool = False
     _search_since: float | None = None
     _search_phase_since: float | None = None
     _turning: bool = True
-    # Whether a target is currently being held. Decides which confidence the
-    # detector's answers are judged against, and nothing else.
-    _holding: bool = False
-    # The two hysteresis latches, each carrying the direction it committed to.
-    # Which side of a threshold the robot is on is state, not a fresh
-    # comparison -- and so is which way it decided to go, because a latch that
-    # holds only the magnitude reverses the moment the bearing changes sign.
-    _turn_direction: int = 0
-    _correct_direction: int = 0
-    # When the stop size was first reached, or None while it is not.
     _big_since: float | None = None
 
     # --- the loop ---------------------------------------------------------
 
-    def update(self, detections: Sequence[Detection], now: float, pitch_deg: float = 0.0) -> Intent:
-        """One tick. ``pitch_deg`` is the body's own pitch, if it is known.
+    def update(
+        self,
+        detections: Sequence[Detection],
+        now: float,
+        pitch_deg: float = 0.0,
+        turned_deg: float | None = None,
+    ) -> Intent:
+        """One tick. ``turned_deg`` is the body's accumulated yaw, if known.
 
-        Zero means "assume level", which is what every caller did before the
-        IMU was on the wire and what a backend without one still does. Passing
-        the real thing removes the largest error in the distance estimate;
-        passing nothing leaves the behaviour exactly as it was.
+        Without it (mock, sim, firmware without the IMU) alignment degrades to
+        short timed pulses and drift goes unwatched; everything else is
+        unchanged. ``pitch_deg`` corrects the distance cue exactly as before.
         """
         if self.started_at is None:
             self.started_at = now
-            self._search_since = now
-            self._search_phase_since = now
+            self._look_since = now
+        self._turned_fresh = turned_deg is not None
+        if turned_deg is not None:
+            self._last_turned = turned_deg
         if self.state in _TERMINAL:
             return Intent(Drive(0, 0), self.state, self.reason)
         if now - self.started_at >= self.config.timeout:
             return self._give_up(f"timed out after {self.config.timeout:.0f}s")
 
-        # A target already being approached is kept on weaker evidence than an
-        # unknown one is acquired on -- see ApproachConfig.keep_confidence.
         threshold = self.config.keep_confidence if self._holding else self.config.acquire_confidence
         target = pick_target(detections, label=self.config.target, min_confidence=threshold)
-        if target is not None:
-            return self._approach(target, now, pitch_deg)
-        return self._without_target(now)
 
-    # --- with something in front of it ------------------------------------
+        if self.state is BehaviourState.PEEKING:
+            return self._peek_tick(target, now, pitch_deg)
+        if self.state is BehaviourState.ALIGNING:
+            return self._align_tick(target, now, pitch_deg)
+        if self.state is BehaviourState.ADVANCING:
+            return self._advance_tick(target, now, pitch_deg)
+        if self.state is BehaviourState.SEARCHING and target is None:
+            return self._search_tick(now)
+        # LOOKING -- or SEARCHING that just found something.
+        return self._look_tick(target, now, pitch_deg)
 
-    def _approach(self, target: Detection, now: float, pitch_deg: float = 0.0) -> Intent:
-        bearing = self._smooth(target.bearing, now)
+    # --- looking ----------------------------------------------------------
+
+    def _look_tick(self, target: Detection | None, now: float, pitch_deg: float) -> Intent:
+        config = self.config
+        if self._look_since is None:
+            self._look_since = now
+        if target is None:
+            waited = now - self._look_since
+            if waited < config.look_patience:
+                self.state = BehaviourState.LOOKING
+                self.reason = f"looking ({waited:.1f}s)"
+                return Intent(Drive(0, 0), self.state, self.reason, stance=self._stand_stance())
+            # The camera has had its chance. Near-loss means the person is
+            # probably towering over a level lens -- so look up and CHECK,
+            # once, before calling it arrival on a heuristic (G6).
+            if self._holding and self._last_height >= self.lost_close_height:
+                if config.peek and not self._peeked:
+                    return self._enter_peek(now)
+                self.state = BehaviourState.ARRIVED
+                self.reason = (
+                    f"arrived: lost sight of the {config.target} at "
+                    f"{self._last_height * 100:.0f}% of the frame -- too close to see it whole"
+                )
+                return Intent(Drive(0, 0), self.state, self.reason, stance=self._stand_stance())
+            # ... and far-loss is a search.
+            return self._enter_search(now)
+
         size = level_height_fraction(target, pitch_deg)
+        smoothed = self._smooth(target.bearing, now)
+        self._register_sighting(target, size, now)
+        if not config.approach_until_blind and size >= config.stop_height_fraction:
+            return self._confirm_arrival(size, now, target)
+        self._big_since = None
+
+        if size < self.lost_close_height:
+            # Back at ordinary range: a later close approach earns a fresh peek.
+            self._peeked = False
+        # Dwell before committing: the whole point of smoothing the bearing is
+        # that more than one frame contributes to it, and a decision on the
+        # first frame would hand one jittery box centre the entire alignment.
+        if self._look_target_since is None:
+            self._look_target_since = now
+        if now - self._look_target_since < config.look_settle_seconds:
+            self.state = BehaviourState.LOOKING
+            self.reason = f"watching (bearing {smoothed:+.2f})"
+            return Intent(Drive(0, 0), self.state, self.reason, target, stance=self._stand_stance())
+
+        bearing_deg = smoothed * (config.hfov_deg / 2.0)
+        if abs(bearing_deg) <= config.align_tolerance_deg:
+            return self._enter_advance(now, target)
+        return self._enter_align(bearing_deg, now, target)
+
+    def _register_sighting(self, target: Detection, size: float, now: float) -> None:
         self._last_seen = now
-        self._last_bearing = target.bearing
         self._last_height = size
+        self._last_bearing_deg = target.bearing * (self.config.hfov_deg / 2.0)
         self._holding = True
         self._search_since = None
-        if size >= self.config.stop_height_fraction:
-            if self._big_since is None:
-                self._big_since = now
-            held = now - self._big_since
-            if held >= self.config.stop_confirm_seconds:
-                self.state = BehaviourState.ARRIVED
-                self.reason = f"{self.config.target} fills {size * 100:.0f}% of the frame"
-                return Intent(Drive(0, 0), self.state, self.reason, target)
-            # Near enough to stop, not yet sure of it. Standing still is the
-            # right thing to do while deciding: it is where the robot would end
-            # up anyway if the reading holds.
-            self.state = BehaviourState.APPROACHING
-            self.reason = f"close enough -- confirming ({size:.2f}, {held:.1f}s)"
-            return Intent(Drive(0, 0), self.state, self.reason, target)
-        self._big_since = None
-        self.state = BehaviourState.APPROACHING
-        drive, note = self._steer(bearing)
-        self.reason = f"{note} (bearing {bearing:+.2f}, size {size:.2f})"
-        return Intent(drive, self.state, self.reason, target)
+        if self._near and size < self.lost_close_height - 0.05:
+            # Clearly back at distance: stand tall again. The margin keeps a
+            # size wobbling around the close band from bobbing the robot.
+            self._near = False
 
-    def _smooth(self, bearing: float, now: float) -> float:
-        """The measured bearing, low-passed towards the one to steer by.
+    def _stand_stance(self) -> str:
+        """What a standing phase should do with its body: look up when near."""
+        return "peek" if self._near else "stand"
 
-        A first-order filter with a time constant rather than a fixed weight,
-        because the two rates involved are unrelated and both vary: this is
-        called once per control tick, and the detector underneath answers at
-        its own pace. Weighting by elapsed time makes the filter behave the
-        same whether it is fed twice a second or twenty times.
+    def _confirm_arrival(self, size: float, now: float, target: Detection) -> Intent:
+        if self._big_since is None:
+            self._big_since = now
+        held = now - self._big_since
+        if held >= self.config.stop_confirm_seconds:
+            self.state = BehaviourState.ARRIVED
+            self.reason = f"{self.config.target} fills {size * 100:.0f}% of the frame"
+            return Intent(Drive(0, 0), self.state, self.reason, target, stance=self._stand_stance())
+        self.state = BehaviourState.LOOKING
+        self.reason = f"close enough -- confirming ({size:.2f}, {held:.1f}s)"
+        return Intent(Drive(0, 0), self.state, self.reason, target, stance=self._stand_stance())
 
-        Deliberately only on the bearing. The size decides arrival, and
-        smoothing that would delay a stop -- which is the one decision here
-        that must never be late.
-        """
-        tau = self.config.bearing_tau
-        if tau <= 0 or self._steered_bearing is None or self._last_seen is None:
-            self._steered_bearing = bearing
-            return bearing
-        elapsed = max(now - self._last_seen, 0.0)
-        weight = 1.0 - math.exp(-elapsed / tau)
-        self._steered_bearing += weight * (bearing - self._steered_bearing)
-        return self._steered_bearing
+    # --- aligning ---------------------------------------------------------
 
-    def _steer(self, bearing: float) -> tuple[Drive, str]:
-        """Bearing to drive, with a latch on each band rather than a fresh test.
+    def _enter_align(self, bearing_deg: float, now: float, target: Detection) -> Intent:
+        """One short pulse towards the remembered bearing -- never a loop.
 
-        Each band is entered at one bearing and left at a smaller one, and the
-        gap is what the overshoot is allowed to use up. The robot turns by
-        latching a move, and by the time a picture showing the target centred
-        has arrived, been detected and been acted on, it has turned further.
-        With a single threshold that overshoot lands on the far side and
-        immediately commands the opposite turn -- the rocking left and right
-        observed on the robot on 2026-08-23, closing on nothing.
-
-        The latch carries the *direction*, not just the magnitude, and that is
-        the half that is easy to get wrong: a magnitude-only latch is still
-        latched when the bearing crosses centre, so it reverses the turn on the
-        first overshoot and rocks exactly as before. Crossing centre therefore
-        ENDS a turn rather than reversing it -- turning back needs the full
-        entry bearing again, which an overshoot does not reach.
+        The pulse is timed (|bearing| / measured rate, hard-capped) and the
+        gyro, when it reports, only ever ends it EARLIER -- covered or
+        overshot. What follows is decided now, from the bearing that started
+        it: a moderate bearing walks regardless afterwards, because refusing
+        to walk until centred is how the robot ends up facing the person
+        forever without approaching them (seen on the robot, 2026-08-25).
         """
         config = self.config
-        offset = abs(bearing)
-        heading = 1 if bearing > 0 else -1
-        if self._turn_direction and self._turn_direction * bearing <= config.turn_exit_bearing:
-            self._turn_direction = 0
-        if not self._turn_direction and offset >= config.turn_enter_bearing:
-            self._turn_direction = heading
+        self.state = BehaviourState.ALIGNING
+        self._align_since = now
+        self._align_dir = 1 if bearing_deg > 0 else -1
+        self._align_walk_after = abs(bearing_deg) <= config.align_only_above_deg
+        rate = config.turn_rate_right_dps if bearing_deg > 0 else config.turn_rate_left_dps
+        self._align_pulse_until = now + min(abs(bearing_deg) / rate, config.align_max_pulse)
+        self._align_target_deg = (
+            self._last_turned + bearing_deg if self._last_turned is not None else None
+        )
+        self.reason = f"nudging {bearing_deg:+.0f} deg"
+        return Intent(Drive(0, self._align_dir), self.state, self.reason, target)
+
+    def _align_tick(self, target: Detection | None, now: float, pitch_deg: float) -> Intent:
+        config = self.config
+        assert self._align_since is not None
+        assert self._align_pulse_until is not None
+        if target is not None:
+            # Continuous vision only (a gated stream is dark while turning):
+            # someone who walked up to the robot mid-align is an arrival, not
+            # an alignment problem.
+            size = level_height_fraction(target, pitch_deg)
+            self._register_sighting(target, size, now)
+            if not config.approach_until_blind and size >= config.stop_height_fraction:
+                return self._confirm_arrival(size, now, target)
+        done = now >= self._align_pulse_until
+        if not done and self._align_target_deg is not None and self._turned_fresh:
+            assert self._last_turned is not None
+            remaining = self._align_target_deg - self._last_turned
+            # The gyro can only shorten the pulse: covered, or overshot.
+            done = self._align_dir * remaining <= config.align_tolerance_deg
+        if done:
+            if self._align_walk_after:
+                return self._enter_advance(now, target)
+            return self._enter_look(now, "big turn done -- looking again")
+        self.reason = "nudging towards them"
+        return Intent(Drive(0, self._align_dir), self.state, self.reason)
+
+    def _enter_look(self, now: float, reason: str) -> Intent:
+        self.state = BehaviourState.LOOKING
+        self._look_since = now
+        self._look_target_since = None
+        self._steered_bearing = None
+        self._align_since = None
+        self._align_target_deg = None
+        self._align_pulse_until = None
+        self._walk_since = None
+        self._walk_heading_ref = None
+        self.reason = reason
+        # The stance rides along: in the close band (self._near) every halt is
+        # taken kneeling, and this is the return path every halt goes through.
+        return Intent(Drive(0, 0), self.state, self.reason, stance=self._stand_stance())
+
+    # --- advancing --------------------------------------------------------
+
+    def _enter_advance(self, now: float, target: Detection | None) -> Intent:
+        self.state = BehaviourState.ADVANCING
+        self._walk_since = now
+        self._walk_heading_ref = self._last_turned
+        self.reason = "advancing straight"
+        return Intent(Drive(1, 0), self.state, self.reason, target)
+
+    def _advance_tick(self, target: Detection | None, now: float, pitch_deg: float) -> Intent:
+        config = self.config
+        assert self._walk_since is not None
         if (
-            self._correct_direction
-            and self._correct_direction * bearing <= config.correct_exit_bearing
+            self._walk_heading_ref is not None
+            and self._last_turned is not None
+            and abs(self._last_turned - self._walk_heading_ref) >= config.drift_abort_deg
         ):
-            self._correct_direction = 0
-        if not self._correct_direction and offset >= config.correct_enter_bearing:
-            self._correct_direction = heading
-        if self._turn_direction:
-            return Drive(0, self._turn_direction), "turning towards it"
-        if self._correct_direction:
-            return Drive(1, self._correct_direction), "walking, correcting"
-        return Drive(1, 0), "walking towards it"
+            return self._enter_look(now, "heading drifted -- stopping to look")
+        if now - self._walk_since >= config.walk_burst_seconds:
+            return self._enter_look(now, "burst done -- looking")
+        if target is not None:
+            # Continuous vision (sim, or streamgate=0): the burst may end
+            # early on what the camera says, but it never steers.
+            size = level_height_fraction(target, pitch_deg)
+            self._register_sighting(target, size, now)
+            if not config.approach_until_blind and size >= config.stop_height_fraction:
+                return self._confirm_arrival(size, now, target)
+            if abs(self._last_bearing_deg) >= config.realign_bearing_deg:
+                return self._enter_look(now, "target off centre -- stopping to look")
+        self.reason = "advancing straight"
+        return Intent(Drive(1, 0), self.state, self.reason, target)
 
-    # --- with nothing in front of it --------------------------------------
+    # --- peeking: kneel, look up, make sure -------------------------------
 
-    def _without_target(self, now: float) -> Intent:
+    def _enter_peek(self, now: float) -> Intent:
+        self.state = BehaviourState.PEEKING
+        self._peek_since = now
+        self._peeked = True
+        self._near = True
+        self._steered_bearing = None
+        self.reason = "lost it close in -- kneeling to look up"
+        return Intent(Drive(0, 0), self.state, self.reason, stance="peek")
+
+    def _peek_tick(self, target: Detection | None, now: float, pitch_deg: float) -> Intent:
         config = self.config
-        if self._last_seen is not None and now - self._last_seen < config.lost_grace:
-            # Deliberately a full stop rather than "carry on for a moment": the
-            # robot is walking at a person it can no longer see. A stutter is a
-            # cheap price for never moving blind.
-            self.state = BehaviourState.APPROACHING
-            self.reason = "lost sight of it -- holding"
-            return Intent(Drive(0, 0), self.state, self.reason)
-
-        # Losing a target that had grown large is not loss, it is arrival.
-        #
-        # Walking at a person from a camera a hand's width off the floor ends
-        # with the person filling the frame -- and a detector shown a fraction
-        # of a person stops calling it one. The old reading of that moment was
-        # "gone, go and look for it", so the robot turned away at exactly the
-        # point it had succeeded. Observed on the robot 2026-08-23.
-        #
-        # The failure mode of getting this wrong is benign in the one direction
-        # that matters: it stops the robot. A tracker asked to bridge the same
-        # gap fails the other way -- it keeps reporting a box, and the robot
-        # walks at a drifted guess of a person it can no longer see.
-        if self._holding and self._last_height >= self.lost_close_height:
+        assert self._peek_since is not None
+        if target is not None:
+            # There they are. The pitch the tilt commands is measured by the
+            # IMU and fed in here, so the size is corrected for the very tilt
+            # that made the sighting possible.
+            size = level_height_fraction(target, pitch_deg)
+            self._register_sighting(target, size, now)
+            if not config.approach_until_blind and size >= config.stop_height_fraction:
+                self.state = BehaviourState.ARRIVED
+                self.reason = (
+                    f"arrived: looked up and found the {config.target} "
+                    f"({size * 100:.0f}% of the frame)"
+                )
+                return Intent(Drive(0, 0), self.state, self.reason, target, stance="peek")
+            if size < self.lost_close_height - 0.05:
+                # Genuinely small again: they stepped back out of the close
+                # band. Stand tall and resume the ordinary approach.
+                self._near = False
+                return self._enter_look(now, "they moved away -- standing back up")
+            # Found, still short of the stop size: the operator's design says
+            # keep going. _near stays set, so every check on the way in is
+            # taken kneeling, camera up -- walk, kneel, look, walk.
+            return self._enter_look(now, "still there -- pressing on, looking up")
+        if now - self._peek_since >= config.peek_seconds:
+            # Looked up, saw nobody. The close-loss heuristic stands, minus
+            # its confidence: say what was and was not seen.
+            # The default run's terminal: it came until even the kneeling
+            # look sees nobody -- which at this range means it is standing at
+            # the person's feet. It stays kneeling, looking up.
             self.state = BehaviourState.ARRIVED
             self.reason = (
-                f"arrived: lost sight of the {config.target} at "
-                f"{self._last_height * 100:.0f}% of the frame -- too close to see it whole"
+                f"arrived: came in until even the kneeling look lost the "
+                f"{config.target} (last seen at {self._last_height * 100:.0f}%)"
             )
-            return Intent(Drive(0, 0), self.state, self.reason)
+            return Intent(Drive(0, 0), self.state, self.reason, stance="peek")
+        self.reason = "peeking up"
+        return Intent(Drive(0, 0), self.state, self.reason, stance="peek")
 
+    # --- searching (unchanged in spirit) ----------------------------------
+
+    def _enter_search(self, now: float) -> Intent:
+        self._holding = False
+        self._near = False
+        self._steered_bearing = None
+        self._look_target_since = None
+        self._search_since = now
+        self._search_phase_since = now
+        self._turning = True
+        return self._search_tick(now)
+
+    def _search_tick(self, now: float) -> Intent:
+        config = self.config
         if self._search_since is None:
-            self._search_since = now
-            self._search_phase_since = now
-            self._turning = True
-            # A fresh look starts with fresh latches: which side of a steering
-            # threshold the robot was on before it lost the target says nothing
-            # about the one it finds next.
-            self._holding = False
-            self._big_since = None
-            self._steered_bearing = None
-            self._turn_direction = 0
-            self._correct_direction = 0
+            return self._enter_search(now)
         if now - self._search_since >= config.search_seconds:
             return self._give_up(f"no {config.target} found in {config.search_seconds:.0f}s")
-
         self.state = BehaviourState.SEARCHING
-        turn = self.config.default_search_turn
-        if self._last_seen is not None and self._last_bearing != 0.0:
-            turn = 1 if self._last_bearing > 0 else -1
-        # Pulse: turn, then stand still long enough for the detector to get a
-        # frame that is not smeared.
+        turn = config.default_search_turn
+        if self._last_seen is not None and self._last_bearing_deg != 0.0:
+            turn = 1 if self._last_bearing_deg > 0 else -1
         assert self._search_phase_since is not None
         span = config.search_turn_seconds if self._turning else config.search_look_seconds
         if now - self._search_phase_since >= span:
@@ -572,10 +757,23 @@ class ComeToMe:
         self.reason = f"searching: looking ({left:.0f}s left)"
         return Intent(Drive(0, 0), self.state, self.reason)
 
+    # --- shared -----------------------------------------------------------
+
     @property
     def lost_close_height(self) -> float:
         """The size at or above which losing the target counts as arrival."""
         return self.config.stop_height_fraction - self.config.lost_close_margin
+
+    def _smooth(self, bearing: float, now: float) -> float:
+        """The measured bearing, low-passed while LOOKING (G7)."""
+        tau = self.config.bearing_tau
+        if tau <= 0 or self._steered_bearing is None or self._last_seen is None:
+            self._steered_bearing = bearing
+            return bearing
+        elapsed = max(now - self._last_seen, 0.0)
+        weight = 1.0 - math.exp(-elapsed / tau)
+        self._steered_bearing += weight * (bearing - self._steered_bearing)
+        return self._steered_bearing
 
     def _give_up(self, reason: str) -> Intent:
         self.state = BehaviourState.LOST

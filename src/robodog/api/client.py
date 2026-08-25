@@ -144,6 +144,19 @@ class RobotClient:
         reader: Attitude | None = getattr(self._backend, "attitude", None)
         return reader
 
+    def poll_imu(self) -> None:
+        """Ask the backend to collect fresh IMU samples now, if it can.
+
+        The behaviour runner calls this before ticks that steer by the gyro:
+        blind rotation is closed-loop on `turned`, and the watchdog feed's own
+        polling cadence (every 500 ms while moving) quantises a 42 deg/s turn
+        to 21-degree steps -- far too coarse to stop on. A backend without an
+        IMU simply has nothing to do here.
+        """
+        reader = getattr(self._backend, "read_imu", None)
+        if reader is not None:
+            reader()
+
     def read_camera_state(self) -> dict[str, int] | None:
         """What the robot says its camera holds, or None if it cannot say.
 

@@ -151,11 +151,14 @@ def test_come_to_me_walks_the_robot_and_ends_stopped(tmp_path: Path) -> None:
     """The acceptance criterion, with everything but the robot and the camera."""
     for _server, backend, url, fake in make_rig(tmp_path, detections=[seen(0.0, 0.9)]):
         wait_for_detections(url)
-        fake.content = '{"behaviour": "come_to_me", "target": "person"}'
-        status, data = post(url, "say", {"text": "Komm zu mir"})
+        # An explicit distance keeps the size stop: the shipped default walks
+        # until even the kneeling look goes blind, which a scripted detector
+        # that never goes blind would turn into a 60 s timeout.
+        fake.content = '{"behaviour": "come_to_me", "target": "person", "stop_distance_mm": 1000}'
+        status, data = post(url, "say", {"text": "Komm zu mir, bleib einen Meter weg"})
         assert status == 200 and data["ok"], data
         state = wait_idle(url)
-        assert state["behaviour"]["call"] == "come_to_me(target=person)"
+        assert state["behaviour"]["call"] == "come_to_me(stop_distance_mm=1000, target=person)"
         assert state["behaviour"]["state"] == "ARRIVED"
         assert not state["behaviour"]["active"]
         assert backend.state().drive == Drive(0, 0)
@@ -310,10 +313,14 @@ def test_a_behaviour_starts_without_a_language_model(tmp_path: Path) -> None:
         tmp_path, detections=[seen(0.0, 0.9)], with_llm=False
     ):
         wait_for_detections(url)
-        status, data = post(url, "behaviour", {"name": "come_to_me", "target": "person"})
+        status, data = post(
+            url,
+            "behaviour",
+            {"name": "come_to_me", "target": "person", "stop_distance_mm": 1000},
+        )
         assert status == 200 and data["ok"], data
         state = wait_idle(url)
-        assert state["behaviour"]["call"] == "come_to_me(target=person)"
+        assert state["behaviour"]["call"] == "come_to_me(stop_distance_mm=1000, target=person)"
         assert state["behaviour"]["state"] == "ARRIVED"
         assert backend.state().drive == Drive(0, 0)
 

@@ -280,8 +280,12 @@ def approach_config(call: BehaviourCall, *, base: ApproachConfig | None = None) 
     distance = call.params.get("stop_distance_mm")
     if isinstance(distance, int) and distance > 0:
         wanted = height_fraction_for_distance(float(distance))
+        # An explicit distance re-enables the size stop: "bleib 2 Meter weg"
+        # means exactly that. Without one, the default run comes all the way
+        # in, until even the kneeling look sees nobody (approach_until_blind).
         config = replace(
             config,
             stop_height_fraction=min(max(wanted, STOP_HEIGHT_MIN), STOP_HEIGHT_MAX),
+            approach_until_blind=False,
         )
     return config

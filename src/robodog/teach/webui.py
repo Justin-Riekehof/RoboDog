@@ -1086,7 +1086,7 @@ class TeachUIServer:
                 "ok": False,
                 "message": "that behaviour needs the camera -- start teach with --vision",
             }
-        config = approach_config(call)
+        config = self._tune_for_backend(approach_config(call))
         with self._lock:
             return self._start_behaviour(config, said=said, call=call.describe())
 
@@ -1114,9 +1114,17 @@ class TeachUIServer:
                 "ok": False,
                 "message": "that behaviour needs the camera -- start teach with --vision",
             }
-        config = approach_config(call)
+        config = self._tune_for_backend(approach_config(call))
         with self._lock:
             return self._start_behaviour(config, said="", call=call.describe())
+
+    def _tune_for_backend(self, config: ApproachConfig) -> ApproachConfig:
+        """Strip what this backend cannot do -- peeking needs leg targets."""
+        from dataclasses import replace
+
+        if Capability.LEG_TARGET not in self._client.capabilities:
+            return replace(config, peek=False)
+        return config
 
     def _start_behaviour(
         self, config: ApproachConfig, *, said: str, call: str
