@@ -52,7 +52,7 @@ from robodog.api.types import (
 from robodog.backends.base import DEFAULT_TICK
 from robodog.backends.mock import MockBackend
 from robodog.camera import STREAM_PATH, STREAM_PORT
-from robodog.errors import BackendError, CapabilityError
+from robodog.errors import BackendError, CapabilityError, TransportError
 from robodog.kinematics.constants import SERVO_CHANNELS, SERVO_MIDDLE
 from robodog.localization import Attitude, AttitudeEstimator, ImuBatch, parse_imu_batch
 from robodog.netdiag import diagnose_unreachable
@@ -174,6 +174,10 @@ class HttpBackend:
         self.imu = AttitudeEstimator()
         self._imu_seq = 0
         self.imu_dropped = 0
+        # Worst firmware loop() gap seen this session. The firmware resets its
+        # counter on every read, so the running max lives here -- each poll
+        # hands over its window and the session keeps the worst of them.
+        self.imu_loop_max_ms = 0
         # When the last pose went out, so the next one can say how long it has.
         self._last_flush: float | None = None
         self._clock = clock
@@ -215,7 +219,7 @@ class HttpBackend:
             except urllib.error.HTTPError as exc:
                 raise BackendError(f"{url} returned HTTP {exc.code}") from exc
             except (urllib.error.URLError, OSError, TimeoutError) as exc:
-                raise BackendError(f"cannot reach robot at {url}: {exc}") from exc
+                raise TransportError(f"cannot reach robot at {url}: {exc}") from exc
         return self._get_pooled(url, path, timeout or self.timeout)
 
     def _get_pooled(self, url: str, path: str, timeout: float) -> bytes:
@@ -248,7 +252,7 @@ class HttpBackend:
                 except (OSError, http.client.HTTPException) as exc:
                     self._drop_connection()
                     if attempt == 2:
-                        raise BackendError(f"cannot reach robot at {url}: {exc}") from exc
+                        raise TransportError(f"cannot reach robot at {url}: {exc}") from exc
             raise AssertionError("unreachable")  # pragma: no cover
 
     def _connection(self, timeout: float) -> http.client.HTTPConnection:
@@ -325,12 +329,29 @@ class HttpBackend:
             try:
                 self._control("watchdog", FIRMWARE_WATCHDOG_MS)
                 self._watchdog_armed = True
-            except BackendError as exc:
-                # Only reachable when the firmware was declared rather than
-                # probed. Failing loudly is the point: the operator asserted a
-                # robot that stops itself, and it does not.
+            except TransportError as exc:
+                # The link died between the probe and here. That is a verdict
+                # about the network and about nothing else -- and the message
+                # this used to print blamed the firmware for it, which sent an
+                # operator looking at a robot whose only problem was Wi-Fi.
+                # Seen on 2026-08-25: the stop and the probe both got through,
+                # and the watchdog request found no route to the host.
                 self._connected = False
                 self._model.disconnect()
+                hints = diagnose_unreachable(self.host, AP_SSID, AP_PASSWORD)
+                raise TransportError(
+                    "\n  ".join([f"lost the robot while arming its watchdog: {exc}", *hints])
+                ) from exc
+            except BackendError as exc:
+                # The robot answered and refused, which IS a firmware verdict.
+                self._connected = False
+                self._model.disconnect()
+                if self.firmware == "auto":
+                    raise BackendError(
+                        f"this robot answered the firmware probe but refused the watchdog "
+                        f"command, so it runs a build of firmware/wavego-robodog older "
+                        f"than the watchdog -- reflash it ({exc})"
+                    ) from exc
                 raise BackendError(
                     f"this robot refused the watchdog command, so it is not running "
                     f"{self.firmware!r} firmware -- drop --firmware, or flash "
@@ -440,6 +461,11 @@ class HttpBackend:
         """
         try:
             batch = parse_imu_batch(json.loads(self._control("imu", self._imu_seq)))
+        except TransportError:
+            # No answer is not "no IMU". Swallowing this classified a dying
+            # link as an old firmware and let connect() stumble on to fail one
+            # request later with the blame in the wrong place (2026-08-25).
+            raise
         except (BackendError, ValueError, TypeError):
             return False
         self._imu_seq = max(self._imu_seq, batch.last_seq)
@@ -461,6 +487,7 @@ class HttpBackend:
             return None
         self._imu_seq = max(self._imu_seq, batch.last_seq)
         self.imu_dropped += batch.dropped
+        self.imu_loop_max_ms = max(self.imu_loop_max_ms, batch.loop_max_ms)
         self.imu.feed(batch.samples)
         return batch
 
@@ -485,6 +512,11 @@ class HttpBackend:
             return self.firmware == "robodog"
         try:
             self._control("ping", 0)
+        except TransportError:
+            # A link that died is an answer about the network, not about the
+            # firmware -- reading it as "stock" would quietly strip LEG_TARGET
+            # from a robot that has it.
+            raise
         except BackendError:
             return False
         return True
@@ -694,6 +726,7 @@ class HttpBackend:
             roll=attitude.roll,
             turned=attitude.turned,
             still=attitude.still,
+            loop_max_ms=self.imu_loop_max_ms,
         )
 
     # --- safety ---

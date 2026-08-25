@@ -554,3 +554,51 @@ def test_a_spike_that_does_not_hold_leaves_the_run_going() -> None:
 def test_confirmation_can_be_switched_off() -> None:
     machine = ComeToMe(config=ApproachConfig(stop_confirm_seconds=0.0))
     assert machine.update([person(0.0, 0.95)], 0.0).state is BehaviourState.ARRIVED
+
+
+def test_stop_and_look_emerges_without_any_new_machinery() -> None:
+    """The firmware streams only while the robot is stopped (the operator's
+    own design, 2026-08-25). Nothing in this state machine was changed for it:
+    walking blanks the detections, the never-walk-blind invariant halts the
+    robot within its grace, the halt restarts the stream, the next look
+    re-acquires -- and the approach advances as walk-bursts strung between
+    looks, arriving exactly as before.
+    """
+    machine = ComeToMe(config=ApproachConfig(lost_grace=0.6))
+    now, size = 0.0, 0.25
+    walked = holds = 0
+    arrived = None
+    last_drive = Drive(0, 0)
+    for _ in range(400):
+        # The gate, modelled: frames -- and so detections -- exist only while
+        # the previous intent left the robot standing.
+        seen = [person(0.0, size)] if last_drive == Drive(0, 0) else []
+        intent = machine.update(seen, now)
+        if intent.state is BehaviourState.ARRIVED:
+            arrived = now
+            break
+        if intent.drive.forward == 1:
+            walked += 1
+            size = min(size + 0.004, 0.9)  # walking closes the distance
+        elif last_drive.forward == 1:
+            holds += 1  # the blind-grace stop between bursts
+        last_drive = intent.drive
+        now += 0.1
+    assert arrived is not None, "stop-and-look never arrived"
+    assert walked > 10, "it should spend real time walking"
+    assert holds >= 3, "the walk must be bursts strung between looks"
+
+
+def test_stop_and_look_never_overruns_the_blind_grace() -> None:
+    """Bounded blindness: between two sightings the robot walks at most
+    lost_grace long, then stands until it has seen the target again."""
+    machine = ComeToMe(config=ApproachConfig(lost_grace=0.6))
+    now = 0.0
+    machine.update([person(0.0, 0.3)], now)
+    blind_walk = 0.0
+    while now < 10.0:
+        now += 0.1
+        intent = machine.update([], now)  # the stream never comes back
+        if intent.drive.forward == 1:
+            blind_walk += 0.1
+    assert blind_walk <= 0.6 + 0.11, f"walked blind for {blind_walk:.1f}s"

@@ -281,7 +281,15 @@ def test_the_page_shows_what_the_imu_says(tmp_path: Path) -> None:
     url = server.start()
     try:
         attitude = state_of(url)["attitude"]
-        assert attitude == {"pitch": -3.5, "roll": 0.5, "turned": 91.0, "still": False}
+        assert attitude == {
+            "pitch": -3.5,
+            "roll": 0.5,
+            "turned": 91.0,
+            "still": False,
+            # None, not 0: this mock reports no loop health, and "no idea" must
+            # stay distinguishable from "perfect".
+            "loop_max_ms": None,
+        }
     finally:
         server.shutdown()
 
@@ -290,3 +298,48 @@ def test_a_backend_without_an_imu_says_nothing_rather_than_zero(rig: Rig) -> Non
     """Zero degrees and 'no idea' are different, and only one of them is safe
     to feed into the distance geometry."""
     assert state_of(rig[2])["attitude"] is None
+
+
+# --- the direct path: behaviours without any language model ------------------
+
+
+def test_a_behaviour_starts_without_a_language_model(tmp_path: Path) -> None:
+    """The model was only ever a translator, and this proves it: the same
+    deterministic run, started from explicit parameters, no LLM configured."""
+    for _server, backend, url, _fake in make_rig(
+        tmp_path, detections=[seen(0.0, 0.9)], with_llm=False
+    ):
+        wait_for_detections(url)
+        status, data = post(url, "behaviour", {"name": "come_to_me", "target": "person"})
+        assert status == 200 and data["ok"], data
+        state = wait_idle(url)
+        assert state["behaviour"]["call"] == "come_to_me(target=person)"
+        assert state["behaviour"]["state"] == "ARRIVED"
+        assert backend.state().drive == Drive(0, 0)
+
+
+def test_the_direct_path_validates_against_the_same_vocabulary(rig: Rig) -> None:
+    status, data = post(rig[2], "behaviour", {"name": "backflip"})
+    assert status == 400
+    assert "unknown behaviour" in data["message"]
+    status, data = post(rig[2], "behaviour", {"name": "come_to_me", "target": "dragon"})
+    assert status == 400
+    assert "is not one of" in data["message"]
+
+
+def test_the_direct_path_takes_a_stop_distance(rig: Rig) -> None:
+    """The one thing the model parsed from words arrives here as a number."""
+    _server, _backend, url, _fake = rig
+    status, data = post(
+        url, "behaviour", {"name": "come_to_me", "target": "person", "stop_distance_mm": 2000}
+    )
+    assert status == 200 and data["ok"], data
+    assert "stop_distance_mm=2000" in state_of(url)["behaviour"]["call"]
+    post(url, "stop", {})
+    wait_idle(url)
+
+
+def test_direct_stop_needs_no_camera_and_no_model(tmp_path: Path) -> None:
+    for _server, _backend, url, _fake in make_rig(tmp_path, with_llm=False, with_vision=False):
+        status, data = post(url, "behaviour", {"name": "stop"})
+        assert status == 200 and data["ok"]

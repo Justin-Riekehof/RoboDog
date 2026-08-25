@@ -27,6 +27,8 @@
 //    <SWITCH>
 extern IPAddress IP_ADDRESS = (0, 0, 0, 0);
 extern byte WIFI_MODE = 0; // select WIFI_MODE in app_httpd.cpp
+// RoboDog: loopTask handle, so the prio command can reach it from other tasks.
+TaskHandle_t ROBODOG_LOOP_TASK = NULL;
 extern void getWifiStatus();
 extern int WIFI_RSSI = 0;
 
@@ -396,15 +398,56 @@ void serialCtrl(){
         robodogApply();
       }
 
+      // Gait priority, live. {"var":"prio","val":1..12} -- see setup().
+      else if(docReceive["var"] == "prio"){
+        if(ROBODOG_LOOP_TASK != NULL && val >= 1 && val <= 12){
+          vTaskPrioritySet(ROBODOG_LOOP_TASK, val);
+          Serial.print("prio:");Serial.println(val);
+        }
+      }
+
+      // Battery voltage and current, as one JSON line. The vendor measures
+      // both every pass (INA219, allDataUpdate) and then shows them only on
+      // the OLED -- jsonSend() would have exported them but is never called.
+      // First asked for on 2026-08-25, chasing a POWERON_RESET mid-session:
+      // whether the rail sags under load is exactly the question a battery
+      // answer settles. {"var":"vol","val":0}
+      else if(docReceive["var"] == "vol"){
+        Serial.print("{\"vol\":");Serial.print(loadVoltage_V);
+        Serial.print(",\"ma\":");Serial.print(current_mA);
+        Serial.println("}");
+      }
+
       // The IMU, as one JSON line. val = the last sequence already seen, so
       // {"var":"imu","val":0} dumps everything the ring still holds. This is
       // the bring-up answer to "is the gyroscope alive at all", which nothing
       // in the vendor firmware could ever be asked.
       else if(docReceive["var"] == "imu"){
-        char json[2048];
+        // static: this task has 4000 bytes of stack (xTaskCreate below), and
+        // the HTTP twin of this buffer measurably overflowed httpd's 4096 --
+        // see app_httpd.cpp. One task, one caller, no reentrancy.
+        static char json[2048];
         int len = robodogImuJson(json, sizeof(json), (uint32_t)(val < 0 ? 0 : val));
         if(len > 0){Serial.println(json);}
         else{Serial.println("{\"imu\":false}");}
+      }
+      // === end RoboDog ======================================================
+
+      // === RoboDog: drain trailing whitespace ==============================
+      // Or the NEXT pass stalls the robot for a full second:
+      // deserializeJson returns at the closing brace and
+      // leaves a sender's newline in the buffer; the next serialCtrl() sees
+      // Serial.available(), calls the parser on it, and ArduinoJson's stream
+      // reader BUSY-WAITS through Serial's 1000 ms timeout hoping a document
+      // follows -- on this task, which outranks loop(), so the gait and the
+      // IMU freeze for that second. Measured 2026-08-25: exactly one ~1045 ms
+      // sampling hole per newline-terminated command, zero without the
+      // newline. Only whitespace is drained, so a second queued command
+      // survives.
+      while (Serial.available() > 0){
+        int rdPeek = Serial.peek();
+        if (rdPeek=='\n' || rdPeek=='\r' || rdPeek==' ' || rdPeek=='\t'){ Serial.read(); }
+        else { break; }
       }
       // === end RoboDog ======================================================
     }
@@ -470,11 +513,18 @@ void threadingsInit(){
 // HTTP handler and the serial console only format what is already in the ring.
 
 #define ROBODOG_IMU_SLOTS 64
-// 50 Hz. Fast enough to integrate a walking gait's rotation, slow enough that
-// the read costs a few percent of a loop that also drives twelve servos over
-// the same I2C bus. If the gait degrades after this lands, this is the first
-// number to raise.
-#define ROBODOG_IMU_PERIOD_MS 20
+// This was 20 ms ("a few percent of the loop") and both halves of that
+// sentence were wrong, reported by the operator on the robot's first Wi-Fi
+// drive with the IMU aboard (2026-08-25): the gait was visibly slower and
+// jerkier than the 08-22 firmware. Measured, the read costs ~12 ms of I2C on
+// the servos' own bus -- at a 20 ms gate that is a third of the loop, not a
+// few percent. And the cost lands twice: every HTTP poll formats the
+// accumulated samples on the httpd task, which outranks loop() and preempts
+// the gait precisely while the robot drives, since driving is when the host
+// polls. Both scale with this one number. 100 ms cuts them 5x; ~10 Hz still
+// oversamples a gait whose pitch swings at about 2 Hz, and the host filter
+// weighs by per-sample timestamps, so it does not care about the rate.
+#define ROBODOG_IMU_PERIOD_MS 100
 // The magnetometer sits behind the auxiliary bus and costs its own
 // transaction, and a heading drifts slowly -- it does not need the gyro's rate.
 #define ROBODOG_IMU_MAG_PERIOD_MS 100
@@ -486,6 +536,21 @@ struct RobodogImuSample {
 };
 
 RobodogImuSample ROBODOG_IMU_RING[ROBODOG_IMU_SLOTS];
+// RoboDog: the longest gap between two loop() passes since the last imu
+// request, in ms. loop() is where the gait advances, so this number IS the
+// gait's health -- and it survives a session, so the next serial connection
+// can read what a Wi-Fi drive did to the loop after the fact. Reset on read.
+volatile uint32_t ROBODOG_LOOP_MAX_MS = 0;
+uint32_t ROBODOG_LOOP_PREV_MS = 0;
+
+void robodogLoopWatch(){
+  uint32_t now = millis();
+  if (ROBODOG_LOOP_PREV_MS != 0){
+    uint32_t gap = now - ROBODOG_LOOP_PREV_MS;
+    if (gap > ROBODOG_LOOP_MAX_MS){ ROBODOG_LOOP_MAX_MS = gap; }
+  }
+  ROBODOG_LOOP_PREV_MS = now;
+}
 // Sequence of the NEWEST sample written, counting from 1. The host sends back
 // the last one it saw, so nothing has to be acknowledged and a lost reply
 // simply gets the samples again on the next request.
@@ -530,6 +595,13 @@ void robodogImuInit(){
 
 // Called from loop() only. Rate-gated, so it costs one I2C burst per period
 // rather than one per pass.
+// The read half of the profiler: hand out the worst gap and start fresh.
+uint32_t robodogLoopMaxTake(){
+  uint32_t worst = ROBODOG_LOOP_MAX_MS;
+  ROBODOG_LOOP_MAX_MS = 0;
+  return worst;
+}
+
 void robodogImuSample(){
   uint32_t now = millis();
   if(now - ROBODOG_IMU_LAST_MS < ROBODOG_IMU_PERIOD_MS){return;}
@@ -574,9 +646,9 @@ extern int robodogImuJson(char *out, size_t n, uint32_t since){
   uint32_t dropped = (from > since + 1) ? (from - since - 1) : 0;
 
   int len = snprintf(out, n,
-    "{\"imu\":true,\"rate\":%d,\"seq\":%lu,\"dropped\":%lu,\"mag_ok\":%d,"
+    "{\"imu\":true,\"rate\":%d,\"lmax\":%lu,\"seq\":%lu,\"dropped\":%lu,\"mag_ok\":%d,"
     "\"mag\":[%.2f,%.2f,%.2f],\"mag_t\":%lu,\"temp\":%.1f,\"s\":[",
-    (int)(1000 / ROBODOG_IMU_PERIOD_MS), (unsigned long)newest,
+    (int)(1000 / ROBODOG_IMU_PERIOD_MS), (unsigned long)robodogLoopMaxTake(), (unsigned long)newest,
     (unsigned long)dropped, ROBODOG_MAG_OK ? 1 : 0,
     ROBODOG_MAG_X, ROBODOG_MAG_Y, ROBODOG_MAG_Z,
     (unsigned long)ROBODOG_MAG_T, ROBODOG_IMU_TEMP);
@@ -649,6 +721,36 @@ void setup() {
   // WEBCTRL INIT. WIFI settings included.
   webServerInit();
 
+  // === RoboDog: the gait outranks the web servers ==========================
+  // loop() -- where robotCtrl() computes the gait and writes all twelve
+  // servos -- runs in loopTask at priority 1. The two httpd tasks run at 5,
+  // unpinned, and the MJPEG stream handler is a near-continuous worker: with
+  // a client attached it loops fb_get -> chunk-send at full tilt, preempting
+  // the gait at will. Measured by elimination 2026-08-25: every session that
+  // held the stream walked slow and hitching, the same session without it was
+  // smooth, and a serial-driven gait with no Wi-Fi client ran clean 114 ms
+  // loop intervals all along.
+  //
+  // This IDF's httpd_config_t has no core_id yet, so the servers cannot be
+  // pinned away. Raising loopTask above them inverts the preemption instead:
+  // the gait computes whenever it needs to, and the servers run in the gaps
+  // the loop's own I2C waits leave open -- which on a pass that spends most
+  // of its time on the servo bus is most of the time -- and in core 0's
+  // leftovers beside Wi-Fi. The stream loses frames under load; the walk
+  // does not lose steps. That is the right direction for a robot.
+  ROBODOG_LOOP_TASK = xTaskGetCurrentTaskHandle();
+  vTaskPrioritySet(NULL, 7);
+  //
+  // 7 beat the httpd tasks and the walk stayed sluggish anyway (2026-08-25),
+  // which points one level up: this core generation's camera driver runs its
+  // DMA task at priority 10, PINNED to this core. So the priority is also a
+  // runtime knob -- {"var":"prio"} on both transports -- because finding the
+  // rung that actually clears the ladder is a dose-response experiment, and
+  // an experiment per reflash is a bad afternoon. Clamped to 1..12: above 12
+  // sit the system's own tasks (esp_timer, tcpip, Wi-Fi), and a gait that
+  // outranked those would take the radio down with every step.
+  // === end RoboDog ==========================================================
+
   // RGB LEDs on.
   delay(500);
   setSingleLED(0,matrix.Color(0, 32, 255));
@@ -668,6 +770,7 @@ void loop() {
   allDataUpdate();
   wireDebugDetect();
   robodogRampStep();        // RoboDog: carry GoalPWM towards the staged pose
+  robodogLoopWatch();       // RoboDog: how long since the last pass -- gait health
   robodogImuSample();       // RoboDog: the only place the IMU is read (I2C rule)
   robodogWatchdogCheck();   // RoboDog: stop by ourselves if the host went away
 }

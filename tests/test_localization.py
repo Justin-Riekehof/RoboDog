@@ -350,3 +350,11 @@ def test_all_three_rates_are_inverted_together() -> None:
     """
     result = integrate(-10.0, -10.0, -10.0)
     assert result.pitch > 0 and result.roll > 0 and result.turned > 0
+
+
+def test_the_loop_health_number_travels_with_the_batch() -> None:
+    """`lmax` is the one measurement that must come over Wi-Fi: attaching a
+    serial cable resets the robot and destroys it (learned 2026-08-25)."""
+    batch = parse_imu_batch({"imu": True, "rate": 10, "lmax": 512, "s": [], "last": 3})
+    assert batch.loop_max_ms == 512
+    assert parse_imu_batch({"imu": True, "s": [], "last": 1}).loop_max_ms == 0

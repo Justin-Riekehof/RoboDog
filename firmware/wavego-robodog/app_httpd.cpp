@@ -72,6 +72,28 @@ extern void robodogCameraReport();
 extern int robodogCameraJson(char *out, size_t n);
 // RoboDog: how long the next pose should take, defined in WAVEGO.ino.
 extern void robodogApplyMs(int val);
+// RoboDog: loopTask handle, for the prio command (WAVEGO.ino).
+extern TaskHandle_t ROBODOG_LOOP_TASK;
+// === RoboDog: stream frame-rate cap =======================================
+// Minimum ms between MJPEG frames; 200 = 5 fps. A held VGA stream otherwise
+// runs capture->send at full tilt, and the sluggish walk it causes survived
+// every task-priority experiment (1, 7 and 12 all felt the same, 2026-08-25)
+// -- so the damage is below the scheduler: per-line DMA interrupts and radio
+// airtime, neither of which a priority outranks. The only lever that reaches
+// both is doing less per second. Vision needs ~5 fps; nobody needs 20.
+// Runtime knob: var=fps, val = max frames/sec (0 = uncapped).
+static uint32_t ROBODOG_STREAM_MIN_MS = 200;
+// And the stronger rule, the operator's own suggestion (2026-08-25): no
+// frames at all while the robot MOVES. The 5 fps cap still left the walk
+// hitching, so whatever the stream costs -- DMA interrupts, radio airtime --
+// it costs too much per frame; and a frame taken mid-stride is motion-blurred
+// and pitched anyway, the exact frames that lie about distance (G2/F6). The
+// robot advances by looking, walking a bounded burst, and looking again; the
+// host's behaviour machine produces that rhythm by itself, because its
+// detections expire and it refuses to walk blind. var=streamgate 0 disables,
+// for A/B and for anyone who wants the vendor experience back.
+static int ROBODOG_STREAM_GATE = 1;
+// === end RoboDog ==========================================================
 // RoboDog: the IMU ring, sampled in loop() and formatted here (InitConfig.h).
 extern int robodogImuJson(char *out, size_t n, uint32_t since);
 
@@ -158,6 +180,26 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   }
  
   while (true) {
+    // === RoboDog: stop-and-look ==========================================
+    // While a move is latched the stream sends nothing: the gait keeps its
+    // core and its airtime, and the client sees a stalled stream, which the
+    // host reader is built to ride out. Polled at 50 ms so frames return
+    // within a step of the robot stopping.
+    while (ROBODOG_STREAM_GATE && (moveFB != 0 || moveLR != 0)) {
+      vTaskDelay(50 / portTICK_PERIOD_MS);
+    }
+    // === end RoboDog ======================================================
+
+    // === RoboDog: the frame-rate cap =====================================
+    // vTaskDelay rather than a busy check, so the wait itself yields the
+    // core and the radio.
+    if (ROBODOG_STREAM_MIN_MS > 0) {
+      int64_t since_ms = (esp_timer_get_time() - last_frame) / 1000;
+      if (since_ms < (int64_t)ROBODOG_STREAM_MIN_MS) {
+        vTaskDelay((ROBODOG_STREAM_MIN_MS - since_ms) / portTICK_PERIOD_MS);
+      }
+    }
+    // === end RoboDog ======================================================
     fb = esp_camera_fb_get();
     if (!fb) {
       // Serial.println("Camera capture failed");
@@ -360,6 +402,32 @@ static esp_err_t cmd_handler(httpd_req_t *req){
   else if (!strcmp(variable, "ping")){
   }
 
+  // === RoboDog: stop-and-look gate, live =================================
+  else if (!strcmp(variable, "streamgate")){
+    ROBODOG_STREAM_GATE = (val != 0) ? 1 : 0;
+    Serial.print("streamgate:");Serial.println(ROBODOG_STREAM_GATE);
+  }
+  // === end RoboDog =========================================================
+
+  // === RoboDog: stream frame-rate cap, live ==============================
+  else if (!strcmp(variable, "fps")){
+    ROBODOG_STREAM_MIN_MS = (val > 0 && val <= 25) ? (1000 / val) : 0;
+    Serial.print("fps cap:");Serial.println(val);
+  }
+  // === end RoboDog =========================================================
+
+  // === RoboDog: gait priority, live -- the dose-response knob ============
+  // See setup() in WAVEGO.ino for why this exists.
+  else if (!strcmp(variable, "prio")){
+    if (ROBODOG_LOOP_TASK != NULL && val >= 1 && val <= 12){
+      vTaskPrioritySet(ROBODOG_LOOP_TASK, val);
+      Serial.print("prio:");Serial.println(val);
+    } else {
+      res = -1;
+    }
+  }
+  // === end RoboDog =========================================================
+
   // === RoboDog: the IMU, buffered =========================================
   // `val` is the last sequence number the host already has; the reply carries
   // everything newer. That is what makes 50 Hz of gyroscope survive a link
@@ -369,7 +437,19 @@ static esp_err_t cmd_handler(httpd_req_t *req){
   // Reads only the ring, never the chip -- loop() is the single I2C writer
   // (see the fork's README), and breaking that rule crashes the robot.
   else if (!strcmp(variable, "imu")){
-    char json[2048];
+    // `static`, and that is a bug fix, not a style choice. This handler runs
+    // on the httpd task, whose stack is HTTPD_DEFAULT_CONFIG()'s 4096 bytes --
+    // a 2 KB buffer here, plus this frame, plus snprintf's float formatting,
+    // overflows it. Measured on the robot 2026-08-25: the first HTTP `imu`
+    // request ever made killed the IP stack mid-connect, twice, identically --
+    // ARP went silent while the 802.11 association stayed up for another five
+    // minutes, which is what a corrupted neighbour task looks like, not a
+    // panic (a panic reboots, and a reboot drops the association). The serial
+    // path had worked for a whole evening because it runs on a different task;
+    // its buffer is now static too, since 4000 bytes of stack is the same
+    // cliff. Not reentrant, and does not need to be: httpd serialises its
+    // handlers on one task.
+    static char json[2048];
     int len = robodogImuJson(json, sizeof(json), (uint32_t)(val < 0 ? 0 : val));
     if (len < 0) { res = -1; }
     else {

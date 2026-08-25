@@ -325,12 +325,18 @@
 
 <aside class="console" id="console">
   <div class="panel" id="say-panel" hidden>
-    <h2>Say what to do <span class="hint">(a behaviour, not a chat)</span></h2>
-    <!-- The model is asked once, here, and maps this to one named behaviour
-         with parameters. It never drives: from that point a deterministic loop
-         runs, through the same safety supervisor as every other command. -->
-    <div class="row say">
-      <input id="say-text" placeholder="Komm zu mir" autocomplete="off">
+    <h2>Behaviours <span class="hint">(deterministic; the model never drives)</span></h2>
+    <!-- The button IS the feature: a named call straight into the vocabulary
+         validation, no language model anywhere on the path. The text box is
+         optional sugar in front of the same call -- the model translates free
+         words (and things like "zwei Meter") into these parameters, once,
+         before anything moves. -->
+    <div class="row" id="behaviour-buttons">
+      <button id="btn-come" class="primary">Komm zu mir</button>
+      <span class="hint">walks to the nearest person, stop-and-look</span>
+    </div>
+    <div class="row say" id="say-input-row">
+      <input id="say-text" placeholder="frei formuliert, z.B. 'bleib 2 m weg'" autocomplete="off">
       <button id="say-send" class="primary">Go</button>
     </div>
     <div class="row"><span class="hint" id="say-note"></span></div>
@@ -703,8 +709,11 @@ function renderVision() {
   // A stalled detector is the one vision failure that looks like success:
   // the picture may still be moving while nothing is looking at it.
   $("vision-note").textContent = vision.stale
-    ? "the detector has stopped answering -- nothing is being recognised. "
-      + "Is something else holding the robot's stream? (ASSUMPTIONS G3)"
+    ? (vision.moving
+        ? "stop-and-look: the stream pauses while the robot moves; it looks "
+          + "again at the next halt"
+        : "the detector has stopped answering -- nothing is being recognised. "
+          + "Is something else holding the robot's stream? (ASSUMPTIONS G3)")
     : vision.note || "";
   const list = $("vision-list");
   const found = vision.detections || [];
@@ -725,16 +734,22 @@ function renderVision() {
 
 function renderSay() {
   const behaviour = state.behaviour || {};
-  $("say-panel").hidden = !state.can_talk;
-  if (!state.can_talk) return;
+  // The panel needs vision OR a model: the button drives without any model,
+  // the text box drives without the button. Hidden only when neither exists.
+  $("say-panel").hidden = !state.can_talk && !state.vision;
+  if ($("say-panel").hidden) return;
+  $("btn-come").disabled = !!state.busy || !state.vision;
+  $("say-input-row").hidden = !state.can_talk;
   // Anything running refuses a new command, so the button says so rather than
   // posting one that comes back 409. Stopping is NOT done from here: the STOP
   // button and Escape are, and neither waits for a model to answer.
   $("say-send").disabled = !!state.busy;
   $("say-note").textContent = behaviour.call
-    ? `understood as: ${behaviour.call}`
+    ? `running as: ${behaviour.call}`
+    : state.vision && state.can_talk
+    ? "plain words -- anything outside the vocabulary is refused"
     : state.vision
-    ? "plain words -- \"Komm zu mir\". Anything outside the vocabulary is refused."
+    ? "no language model (--no-llm): the buttons above still work"
     : "no camera: only stop can be asked for (start teach with --vision for the rest)";
   const note = $("behaviour-note");
   if (behaviour.active) {
@@ -1125,7 +1140,8 @@ function renderAttitude() {
   const sign = (v) => (v >= 0 ? "+" : "") + v.toFixed(1);
   note.textContent =
     `body: pitch ${sign(a.pitch)} deg, roll ${sign(a.roll)} deg, ` +
-    `turned ${sign(a.turned)} deg -- ${a.still ? "still" : "moving"}`;
+    `turned ${sign(a.turned)} deg -- ${a.still ? "still" : "moving"}` +
+    (a.loop_max_ms ? ` -- loop max ${a.loop_max_ms} ms` : "");
 }
 
 function renderPad(seq) {
@@ -1380,6 +1396,8 @@ function sendSaid() {
   });
 }
 $("say-send").addEventListener("click", sendSaid);
+$("btn-come").addEventListener("click", () =>
+  api("behaviour", {name: "come_to_me", target: "person"}).then(render));
 $("say-text").addEventListener("keydown", (event) => {
   // Enter sends; Escape is the global stop and must not be swallowed here.
   if (event.key === "Enter") { event.preventDefault(); sendSaid(); }

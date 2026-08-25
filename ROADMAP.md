@@ -217,6 +217,12 @@ commands plus an on-device safety net.
   page says it is remembering rather than reading.
 - Active telemetry: battery voltage and the **full** IMU (the stock firmware
   reads only 2 of the ICM20948's 9 axes) → `TELEMETRY`.
+  ✅ **IMU done 2026-08-24/25** (all nine axes at 10 Hz into a ring buffer,
+  batched over both transports, attitude on the host -- see M8's notes and
+  ASSUMPTIONS G9-G13). ✅ **voltage/current over serial 2026-08-25**: the
+  vendor measures both every pass and showed them only on the OLED;
+  `{"var":"vol"}` now answers with JSON. First use: exonerating the battery
+  (7.44 V) while chasing the F7 resets. Wi-Fi transport for it still open.
   ✅ **the IMU, written 2026-08-23, not yet flashed.** All nine axes: the fork
   configures the gyroscope and magnetometer the vendor leaves untouched, and
   samples accelerometer and gyroscope at 50 Hz from `loop()` -- the only place
