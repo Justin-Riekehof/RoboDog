@@ -8,6 +8,8 @@ moves time and nothing waits on a wall clock.
 
 from __future__ import annotations
 
+import itertools
+
 import pytest
 
 from robodog.api.client import RobotClient
@@ -192,82 +194,83 @@ def test_nothing_ever_walks_and_turns_at_once() -> None:
     assert all(not (d.forward != 0 and d.turn != 0) for d in scenarios)
 
 
-# --- aligning: closed-loop on the gyro --------------------------------------
+# --- aligning: one short pulse, then walk ------------------------------------
+#
+# The operator's second correction from the robot (2026-08-25 evening): a
+# turn-until-centred loop can NEVER settle when one control tick covers more
+# degrees than the tolerance itself, so the robot faced the person forever
+# without approaching. Now alignment is a single bounded nudge toward the
+# remembered bearing, and walking follows regardless; the next check corrects.
 
 
-def test_alignment_stops_when_the_gyro_says_so() -> None:
-    """Bearing +0.6 of a 65 deg lens is +19.5 deg. The turn must end when
-    `turned` has covered that, not when a timer guesses it has."""
+def test_an_align_pulse_is_followed_by_walking_not_by_another_look() -> None:
+    """The heart of the fix: remember the direction, nudge once, then GO."""
     machine = ComeToMe(config=instant())
-    assert look_at(machine, person(0.6, 0.2), 0.0, turned=0.0).drive == Drive(0, 1)
-    turned, t = 0.0, 0.0
-    while machine.state is BehaviourState.ALIGNING and t < 4.0:
-        t += 0.2
-        turned += 5.0  # a fresh gyro reading per tick, mid-turn
-        intent = machine.update([], t, 0.0, turned)
-    assert machine.state is BehaviourState.LOOKING
-    assert intent.drive == Drive(0, 0)
-    # 19.5 deg wanted, 7 deg tolerance: it must stop by 20 deg turned, not
-    # sail on to the 30+ the old blind burst would have covered.
-    assert turned <= 20.0
+    assert look_at(machine, person(0.6, 0.2), 0.0).state is BehaviourState.ALIGNING
+    intent = machine.update([], 0.25)  # pulse cap (0.2 s) over
+    assert intent.state is BehaviourState.ADVANCING
+    assert intent.drive == Drive(1, 0)
 
 
-def test_alignment_survives_an_overshoot_reading() -> None:
-    """One coarse gyro sample can jump past the target; the sign of the
-    remaining angle, not its size, ends the turn."""
+def test_the_pulse_is_capped_however_large_the_bearing() -> None:
+    """The operator's "kleinere Schritte": at most align_max_pulse of turning
+    per cycle, whatever the bearing asked for."""
+    machine = ComeToMe(config=instant())
+    look_at(machine, person(0.9, 0.2), 0.0)  # ~29 deg wanted
+    still_turning = machine.update([], 0.19)
+    assert still_turning.state is BehaviourState.ALIGNING
+    after_cap = machine.update([], 0.21)
+    assert after_cap.state is not BehaviourState.ALIGNING
+
+
+def test_the_gyro_can_only_shorten_the_pulse() -> None:
+    """With the gyro reporting, a covered bearing ends the nudge early --
+    but silence never extends it past the timed cap."""
+    machine = ComeToMe(config=instant())
+    look_at(machine, person(0.35, 0.2), 0.0, turned=0.0)  # ~11.4 deg wanted
+    # One coarse reading says the turn already covered it: stop now.
+    intent = machine.update([], 0.05, 0.0, 11.0)
+    assert intent.state is BehaviourState.ADVANCING
+    machine = ComeToMe(config=instant())
+    look_at(machine, person(0.35, 0.2), 0.0, turned=0.0)
+    # The gyro goes quiet: the timed cap still bounds the pulse.
+    assert machine.update([], 0.1, 0.0, None).state is BehaviourState.ALIGNING
+    assert machine.update([], 0.25, 0.0, None).state is BehaviourState.ADVANCING
+
+
+def test_an_overshoot_reading_ends_the_pulse_and_walks() -> None:
     machine = ComeToMe(config=instant())
     look_at(machine, person(0.6, 0.2), 0.0, turned=0.0)
-    intent = machine.update([], 0.5, 0.0, 35.0)  # way past the ~19.5 target
-    assert machine.state is BehaviourState.LOOKING
-    assert intent.drive == Drive(0, 0)
+    intent = machine.update([], 0.05, 0.0, 35.0)  # sailed past the ~19.5 target
+    assert intent.state is BehaviourState.ADVANCING
 
 
-def test_a_gyro_that_goes_quiet_ends_the_turn_rather_than_dead_reckoning() -> None:
+def test_a_very_large_bearing_earns_a_second_look_instead_of_a_blind_walk() -> None:
+    """Above align_only_above_deg walking would carry the robot past the
+    person; the pulse is followed by another look, and the NEXT cycle walks."""
+    wide = person(0.95, 0.2)  # ~31 deg of bearing
+    machine = ComeToMe(config=instant(align_only_above_deg=25.0))
+    assert look_at(machine, wide, 0.0).state is BehaviourState.ALIGNING
+    intent = machine.update([], 0.25)
+    assert intent.state is BehaviourState.LOOKING
+
+
+def test_no_two_nudges_without_a_walk_between_at_moderate_bearings() -> None:
+    """The ping-pong that kept the robot 'focusing' is structurally gone:
+    within the walk gate, ALIGNING can never be followed by ALIGNING without
+    an ADVANCING in between."""
     machine = ComeToMe(config=instant())
-    look_at(machine, person(0.6, 0.2), 0.0, turned=0.0)
-    intent = machine.update([], 0.4, 0.0, None)
-    assert machine.state is BehaviourState.LOOKING
-    assert intent.drive == Drive(0, 0)
-
-
-def test_without_a_gyro_alignment_is_a_short_timed_pulse() -> None:
-    """Mock and sim have no IMU. The fallback turns for |bearing|/rate, capped,
-    then looks again -- iterative, bounded, honest."""
-    machine = ComeToMe(config=instant())
-    intent = look_at(machine, person(0.6, 0.2), 0.0)  # no turned anywhere
-    assert intent.state is BehaviourState.ALIGNING
-    # The pulse may not exceed the cap, however large the bearing.
-    assert machine.update([], ApproachConfig().align_max_pulse + 0.01, 0.0).state is (
-        BehaviourState.LOOKING
-    )
-
-
-def test_the_timed_pulse_respects_the_measured_asymmetry() -> None:
-    """Left turns 2.4x faster than right on this robot (G4/F1), so the same
-    bearing needs a shorter pulse to the left."""
-    config = instant()
-    to_deg = config.hfov_deg / 2.0
-    bearing = 10.0 / to_deg  # exactly 10 degrees, either side
-
-    def pulse_length(sign: float) -> float:
-        machine = ComeToMe(config=instant())
-        look_at(machine, person(sign * bearing, 0.2), 0.0)
-        t = 0.0
-        while machine.state is BehaviourState.ALIGNING:
-            t += 0.05
-            machine.update([], t, 0.0)
-        return t
-
-    assert pulse_length(-1.0) < pulse_length(+1.0)
-
-
-def test_alignment_never_outlives_its_timeout() -> None:
-    machine = ComeToMe(config=instant(align_timeout=1.0))
-    look_at(machine, person(0.9, 0.2), 0.0, turned=0.0)
-    # The gyro reports but never moves -- a robot stuck against a wall.
-    intent = machine.update([], 1.2, 0.0, 0.0)
-    assert machine.state is BehaviourState.LOOKING
-    assert intent.drive == Drive(0, 0)
+    states = []
+    bearing = 0.5
+    for i in range(60):
+        seen = [person(bearing, 0.25)] if i % 4 == 0 else []
+        intent = machine.update(seen, 0.15 * i, 0.0, None)
+        states.append(intent.state)
+    for a, b in itertools.pairwise(states):
+        if a is BehaviourState.ALIGNING and b is not BehaviourState.ALIGNING:
+            assert b in (BehaviourState.ADVANCING, BehaviourState.ARRIVED), (
+                f"a nudge must lead to walking, went to {b}"
+            )
 
 
 # --- advancing: straight, bounded, watched ----------------------------------

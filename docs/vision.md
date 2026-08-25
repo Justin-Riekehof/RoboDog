@@ -120,12 +120,14 @@ search that had to start over. Hence three rules, each pinned by tests:
 1. **Nothing ever walks and turns at once.** Turning happens standing, walking
    happens dead straight. The steering bands, their hysteresis and the whole
    walk-while-correcting mode are gone.
-2. **Blind rotation is closed-loop on the gyro.** A look yields a bearing; the
-   turn runs until `turned` has covered it (±7 deg) -- not until a timer
-   guesses it has. Overshoot in a single coarse reading ends the turn; a gyro
-   that goes silent ends it too, because steering by a remembered angle is
-   dead reckoning wearing a sensor's badge. Without any IMU (mock, sim) the
-   fallback is short timed pulses at the measured, asymmetric rates.
+2. **Rotation is one short nudge, then walking -- never turn-until-centred.**
+   A real control tick (HTTP plus the IMU poll) covers more degrees of turn
+   than any sane tolerance, so a centring loop ping-pongs past the target
+   forever while the robot "focuses" without approaching. Instead the bearing
+   is remembered, at most one 0.2 s pulse is spent on it (the gyro can only
+   END the pulse early -- covered or overshot), and the robot walks
+   regardless; the next check corrects. Only bearings past 35 deg earn a
+   second look before walking.
 3. **Blind advance is a bounded burst.** At most `walk_burst_seconds` (1.2 s,
    ~11 cm) between looks -- the "regularly check" half of the design -- and
    the gyro aborts the burst early if the heading drifts (the robot veers

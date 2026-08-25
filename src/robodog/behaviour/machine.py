@@ -266,16 +266,25 @@ class ApproachConfig:
     # degrees the gyro must see. Same assumption family as G2's vertical FOV.
     hfov_deg: float = 65.0
     # --- aligning ---------------------------------------------------------
-    # Close enough: within this of the target heading the turn ends. Half a
-    # metre out, 7 deg of bearing error is ~6 cm of lateral miss -- the next
-    # look absorbs it.
-    align_tolerance_deg: float = 7.0
-    # The whole alignment, gyro-guided or not, may take at most this long.
-    align_timeout: float = 5.0
-    # Without a gyro (mock/sim, or firmware without the IMU) alignment falls
-    # back to timed pulses: turn for |bearing| / rate, capped here, then look
-    # again. Iterative and slow, and honest about it.
-    align_max_pulse: float = 0.4
+    # The regime here changed twice on the robot, and the second lesson is
+    # the operator's (2026-08-25 evening): DO NOT centre before walking. A
+    # control tick on the real link is 0.2-0.3 s (HTTP plus the IMU poll),
+    # which at 42.7 deg/s of left turn is 8-13 deg per tick -- more than any
+    # sane tolerance, so a turn-until-centred loop ping-pongs past the target
+    # forever and the robot "focuses" without ever advancing. Instead:
+    # remember the direction, spend AT MOST ONE short pulse on it, then walk;
+    # the next check corrects. Walking 1.2 s with 15 deg of bearing error is
+    # ~3 cm of lateral miss -- noise against an 11 cm stride.
+    #
+    # No turn at all below this bearing:
+    align_tolerance_deg: float = 10.0
+    # One pulse is at most this long -- at the measured rates that is ~8.5 deg
+    # of left turn or ~3.6 deg of right, the operator's "kleinere Schritte":
+    align_max_pulse: float = 0.2
+    # Above this bearing walking would carry the robot PAST the person, so the
+    # pulse is followed by another look instead of a burst. Between tolerance
+    # and here: pulse, then walk regardless.
+    align_only_above_deg: float = 35.0
     # The measured turn rates (G4, on the stand -- revise after a floor
     # measurement). Asymmetric because the robot is (F1): left is 2.4x right.
     turn_rate_left_dps: float = 42.7
@@ -296,8 +305,9 @@ class ApproachConfig:
     # burst. The detector answers several times a second while the robot
     # stands; deciding on the very first frame would make the smoothing above
     # decorative -- one jittery box centre would steer the whole alignment
-    # (G7). Zero decides immediately (tests use that).
-    look_settle_seconds: float = 0.35
+    # (G7). Raised from 0.35 on the operator's instruction: longer evaluation
+    # pauses, smaller turns. Zero decides immediately (tests use that).
+    look_settle_seconds: float = 0.6
     # How long a look waits for the camera before concluding the target is
     # gone. Covers the stream restarting after a stop (~1 s) plus a detector
     # pass; the blind-walk bound is walk_burst_seconds, not this.
@@ -340,8 +350,10 @@ class ApproachConfig:
             raise ValueError("confidences must satisfy 0 < keep <= acquire <= 1")
         if not 20.0 <= self.hfov_deg <= 120.0:
             raise ValueError(f"hfov_deg {self.hfov_deg} is not a plausible lens")
-        if self.align_tolerance_deg <= 0 or self.align_timeout <= 0:
-            raise ValueError("alignment needs positive tolerance and timeout")
+        if self.align_tolerance_deg <= 0 or self.align_max_pulse <= 0:
+            raise ValueError("alignment needs a positive tolerance and pulse")
+        if self.align_only_above_deg <= self.align_tolerance_deg:
+            raise ValueError("align_only_above_deg must exceed align_tolerance_deg")
         if self.turn_rate_left_dps <= 0 or self.turn_rate_right_dps <= 0:
             raise ValueError("turn rates must be positive")
         if not 0.0 <= self.look_settle_seconds <= 2.0:
@@ -418,6 +430,7 @@ class ComeToMe:
     _align_dir: int = 0
     _align_target_deg: float | None = None
     _align_pulse_until: float | None = None
+    _align_walk_after: bool = True
     _last_turned: float | None = None
     _walk_since: float | None = None
     _walk_heading_ref: float | None = None
@@ -558,25 +571,32 @@ class ComeToMe:
     # --- aligning ---------------------------------------------------------
 
     def _enter_align(self, bearing_deg: float, now: float, target: Detection) -> Intent:
+        """One short pulse towards the remembered bearing -- never a loop.
+
+        The pulse is timed (|bearing| / measured rate, hard-capped) and the
+        gyro, when it reports, only ever ends it EARLIER -- covered or
+        overshot. What follows is decided now, from the bearing that started
+        it: a moderate bearing walks regardless afterwards, because refusing
+        to walk until centred is how the robot ends up facing the person
+        forever without approaching them (seen on the robot, 2026-08-25).
+        """
         config = self.config
         self.state = BehaviourState.ALIGNING
         self._align_since = now
         self._align_dir = 1 if bearing_deg > 0 else -1
-        if self._last_turned is not None:
-            self._align_target_deg = self._last_turned + bearing_deg
-            self._align_pulse_until = None
-            how = "gyro"
-        else:
-            rate = config.turn_rate_right_dps if bearing_deg > 0 else config.turn_rate_left_dps
-            self._align_target_deg = None
-            self._align_pulse_until = now + min(abs(bearing_deg) / rate, config.align_max_pulse)
-            how = "timed pulse"
-        self.reason = f"aligning {bearing_deg:+.0f} deg ({how})"
+        self._align_walk_after = abs(bearing_deg) <= config.align_only_above_deg
+        rate = config.turn_rate_right_dps if bearing_deg > 0 else config.turn_rate_left_dps
+        self._align_pulse_until = now + min(abs(bearing_deg) / rate, config.align_max_pulse)
+        self._align_target_deg = (
+            self._last_turned + bearing_deg if self._last_turned is not None else None
+        )
+        self.reason = f"nudging {bearing_deg:+.0f} deg"
         return Intent(Drive(0, self._align_dir), self.state, self.reason, target)
 
     def _align_tick(self, target: Detection | None, now: float, pitch_deg: float) -> Intent:
         config = self.config
         assert self._align_since is not None
+        assert self._align_pulse_until is not None
         if target is not None:
             # Continuous vision only (a gated stream is dark while turning):
             # someone who walked up to the robot mid-align is an arrival, not
@@ -585,24 +605,17 @@ class ComeToMe:
             self._register_sighting(target, size, now)
             if size >= config.stop_height_fraction:
                 return self._confirm_arrival(size, now, target)
-        if now - self._align_since >= config.align_timeout:
-            return self._enter_look(now, "alignment timed out -- looking")
-        if self._align_target_deg is not None:
-            if not self._turned_fresh:
-                # The gyro fell silent mid-turn; steering on by the remembered
-                # angle would be dead reckoning wearing a sensor's badge, and
-                # the overshoot this design exists to end.
-                return self._enter_look(now, "gyro went quiet -- looking")
+        done = now >= self._align_pulse_until
+        if not done and self._align_target_deg is not None and self._turned_fresh:
             assert self._last_turned is not None
             remaining = self._align_target_deg - self._last_turned
-            if self._align_dir * remaining <= config.align_tolerance_deg:
-                return self._enter_look(now, "aligned -- looking")
-            self.reason = f"aligning, {abs(remaining):.0f} deg to go"
-            return Intent(Drive(0, self._align_dir), self.state, self.reason)
-        assert self._align_pulse_until is not None
-        if now >= self._align_pulse_until:
-            return self._enter_look(now, "align pulse done -- looking")
-        self.reason = "aligning (timed pulse)"
+            # The gyro can only shorten the pulse: covered, or overshot.
+            done = self._align_dir * remaining <= config.align_tolerance_deg
+        if done:
+            if self._align_walk_after:
+                return self._enter_advance(now, target)
+            return self._enter_look(now, "big turn done -- looking again")
+        self.reason = "nudging towards them"
         return Intent(Drive(0, self._align_dir), self.state, self.reason)
 
     def _enter_look(self, now: float, reason: str) -> Intent:
