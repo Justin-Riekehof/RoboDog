@@ -136,8 +136,11 @@ def instant(**overrides: object) -> ApproachConfig:
 
     The settle dwell exists so several frames feed the smoothed bearing before
     anything moves (G7); unit tests that probe the decision itself set it to
-    zero and probe the dwell separately.
+    zero and probe the dwell separately. The size stop is likewise re-enabled:
+    the shipped default walks until even the kneeling look goes blind, and the
+    tests for THAT regime construct it explicitly.
     """
+    overrides.setdefault("approach_until_blind", False)
     return ApproachConfig(look_settle_seconds=0.0, **overrides)  # type: ignore[arg-type]
 
 
@@ -356,7 +359,7 @@ def test_the_whole_run_is_bounded_by_a_timeout() -> None:
 
 
 def test_a_finished_run_stays_finished() -> None:
-    machine = ComeToMe()
+    machine = ComeToMe(config=instant())
     machine.update([person(0.0, 0.9)], 0.0)
     machine.update([person(0.0, 0.9)], 0.5)
     assert machine.state is BehaviourState.ARRIVED
@@ -419,7 +422,11 @@ def make_runner(
 
     runner = BehaviourRunner(
         client,
-        ComeToMe(config=config if config is not None else ApproachConfig(look_settle_seconds=0.0)),
+        ComeToMe(
+            config=config
+            if config is not None
+            else ApproachConfig(look_settle_seconds=0.0, approach_until_blind=False)
+        ),
         detections=detections,
         clock=clock,
         # Sleeping IS how time passes here: the loop paces itself, and the fake
@@ -580,7 +587,7 @@ def test_the_bearing_is_smoothed_while_looking() -> None:
 
 
 def test_arrival_is_never_delayed_by_the_smoothing() -> None:
-    machine = ComeToMe(config=ApproachConfig(bearing_tau=2.0, stop_confirm_seconds=0.0))
+    machine = ComeToMe(config=instant(bearing_tau=2.0, stop_confirm_seconds=0.0))
     machine.update([person(-0.8, 0.2)], 0.0)
     intent = machine.update([person(-0.8, 0.95)], 0.1)
     assert intent.state is BehaviourState.ARRIVED
@@ -596,7 +603,7 @@ def test_the_search_is_long_enough_to_turn_all_the_way_round() -> None:
 
 def test_a_single_frame_at_the_stop_size_does_not_end_the_run() -> None:
     """One frame is not evidence: a walking body pitches (G2/G10)."""
-    machine = ComeToMe()
+    machine = ComeToMe(config=ApproachConfig(approach_until_blind=False))
     big = person(0.0, 0.95)
     first = machine.update([big], 0.0)
     assert first.state is BehaviourState.LOOKING
@@ -615,7 +622,7 @@ def test_a_spike_that_does_not_hold_leaves_the_run_going() -> None:
 
 
 def test_confirmation_can_be_switched_off() -> None:
-    machine = ComeToMe(config=ApproachConfig(stop_confirm_seconds=0.0))
+    machine = ComeToMe(config=instant(stop_confirm_seconds=0.0))
     assert machine.update([person(0.0, 0.95)], 0.0).state is BehaviourState.ARRIVED
 
 
@@ -626,7 +633,9 @@ def test_stop_and_look_advances_and_arrives_with_a_gated_stream() -> None:
     """The full rhythm against the firmware's stream gate: detections exist
     only while the previous intent left the robot standing, and the approach
     still closes -- as walk-bursts strung between looks, never steering."""
-    machine = ComeToMe(config=ApproachConfig(walk_burst_seconds=0.8, look_patience=1.5))
+    machine = ComeToMe(
+        config=ApproachConfig(walk_burst_seconds=0.8, look_patience=1.5, approach_until_blind=False)
+    )
     now, size = 0.0, 0.25
     walked = looks = 0
     arrived = None
@@ -684,7 +693,7 @@ def test_a_silent_peek_still_arrives_but_says_what_it_did_not_see() -> None:
     machine.update([], 1.2)
     intent = machine.update([], 2.5)
     assert intent.state is BehaviourState.ARRIVED
-    assert "looking up found nothing" in intent.reason
+    assert "kneeling look lost" in intent.reason
 
 
 def test_a_person_who_stepped_back_ends_the_peek_and_resumes() -> None:
@@ -739,13 +748,11 @@ def test_the_runner_translates_the_stance_into_leg_targets() -> None:
     )
     report = runner.run()
     assert report.state is BehaviourState.ARRIVED
-    assert len(backend.poses) == 8, "kneel down (4 legs) and stand back up (4 legs)"
-    peek = dict(backend.poses[:4])
-    # Nose up: front legs reach further down than the hind legs.
+    assert len(backend.poses) == 4, "one kneel, and it stays kneeling at the end"
+    peek = dict(backend.poses)
+    # Nose up: front legs reach further down than the hind legs -- and the
+    # run ends in this stance, looking up from the person's feet.
     assert peek[LegId.FRONT_LEFT].y > peek[LegId.HIND_LEFT].y
-    # And a peek that saw nobody ends standing, not stuck kneeling.
-    stand = dict(backend.poses[4:])
-    assert stand[LegId.FRONT_LEFT].y == stand[LegId.HIND_LEFT].y
 
 
 def test_the_peek_pose_fits_the_workspace_with_margin() -> None:
@@ -857,9 +864,55 @@ def test_the_runner_rekneels_after_every_walk_burst() -> None:
     script: list[list[Detection]] = [[person(0.0, config.stop_height_fraction - 0.02)]]
     script += [[]] * 40  # burst, empty looks, close loss -> kneel (batch 1)
     script += [[clipped(0.60)]]  # found while peeking: press on
-    script += [[]] * 40  # walk burst wipes the stance, next halt re-kneels (2)
-    script += [[clipped(0.75)]]  # big enough: visual arrival
+    script += [[clipped(0.60)]]  # the kneeling look decides: walk again
+    script += [[]] * 20  # burst wipes the stance; the next halt re-kneels (2)
+    script += [[clipped(0.75)]]  # big enough: visual arrival, still kneeling
     runner, _client, _backend, _clock = make_runner(script, config=config, backend=backend)
     report = runner.run()
     assert report.state is BehaviourState.ARRIVED
     assert backend.pose_batches >= 2, "the tilt must be re-applied after walking"
+
+
+# --- the default terminal: come all the way in --------------------------------
+
+
+def test_the_default_walks_past_the_stop_size() -> None:
+    """The operator's definition of done: by default the robot keeps coming
+    until even the kneeling look no longer finds a person -- a size threshold
+    stopping it half a metre out is exactly what was reported and removed."""
+    machine = ComeToMe(config=ApproachConfig(look_settle_seconds=0.0))
+    intent = machine.update([person(0.0, 0.9)], 0.0)
+    assert intent.state is BehaviourState.ADVANCING, "0.9 of frame and still walking"
+    assert intent.drive == Drive(1, 0)
+
+
+def test_the_default_terminal_is_the_blind_kneeling_look() -> None:
+    config = ApproachConfig(
+        look_settle_seconds=0.0, look_patience=0.4, walk_burst_seconds=0.3, peek_seconds=0.8
+    )
+    machine = ComeToMe(config=config)
+    machine.update([person(0.0, 0.9)], 0.0)  # walking, size stop inert
+    machine.update([], 0.5)  # burst over -> looking
+    machine.update([], 1.0)  # patience over, was close -> kneel
+    assert machine.state is BehaviourState.PEEKING
+    intent = machine.update([], 2.0)  # even kneeling sees nobody: done
+    assert intent.state is BehaviourState.ARRIVED
+    assert "kneeling look lost" in intent.reason
+    assert intent.stance == "peek", "it ends at the person's feet, looking up"
+
+
+def test_an_explicit_distance_restores_the_size_stop() -> None:
+    """'Bleib zwei Meter weg' must still mean exactly that."""
+    call = validate_call("come_to_me", {"stop_distance_mm": 2000})
+    config = approach_config(call)
+    assert config.approach_until_blind is False
+    machine = ComeToMe(
+        config=ApproachConfig(
+            look_settle_seconds=0.0,
+            stop_confirm_seconds=0.0,
+            approach_until_blind=False,
+            stop_height_fraction=config.stop_height_fraction,
+        )
+    )
+    big = person(0.0, config.stop_height_fraction + 0.05)
+    assert machine.update([big], 0.0).state is BehaviourState.ARRIVED

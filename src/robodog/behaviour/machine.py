@@ -250,6 +250,13 @@ class ApproachConfig:
 
     target: str = "person"
     stop_height_fraction: float = STOP_HEIGHT_DEFAULT
+    # The operator's definition of done (2026-08-25): by default "Komm zu
+    # mir" means COME ALL THE WAY -- approach until even the kneeling,
+    # camera-up look no longer finds a person. The size threshold then never
+    # declares arrival; it only shapes the close band (lost_close_height) and
+    # the kneel trigger. An explicit requested distance ("bleib 2 Meter weg")
+    # flips this off and the size stop applies, ceiling-clamped as ever.
+    approach_until_blind: bool = True
     # Two confidences, not one: a target already being approached is kept on
     # weaker evidence than an unknown one is acquired on. Walking towards a
     # person fills the frame with a fraction of them, and a fraction scores
@@ -512,14 +519,14 @@ class ComeToMe:
                     f"arrived: lost sight of the {config.target} at "
                     f"{self._last_height * 100:.0f}% of the frame -- too close to see it whole"
                 )
-                return Intent(Drive(0, 0), self.state, self.reason)
+                return Intent(Drive(0, 0), self.state, self.reason, stance=self._stand_stance())
             # ... and far-loss is a search.
             return self._enter_search(now)
 
         size = level_height_fraction(target, pitch_deg)
         smoothed = self._smooth(target.bearing, now)
         self._register_sighting(target, size, now)
-        if size >= config.stop_height_fraction:
+        if not config.approach_until_blind and size >= config.stop_height_fraction:
             return self._confirm_arrival(size, now, target)
         self._big_since = None
 
@@ -603,7 +610,7 @@ class ComeToMe:
             # an alignment problem.
             size = level_height_fraction(target, pitch_deg)
             self._register_sighting(target, size, now)
-            if size >= config.stop_height_fraction:
+            if not config.approach_until_blind and size >= config.stop_height_fraction:
                 return self._confirm_arrival(size, now, target)
         done = now >= self._align_pulse_until
         if not done and self._align_target_deg is not None and self._turned_fresh:
@@ -658,7 +665,7 @@ class ComeToMe:
             # early on what the camera says, but it never steers.
             size = level_height_fraction(target, pitch_deg)
             self._register_sighting(target, size, now)
-            if size >= config.stop_height_fraction:
+            if not config.approach_until_blind and size >= config.stop_height_fraction:
                 return self._confirm_arrival(size, now, target)
             if abs(self._last_bearing_deg) >= config.realign_bearing_deg:
                 return self._enter_look(now, "target off centre -- stopping to look")
@@ -685,7 +692,7 @@ class ComeToMe:
             # that made the sighting possible.
             size = level_height_fraction(target, pitch_deg)
             self._register_sighting(target, size, now)
-            if size >= config.stop_height_fraction:
+            if not config.approach_until_blind and size >= config.stop_height_fraction:
                 self.state = BehaviourState.ARRIVED
                 self.reason = (
                     f"arrived: looked up and found the {config.target} "
@@ -704,12 +711,15 @@ class ComeToMe:
         if now - self._peek_since >= config.peek_seconds:
             # Looked up, saw nobody. The close-loss heuristic stands, minus
             # its confidence: say what was and was not seen.
+            # The default run's terminal: it came until even the kneeling
+            # look sees nobody -- which at this range means it is standing at
+            # the person's feet. It stays kneeling, looking up.
             self.state = BehaviourState.ARRIVED
             self.reason = (
-                f"arrived: lost the {config.target} at "
-                f"{self._last_height * 100:.0f}% of the frame; looking up found nothing"
+                f"arrived: came in until even the kneeling look lost the "
+                f"{config.target} (last seen at {self._last_height * 100:.0f}%)"
             )
-            return Intent(Drive(0, 0), self.state, self.reason)
+            return Intent(Drive(0, 0), self.state, self.reason, stance="peek")
         self.reason = "peeking up"
         return Intent(Drive(0, 0), self.state, self.reason, stance="peek")
 

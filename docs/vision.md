@@ -166,6 +166,17 @@ is not decoration).
 On top of that the ordinary teach-UI safety applies unchanged: STOP button,
 Escape, the page's dead-man's switch, the on-device watchdog.
 
+### The default run has no stop distance at all
+
+"Komm zu mir" without a distance means *come all the way*: the robot
+approaches until even the kneeling, camera-up look no longer finds a person
+-- which at that range means it is standing at your feet -- and it ends
+there, kneeling, looking up. The operator defined this terminal after the
+uncalibrated size threshold halted a run half a metre out. A run WITH a
+distance ("bleib zwei Meter weg") keeps the size stop, ceiling-clamped as
+ever. What bounds the default run instead: 11 cm bursts with a look between
+each, a stop on any loss of sight, and the 60 s timeout.
+
 ### Distance is a guess, and the stop does not depend on it
 
 The only distance cue is how much of the frame's height the box fills, so the
