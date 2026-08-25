@@ -27,6 +27,8 @@
 //    <SWITCH>
 extern IPAddress IP_ADDRESS = (0, 0, 0, 0);
 extern byte WIFI_MODE = 0; // select WIFI_MODE in app_httpd.cpp
+// RoboDog: loopTask handle, so the prio command can reach it from other tasks.
+TaskHandle_t ROBODOG_LOOP_TASK = NULL;
 extern void getWifiStatus();
 extern int WIFI_RSSI = 0;
 
@@ -396,6 +398,14 @@ void serialCtrl(){
         robodogApply();
       }
 
+      // Gait priority, live. {"var":"prio","val":1..12} -- see setup().
+      else if(docReceive["var"] == "prio"){
+        if(ROBODOG_LOOP_TASK != NULL && val >= 1 && val <= 12){
+          vTaskPrioritySet(ROBODOG_LOOP_TASK, val);
+          Serial.print("prio:");Serial.println(val);
+        }
+      }
+
       // Battery voltage and current, as one JSON line. The vendor measures
       // both every pass (INA219, allDataUpdate) and then shows them only on
       // the OLED -- jsonSend() would have exported them but is never called.
@@ -728,7 +738,17 @@ void setup() {
   // of its time on the servo bus is most of the time -- and in core 0's
   // leftovers beside Wi-Fi. The stream loses frames under load; the walk
   // does not lose steps. That is the right direction for a robot.
+  ROBODOG_LOOP_TASK = xTaskGetCurrentTaskHandle();
   vTaskPrioritySet(NULL, 7);
+  //
+  // 7 beat the httpd tasks and the walk stayed sluggish anyway (2026-08-25),
+  // which points one level up: this core generation's camera driver runs its
+  // DMA task at priority 10, PINNED to this core. So the priority is also a
+  // runtime knob -- {"var":"prio"} on both transports -- because finding the
+  // rung that actually clears the ladder is a dose-response experiment, and
+  // an experiment per reflash is a bad afternoon. Clamped to 1..12: above 12
+  // sit the system's own tasks (esp_timer, tcpip, Wi-Fi), and a gait that
+  // outranked those would take the radio down with every step.
   // === end RoboDog ==========================================================
 
   // RGB LEDs on.

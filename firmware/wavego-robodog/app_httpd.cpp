@@ -72,6 +72,8 @@ extern void robodogCameraReport();
 extern int robodogCameraJson(char *out, size_t n);
 // RoboDog: how long the next pose should take, defined in WAVEGO.ino.
 extern void robodogApplyMs(int val);
+// RoboDog: loopTask handle, for the prio command (WAVEGO.ino).
+extern TaskHandle_t ROBODOG_LOOP_TASK;
 // RoboDog: the IMU ring, sampled in loop() and formatted here (InitConfig.h).
 extern int robodogImuJson(char *out, size_t n, uint32_t since);
 
@@ -359,6 +361,18 @@ static esp_err_t cmd_handler(httpd_req_t *req){
   // RoboDog: keep-alive that changes nothing else. The feed above did the work.
   else if (!strcmp(variable, "ping")){
   }
+
+  // === RoboDog: gait priority, live -- the dose-response knob ============
+  // See setup() in WAVEGO.ino for why this exists.
+  else if (!strcmp(variable, "prio")){
+    if (ROBODOG_LOOP_TASK != NULL && val >= 1 && val <= 12){
+      vTaskPrioritySet(ROBODOG_LOOP_TASK, val);
+      Serial.print("prio:");Serial.println(val);
+    } else {
+      res = -1;
+    }
+  }
+  // === end RoboDog =========================================================
 
   // === RoboDog: the IMU, buffered =========================================
   // `val` is the last sequence number the host already has; the reply carries
