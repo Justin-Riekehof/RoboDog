@@ -222,6 +222,8 @@ class Telemetry:
     """Degrees turned since the connection was made; positive to the right."""
     still: bool | None = None
     """True while the body is neither accelerating nor turning."""
+    loop_max_ms: int | None = None
+    """Worst gap between two firmware loop() passes this session (gait health)."""
 
 
 @dataclass(frozen=True, slots=True)

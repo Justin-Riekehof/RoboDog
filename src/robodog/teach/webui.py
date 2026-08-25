@@ -745,6 +745,10 @@ class TeachUIServer:
             "roll": round(telemetry.roll if telemetry.roll is not None else 0.0, 1),
             "turned": round(telemetry.turned if telemetry.turned is not None else 0.0, 1),
             "still": bool(telemetry.still),
+            # The gait-health number: worst firmware loop() gap this session.
+            # On the page rather than in a log, because the operator judging
+            # "the walk feels sluggish" and this number need to meet.
+            "loop_max_ms": telemetry.loop_max_ms,
         }
 
     def _manual_json(self) -> dict[str, Any]:

@@ -174,6 +174,10 @@ class HttpBackend:
         self.imu = AttitudeEstimator()
         self._imu_seq = 0
         self.imu_dropped = 0
+        # Worst firmware loop() gap seen this session. The firmware resets its
+        # counter on every read, so the running max lives here -- each poll
+        # hands over its window and the session keeps the worst of them.
+        self.imu_loop_max_ms = 0
         # When the last pose went out, so the next one can say how long it has.
         self._last_flush: float | None = None
         self._clock = clock
@@ -483,6 +487,7 @@ class HttpBackend:
             return None
         self._imu_seq = max(self._imu_seq, batch.last_seq)
         self.imu_dropped += batch.dropped
+        self.imu_loop_max_ms = max(self.imu_loop_max_ms, batch.loop_max_ms)
         self.imu.feed(batch.samples)
         return batch
 
@@ -721,6 +726,7 @@ class HttpBackend:
             roll=attitude.roll,
             turned=attitude.turned,
             still=attitude.still,
+            loop_max_ms=self.imu_loop_max_ms,
         )
 
     # --- safety ---

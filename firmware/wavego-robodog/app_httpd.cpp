@@ -74,6 +74,16 @@ extern int robodogCameraJson(char *out, size_t n);
 extern void robodogApplyMs(int val);
 // RoboDog: loopTask handle, for the prio command (WAVEGO.ino).
 extern TaskHandle_t ROBODOG_LOOP_TASK;
+// === RoboDog: stream frame-rate cap =======================================
+// Minimum ms between MJPEG frames; 200 = 5 fps. A held VGA stream otherwise
+// runs capture->send at full tilt, and the sluggish walk it causes survived
+// every task-priority experiment (1, 7 and 12 all felt the same, 2026-08-25)
+// -- so the damage is below the scheduler: per-line DMA interrupts and radio
+// airtime, neither of which a priority outranks. The only lever that reaches
+// both is doing less per second. Vision needs ~5 fps; nobody needs 20.
+// Runtime knob: var=fps, val = max frames/sec (0 = uncapped).
+static uint32_t ROBODOG_STREAM_MIN_MS = 200;
+// === end RoboDog ==========================================================
 // RoboDog: the IMU ring, sampled in loop() and formatted here (InitConfig.h).
 extern int robodogImuJson(char *out, size_t n, uint32_t since);
 
@@ -160,6 +170,16 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   }
  
   while (true) {
+    // === RoboDog: the frame-rate cap =====================================
+    // vTaskDelay rather than a busy check, so the wait itself yields the
+    // core and the radio.
+    if (ROBODOG_STREAM_MIN_MS > 0) {
+      int64_t since_ms = (esp_timer_get_time() - last_frame) / 1000;
+      if (since_ms < (int64_t)ROBODOG_STREAM_MIN_MS) {
+        vTaskDelay((ROBODOG_STREAM_MIN_MS - since_ms) / portTICK_PERIOD_MS);
+      }
+    }
+    // === end RoboDog ======================================================
     fb = esp_camera_fb_get();
     if (!fb) {
       // Serial.println("Camera capture failed");
@@ -361,6 +381,13 @@ static esp_err_t cmd_handler(httpd_req_t *req){
   // RoboDog: keep-alive that changes nothing else. The feed above did the work.
   else if (!strcmp(variable, "ping")){
   }
+
+  // === RoboDog: stream frame-rate cap, live ==============================
+  else if (!strcmp(variable, "fps")){
+    ROBODOG_STREAM_MIN_MS = (val > 0 && val <= 25) ? (1000 / val) : 0;
+    Serial.print("fps cap:");Serial.println(val);
+  }
+  // === end RoboDog =========================================================
 
   // === RoboDog: gait priority, live -- the dose-response knob ============
   // See setup() in WAVEGO.ino for why this exists.

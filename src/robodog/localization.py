@@ -292,6 +292,13 @@ class ImuBatch:
     rate: int = 0
     mag: tuple[float, float, float] | None = None
     temperature: float | None = None
+    loop_max_ms: int = 0
+    """Worst gap between two firmware loop() passes since the previous read.
+
+    The gait advances once per pass, so this number IS the gait's health --
+    and it is the one measurement that must travel over Wi-Fi, because
+    attaching a serial cable resets the robot and destroys it.
+    """
 
     @property
     def span(self) -> float:
@@ -336,6 +343,7 @@ def parse_imu_batch(payload: object) -> ImuBatch:
         except (TypeError, ValueError):
             mag = None
     temperature = payload.get("temp")
+    loop_max = payload.get("lmax")
     return ImuBatch(
         samples=tuple(samples),
         last_seq=int(payload.get("last", 0) or 0),
@@ -343,4 +351,5 @@ def parse_imu_batch(payload: object) -> ImuBatch:
         rate=int(payload.get("rate", 0) or 0),
         mag=mag,
         temperature=float(temperature) if isinstance(temperature, int | float) else None,
+        loop_max_ms=int(loop_max) if isinstance(loop_max, int | float) else 0,
     )

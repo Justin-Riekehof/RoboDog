@@ -281,7 +281,15 @@ def test_the_page_shows_what_the_imu_says(tmp_path: Path) -> None:
     url = server.start()
     try:
         attitude = state_of(url)["attitude"]
-        assert attitude == {"pitch": -3.5, "roll": 0.5, "turned": 91.0, "still": False}
+        assert attitude == {
+            "pitch": -3.5,
+            "roll": 0.5,
+            "turned": 91.0,
+            "still": False,
+            # None, not 0: this mock reports no loop health, and "no idea" must
+            # stay distinguishable from "perfect".
+            "loop_max_ms": None,
+        }
     finally:
         server.shutdown()
 

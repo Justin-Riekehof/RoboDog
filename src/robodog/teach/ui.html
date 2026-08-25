@@ -1125,7 +1125,8 @@ function renderAttitude() {
   const sign = (v) => (v >= 0 ? "+" : "") + v.toFixed(1);
   note.textContent =
     `body: pitch ${sign(a.pitch)} deg, roll ${sign(a.roll)} deg, ` +
-    `turned ${sign(a.turned)} deg -- ${a.still ? "still" : "moving"}`;
+    `turned ${sign(a.turned)} deg -- ${a.still ? "still" : "moving"}` +
+    (a.loop_max_ms ? ` -- loop max ${a.loop_max_ms} ms` : "");
 }
 
 function renderPad(seq) {
