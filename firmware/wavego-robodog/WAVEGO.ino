@@ -410,6 +410,24 @@ void serialCtrl(){
         else{Serial.println("{\"imu\":false}");}
       }
       // === end RoboDog ======================================================
+
+      // === RoboDog: drain trailing whitespace ==============================
+      // Or the NEXT pass stalls the robot for a full second:
+      // deserializeJson returns at the closing brace and
+      // leaves a sender's newline in the buffer; the next serialCtrl() sees
+      // Serial.available(), calls the parser on it, and ArduinoJson's stream
+      // reader BUSY-WAITS through Serial's 1000 ms timeout hoping a document
+      // follows -- on this task, which outranks loop(), so the gait and the
+      // IMU freeze for that second. Measured 2026-08-25: exactly one ~1045 ms
+      // sampling hole per newline-terminated command, zero without the
+      // newline. Only whitespace is drained, so a second queued command
+      // survives.
+      while (Serial.available() > 0){
+        int rdPeek = Serial.peek();
+        if (rdPeek=='\n' || rdPeek=='\r' || rdPeek==' ' || rdPeek=='\t'){ Serial.read(); }
+        else { break; }
+      }
+      // === end RoboDog ======================================================
     }
 
 
@@ -496,6 +514,21 @@ struct RobodogImuSample {
 };
 
 RobodogImuSample ROBODOG_IMU_RING[ROBODOG_IMU_SLOTS];
+// RoboDog: the longest gap between two loop() passes since the last imu
+// request, in ms. loop() is where the gait advances, so this number IS the
+// gait's health -- and it survives a session, so the next serial connection
+// can read what a Wi-Fi drive did to the loop after the fact. Reset on read.
+volatile uint32_t ROBODOG_LOOP_MAX_MS = 0;
+uint32_t ROBODOG_LOOP_PREV_MS = 0;
+
+void robodogLoopWatch(){
+  uint32_t now = millis();
+  if (ROBODOG_LOOP_PREV_MS != 0){
+    uint32_t gap = now - ROBODOG_LOOP_PREV_MS;
+    if (gap > ROBODOG_LOOP_MAX_MS){ ROBODOG_LOOP_MAX_MS = gap; }
+  }
+  ROBODOG_LOOP_PREV_MS = now;
+}
 // Sequence of the NEWEST sample written, counting from 1. The host sends back
 // the last one it saw, so nothing has to be acknowledged and a lost reply
 // simply gets the samples again on the next request.
@@ -540,6 +573,13 @@ void robodogImuInit(){
 
 // Called from loop() only. Rate-gated, so it costs one I2C burst per period
 // rather than one per pass.
+// The read half of the profiler: hand out the worst gap and start fresh.
+uint32_t robodogLoopMaxTake(){
+  uint32_t worst = ROBODOG_LOOP_MAX_MS;
+  ROBODOG_LOOP_MAX_MS = 0;
+  return worst;
+}
+
 void robodogImuSample(){
   uint32_t now = millis();
   if(now - ROBODOG_IMU_LAST_MS < ROBODOG_IMU_PERIOD_MS){return;}
@@ -584,9 +624,9 @@ extern int robodogImuJson(char *out, size_t n, uint32_t since){
   uint32_t dropped = (from > since + 1) ? (from - since - 1) : 0;
 
   int len = snprintf(out, n,
-    "{\"imu\":true,\"rate\":%d,\"seq\":%lu,\"dropped\":%lu,\"mag_ok\":%d,"
+    "{\"imu\":true,\"rate\":%d,\"lmax\":%lu,\"seq\":%lu,\"dropped\":%lu,\"mag_ok\":%d,"
     "\"mag\":[%.2f,%.2f,%.2f],\"mag_t\":%lu,\"temp\":%.1f,\"s\":[",
-    (int)(1000 / ROBODOG_IMU_PERIOD_MS), (unsigned long)newest,
+    (int)(1000 / ROBODOG_IMU_PERIOD_MS), (unsigned long)robodogLoopMaxTake(), (unsigned long)newest,
     (unsigned long)dropped, ROBODOG_MAG_OK ? 1 : 0,
     ROBODOG_MAG_X, ROBODOG_MAG_Y, ROBODOG_MAG_Z,
     (unsigned long)ROBODOG_MAG_T, ROBODOG_IMU_TEMP);
@@ -678,6 +718,7 @@ void loop() {
   allDataUpdate();
   wireDebugDetect();
   robodogRampStep();        // RoboDog: carry GoalPWM towards the staged pose
+  robodogLoopWatch();       // RoboDog: how long since the last pass -- gait health
   robodogImuSample();       // RoboDog: the only place the IMU is read (I2C rule)
   robodogWatchdogCheck();   // RoboDog: stop by ourselves if the host went away
 }
