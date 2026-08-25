@@ -161,6 +161,14 @@ class BehaviourRunner:
                 if intent.drive != last:
                     self._client.send(intent.drive)
                     last = intent.drive
+                if intent.drive.forward != 0 or intent.drive.turn != 0:
+                    # The gait owns the servos while the robot moves and
+                    # returns the legs to its own geometry, so whatever stance
+                    # was applied is gone the moment a drive lands. Booking it
+                    # as "stand" here is what makes the runner re-kneel at the
+                    # next standing tick instead of believing a pose the
+                    # firmware has already walked out of.
+                    self._stance = "stand"
                 self._client.heartbeat()
                 if on_update is not None:
                     on_update(intent)

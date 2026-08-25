@@ -763,3 +763,72 @@ def test_the_peek_pose_fits_the_workspace_with_margin() -> None:
         depth = leg_roll_and_depth(target)[1]
         margin = min(depth - limits.plane_depth_min, limits.plane_depth_max - depth)
         assert margin >= 1.0, f"only {margin:.1f} mm from the envelope edge"
+
+
+# --- the proactive look-up: near and top-clipped means kneel to look ---------
+
+
+def clipped(height: float, *, bearing: float = 0.0) -> Detection:
+    """A near person: box clipped by the top of the frame, as every close
+    sighting on this robot is (the camera rides a hand's width off the floor)."""
+    center = (bearing + 1.0) / 2.0
+    return Detection(
+        label="person",
+        confidence=0.9,
+        box=Box(left=center - 0.1, top=0.0, right=center + 0.1, bottom=height),
+    )
+
+
+def test_a_near_clipped_sighting_makes_the_standing_look_kneel() -> None:
+    """The report from the robot: it closed to ~1.5 m with the torso plainly
+    cut off at the frame edge and never tilted, because nothing had been lost
+    yet. Nearness itself is the trigger now, not loss."""
+    machine = ComeToMe(config=ApproachConfig())
+    intent = machine.update([clipped(0.55)], 0.0)
+    assert intent.state is BehaviourState.LOOKING
+    assert intent.stance == "peek"
+
+
+def test_a_far_or_unclipped_sighting_stands_tall() -> None:
+    machine = ComeToMe(config=ApproachConfig())
+    assert machine.update([clipped(0.2)], 0.0).stance == "stand"  # clipped but far
+    machine = ComeToMe(config=ApproachConfig())
+    assert machine.update([person(0.0, 0.5)], 0.0).stance == "stand"  # big but whole
+
+
+def test_nearness_has_hysteresis_on_the_way_out() -> None:
+    """A size flickering round the threshold must not bob the robot."""
+    machine = ComeToMe(config=ApproachConfig())
+    machine.update([clipped(0.50)], 0.0)  # near
+    assert machine.update([clipped(0.42)], 0.3).stance == "peek"  # inside the band
+    assert machine.update([clipped(0.30)], 0.6).stance == "stand"  # clearly out
+
+
+def test_the_runner_rekneels_after_every_walk_burst() -> None:
+    """The gait stands the robot back up whenever it moves; the runner must
+    know that and re-apply the tilt at the next halt, not believe a pose the
+    firmware has already walked out of."""
+
+    class PoseRecorder(MockBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.pose_batches = 0
+            self._legs_in_batch = 0
+
+        def send(self, command: Command) -> None:
+            if isinstance(command, SetLegTarget):
+                self._legs_in_batch += 1
+                if self._legs_in_batch == 4:
+                    self.pose_batches += 1
+                    self._legs_in_batch = 0
+            super().send(command)
+
+    backend = PoseRecorder()
+    config = instant(look_patience=0.3, walk_burst_seconds=0.2, stop_confirm_seconds=0.0)
+    # Near-clipped sightings around walk bursts: kneel, walk, kneel again.
+    script: list[list[Detection]] = [[clipped(0.5)]] + [[]] * 12 + [[clipped(0.55)]] + [[]] * 12
+    script += [[clipped(0.7)]]  # big enough to arrive
+    runner, _client, _backend, _clock = make_runner(script, config=config, backend=backend)
+    report = runner.run()
+    assert report.state is BehaviourState.ARRIVED
+    assert backend.pose_batches >= 2, "the tilt must be re-applied after walking"

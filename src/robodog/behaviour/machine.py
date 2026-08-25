@@ -324,6 +324,17 @@ class ApproachConfig:
     # How long the upward look waits for the person to reappear before
     # falling back to arrival-by-loss (G6), which was previously immediate.
     peek_seconds: float = 2.5
+    # From this size on, a sighting whose box is clipped by the top of the
+    # frame makes every STANDING phase kneel-and-look-up, proactively -- not
+    # just the loss reaction. Reported from the robot (2026-08-25): it closed
+    # to ~1.5 m with the person's torso plainly cut off at the frame edge and
+    # never tilted, because nothing had been lost yet. The gait owns the
+    # servos while moving, so the tilt can only ever hold while standing --
+    # which is exactly when the camera looks anyway.
+    peek_look_fraction: float = 0.45
+    # Hysteresis on the way out, so a size flickering around the threshold
+    # does not bob the robot up and down.
+    peek_look_exit: float = 0.38
     # The whole run, however it is going.
     timeout: float = 60.0
     default_search_turn: int = 1  # +1 right, -1 left
@@ -350,6 +361,8 @@ class ApproachConfig:
             raise ValueError("walk_burst_seconds must be within 0.2..5")
         if self.stop_confirm_seconds < 0.0:
             raise ValueError("stop_confirm_seconds must be >= 0")
+        if not 0.0 < self.peek_look_exit <= self.peek_look_fraction:
+            raise ValueError("peek_look thresholds must satisfy 0 < exit <= enter")
         if not 0.0 <= self.lost_close_margin < self.stop_height_fraction:
             raise ValueError(
                 f"lost_close_margin {self.lost_close_margin} must be >= 0 and smaller "
@@ -423,6 +436,10 @@ class ComeToMe:
     _walk_heading_ref: float | None = None
     _peek_since: float | None = None
     _peeked: bool = False
+    # True while the target is near enough (and top-clipped) that standing
+    # phases should look up. The gait stands the robot back to its own
+    # geometry whenever it moves, so this is re-applied at every halt.
+    _near: bool = False
     _search_since: float | None = None
     _search_phase_since: float | None = None
     _turning: bool = True
@@ -479,7 +496,7 @@ class ComeToMe:
             if waited < config.look_patience:
                 self.state = BehaviourState.LOOKING
                 self.reason = f"looking ({waited:.1f}s)"
-                return Intent(Drive(0, 0), self.state, self.reason)
+                return Intent(Drive(0, 0), self.state, self.reason, stance=self._stand_stance())
             # The camera has had its chance. Near-loss means the person is
             # probably towering over a level lens -- so look up and CHECK,
             # once, before calling it arrival on a heuristic (G6).
@@ -513,7 +530,7 @@ class ComeToMe:
         if now - self._look_target_since < config.look_settle_seconds:
             self.state = BehaviourState.LOOKING
             self.reason = f"watching (bearing {smoothed:+.2f})"
-            return Intent(Drive(0, 0), self.state, self.reason, target)
+            return Intent(Drive(0, 0), self.state, self.reason, target, stance=self._stand_stance())
 
         bearing_deg = smoothed * (config.hfov_deg / 2.0)
         if abs(bearing_deg) <= config.align_tolerance_deg:
@@ -526,6 +543,15 @@ class ComeToMe:
         self._last_bearing_deg = target.bearing * (self.config.hfov_deg / 2.0)
         self._holding = True
         self._search_since = None
+        top_clipped = target.box.top <= _CLIPPED_TOP
+        if top_clipped and size >= self.config.peek_look_fraction:
+            self._near = True
+        elif size < self.config.peek_look_exit:
+            self._near = False
+
+    def _stand_stance(self) -> str:
+        """What a standing phase should do with its body: look up when near."""
+        return "peek" if self._near else "stand"
 
     def _confirm_arrival(self, size: float, now: float, target: Detection) -> Intent:
         if self._big_since is None:
@@ -534,10 +560,10 @@ class ComeToMe:
         if held >= self.config.stop_confirm_seconds:
             self.state = BehaviourState.ARRIVED
             self.reason = f"{self.config.target} fills {size * 100:.0f}% of the frame"
-            return Intent(Drive(0, 0), self.state, self.reason, target)
+            return Intent(Drive(0, 0), self.state, self.reason, target, stance=self._stand_stance())
         self.state = BehaviourState.LOOKING
         self.reason = f"close enough -- confirming ({size:.2f}, {held:.1f}s)"
-        return Intent(Drive(0, 0), self.state, self.reason, target)
+        return Intent(Drive(0, 0), self.state, self.reason, target, stance=self._stand_stance())
 
     # --- aligning ---------------------------------------------------------
 
