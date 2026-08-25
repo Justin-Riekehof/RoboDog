@@ -17,12 +17,26 @@ import contextlib
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Final
 
 from robodog.api.client import RobotClient
 from robodog.api.types import Capability, Drive
 from robodog.behaviour.machine import ATTITUDE_HUNGRY, BehaviourState, ComeToMe, Intent
 from robodog.errors import CapabilityError, RobodogError
+from robodog.kinematics.poses import body_pose_targets, stand_pose
 from robodog.vision import Detection
+
+# The peek stance, in the firmware's own unit: mm of leg-height differential
+# (body_pose_targets). Kneel a little, THEN pitch -- the operator's phrase "in
+# die Knie gehen" turned out to be load-bearing: pitching from full stand puts
+# the front legs at 110.2 mm of LEG-PLANE reach (height 109 plus the 25 mm
+# side offset, the C13 lesson) and the supervisor rightly refuses it. Lowered
+# by 3 mm, +15 mm of pitch fits with 1.8 mm of margin at both ends of the
+# 75..110 envelope, and tilts the camera ~15 deg -- the exact angle does not
+# matter, because the IMU measures whatever it really is and the size
+# correction uses that. A test pins that this pose passes the default limits.
+PEEK_PITCH_MM: Final = 15.0
+PEEK_HEIGHT_OFFSET_MM: Final = -3.0
 
 
 @dataclass(slots=True)
@@ -65,6 +79,32 @@ class BehaviourRunner:
         self._clock = clock
         self._sleep = sleep
         self.last_intent: Intent | None = None
+        self._stance = "stand"
+
+    def _apply_stance(self, stance: str) -> None:
+        """Put the body in the stance the machine asked for, where possible.
+
+        A backend without LEG_TARGET cannot change stance; the machine's peek
+        is disabled at configuration time in that case, and this guard is the
+        second net. Failures are non-fatal on purpose: a refused pose must not
+        kill a run whose drives still work -- the peek degrades to looking
+        straight ahead, which is exactly what happened before peeking existed.
+        """
+        from robodog.api.types import BodyPose, Capability
+
+        if Capability.LEG_TARGET not in self._client.capabilities:
+            return
+        targets = (
+            body_pose_targets(BodyPose(pitch=PEEK_PITCH_MM, height_offset=PEEK_HEIGHT_OFFSET_MM))
+            if stance == "peek"
+            else stand_pose()
+        )
+        try:
+            for leg, target in targets.items():
+                self._client.set_leg_target(leg, target)
+        except RobodogError:
+            return
+        self._stance = stance
 
     def _attitude(self) -> tuple[float, float | None]:
         """(pitch_deg, turned_deg), degraded honestly where nothing measures.
@@ -116,6 +156,8 @@ class BehaviourRunner:
                     self._detections(), self._clock(), pitch_deg, turned_deg
                 )
                 self.last_intent = intent
+                if intent.stance != self._stance:
+                    self._apply_stance(intent.stance)
                 if intent.drive != last:
                     self._client.send(intent.drive)
                     last = intent.drive

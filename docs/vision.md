@@ -131,6 +131,20 @@ search that had to start over. Hence three rules, each pinned by tests:
    the gyro aborts the burst early if the heading drifts (the robot veers
    when walking, F1).
 
+**And when it gets so close that a level lens loses you, it kneels and looks
+up.** The operator's observation: at arrival distance a standing person's
+torso is far above the camera's view, so "lost close in" used to be settled
+by a heuristic. Now the robot drops its hindquarters, pitches the camera up
+~15 deg (the vendor's own `pitchYawRollHeightCtrl` port supplies the pose),
+and checks. Finding you turns a guess into a visual arrival -- and it stays
+kneeling, looking up at you, which is the right ending for "Komm zu mir".
+Finding nobody falls back to the old heuristic, saying so. The IMU measures
+the commanded tilt and the distance correction absorbs it, so the size
+reading stays honest while tilted; the pose itself is validated against the
+leg workspace with margin (a first draft was refused by the supervisor --
+pitching from full stand exceeds the reach envelope, which is why the kneel
+is not decoration).
+
 On top of that the ordinary teach-UI safety applies unchanged: STOP button,
 Escape, the page's dead-man's switch, the on-device watchdog.
 

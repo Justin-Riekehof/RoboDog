@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 from robodog.api.client import RobotClient
-from robodog.api.types import Capability, Command, Drive
+from robodog.api.types import Capability, Command, Drive, LegId, LegTarget, SetLegTarget
 from robodog.backends.mock import MockBackend
 from robodog.behaviour import (
     STOP_HEIGHT_MAX,
@@ -546,8 +546,12 @@ def test_a_target_being_approached_is_kept_on_weaker_evidence() -> None:
 
 
 def test_losing_a_target_that_had_grown_large_is_arrival_not_loss() -> None:
-    """The robot used to turn away at exactly the point it had succeeded (G6)."""
-    config = ApproachConfig(look_patience=0.5, walk_burst_seconds=0.4)
+    """The robot used to turn away at exactly the point it had succeeded (G6).
+
+    Peek disabled: this pins the loss-arrival heuristic itself, which is the
+    fallback the peek falls back TO.
+    """
+    config = ApproachConfig(look_patience=0.5, walk_burst_seconds=0.4, peek=False)
     machine = ComeToMe(config=config)
     machine.update([person(0.0, config.stop_height_fraction - 0.02)], 0.0)
     machine.update([], 0.5)  # burst over, looking
@@ -640,3 +644,122 @@ def test_stop_and_look_advances_and_arrives_with_a_gated_stream() -> None:
         now += 0.1
     assert arrived is not None, "stop-and-look never arrived"
     assert walked > 10 and looks >= 3
+
+
+# --- peeking: kneel and look up before calling a close loss an arrival -------
+
+
+def close_then_lose(config: ApproachConfig) -> ComeToMe:
+    """A machine that walked close, then lost the target."""
+    machine = ComeToMe(config=config)
+    machine.update([person(0.0, config.stop_height_fraction - 0.02)], 0.0)
+    machine.update([], 0.5)  # burst over -> LOOKING
+    return machine
+
+
+def test_a_close_loss_kneels_and_looks_up_before_deciding() -> None:
+    """The operator's observation: if the box has outgrown the FOV, the robot
+    can kneel and look up instead of declaring arrival on a heuristic."""
+    machine = close_then_lose(instant(look_patience=0.5, walk_burst_seconds=0.4))
+    intent = machine.update([], 1.2)  # patience over -- previously ARRIVED here
+    assert intent.state is BehaviourState.PEEKING
+    assert intent.stance == "peek"
+    assert intent.drive == Drive(0, 0)
+
+
+def test_a_peek_that_finds_the_person_is_a_visual_arrival() -> None:
+    machine = close_then_lose(instant(look_patience=0.5, walk_burst_seconds=0.4))
+    machine.update([], 1.2)  # kneel
+    intent = machine.update([person(0.0, 0.8)], 1.5)
+    assert intent.state is BehaviourState.ARRIVED
+    assert "looked up and found" in intent.reason
+    assert intent.stance == "peek", "it stays kneeling, looking at the person"
+
+
+def test_a_silent_peek_still_arrives_but_says_what_it_did_not_see() -> None:
+    machine = close_then_lose(instant(look_patience=0.5, walk_burst_seconds=0.4, peek_seconds=1.0))
+    machine.update([], 1.2)
+    intent = machine.update([], 2.5)
+    assert intent.state is BehaviourState.ARRIVED
+    assert "looking up found nothing" in intent.reason
+
+
+def test_a_person_who_stepped_back_ends_the_peek_and_resumes() -> None:
+    machine = close_then_lose(instant(look_patience=0.5, walk_burst_seconds=0.4))
+    machine.update([], 1.2)
+    intent = machine.update([person(0.0, 0.2)], 1.5)
+    assert intent.state is BehaviourState.LOOKING
+    assert intent.stance == "stand"
+    assert machine.state is not BehaviourState.ARRIVED
+
+
+def test_the_peek_happens_once_per_close_approach() -> None:
+    """A peek that found nothing must not loop kneel-stand forever."""
+    config = instant(look_patience=0.3, walk_burst_seconds=0.4, peek_seconds=0.5)
+    machine = close_then_lose(config)
+    machine.update([], 1.0)  # kneel
+    machine.update([person(0.0, 0.2)], 1.2)  # stepped back -> resume
+    machine.update([person(0.0, config.stop_height_fraction - 0.02)], 1.4)
+    machine.update([], 2.0)  # burst/patience towards a second loss
+    intent = machine.update([], 5.0)
+    # The far sighting (0.2) re-armed the peek; a SECOND close loss peeks again.
+    assert machine._peeked or intent.state in (BehaviourState.ARRIVED, BehaviourState.PEEKING)
+
+
+def test_peek_disabled_arrives_directly_as_before() -> None:
+    machine = close_then_lose(instant(look_patience=0.5, walk_burst_seconds=0.4, peek=False))
+    intent = machine.update([], 1.2)
+    assert intent.state is BehaviourState.ARRIVED
+    assert "too close to see it whole" in intent.reason
+
+
+def test_the_runner_translates_the_stance_into_leg_targets() -> None:
+    """The machine says "peek"; the runner kneels the hind legs and raises the
+    front -- through the client, through the supervisor, like everything."""
+
+    class PoseRecorder(MockBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.poses: list[tuple[LegId, LegTarget]] = []
+
+        def send(self, command: Command) -> None:
+            if isinstance(command, SetLegTarget):
+                self.poses.append((command.leg, command.target))
+            super().send(command)
+
+    backend = PoseRecorder()
+    config = instant(look_patience=0.2, walk_burst_seconds=0.3, peek_seconds=0.2)
+    runner, _client, _backend, _clock = make_runner(
+        [[person(0.0, config.stop_height_fraction - 0.02)]] + [[]] * 400,
+        config=config,
+        backend=backend,
+    )
+    report = runner.run()
+    assert report.state is BehaviourState.ARRIVED
+    assert len(backend.poses) == 8, "kneel down (4 legs) and stand back up (4 legs)"
+    peek = dict(backend.poses[:4])
+    # Nose up: front legs reach further down than the hind legs.
+    assert peek[LegId.FRONT_LEFT].y > peek[LegId.HIND_LEFT].y
+    # And a peek that saw nobody ends standing, not stuck kneeling.
+    stand = dict(backend.poses[4:])
+    assert stand[LegId.FRONT_LEFT].y == stand[LegId.HIND_LEFT].y
+
+
+def test_the_peek_pose_fits_the_workspace_with_margin() -> None:
+    """The first draft did not: pitching from full stand put the front legs at
+    110.2 mm of leg-plane reach (height plus the side offset -- C13) and the
+    supervisor refused the whole stance, silently degrading every peek. The
+    operator's own phrase held the fix: kneel first, then pitch."""
+    from robodog.api.types import BodyPose
+    from robodog.behaviour.runner import PEEK_HEIGHT_OFFSET_MM, PEEK_PITCH_MM
+    from robodog.kinematics.leg import leg_roll_and_depth
+    from robodog.kinematics.poses import body_pose_targets
+    from robodog.safety.limits import LimitConfig, check_leg_target
+
+    targets = body_pose_targets(BodyPose(pitch=PEEK_PITCH_MM, height_offset=PEEK_HEIGHT_OFFSET_MM))
+    limits = LimitConfig()
+    for target in targets.values():
+        check_leg_target(target, limits)  # raises on violation
+        depth = leg_roll_and_depth(target)[1]
+        margin = min(depth - limits.plane_depth_min, limits.plane_depth_max - depth)
+        assert margin >= 1.0, f"only {margin:.1f} mm from the envelope edge"

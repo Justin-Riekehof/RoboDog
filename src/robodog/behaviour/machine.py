@@ -203,6 +203,7 @@ class BehaviourState(Enum):
     LOOKING = auto()  # standing still, waiting for the camera to speak
     ALIGNING = auto()  # turning on the spot towards the last seen bearing
     ADVANCING = auto()  # walking straight ahead, a bounded burst
+    PEEKING = auto()  # kneeling hind legs, camera pitched up: is someone there?
     ARRIVED = auto()  # near enough, stopped -- the successful end
     LOST = auto()  # gave up: the search found nothing, or the run timed out
 
@@ -210,7 +211,9 @@ class BehaviourState(Enum):
 _TERMINAL: Final = frozenset({BehaviourState.ARRIVED, BehaviourState.LOST})
 # The states in which the machine wants a fresh gyro reading each tick: blind
 # rotation is closed-loop on `turned`, and blind advance watches it for drift.
-ATTITUDE_HUNGRY: Final = frozenset({BehaviourState.ALIGNING, BehaviourState.ADVANCING})
+ATTITUDE_HUNGRY: Final = frozenset(
+    {BehaviourState.ALIGNING, BehaviourState.ADVANCING, BehaviourState.PEEKING}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,6 +224,11 @@ class Intent:
     state: BehaviourState
     reason: str
     target: Detection | None = None
+    stance: str = "stand"
+    """The whole-body pose this tick wants: "stand", or "peek" -- hind legs
+    kneeling, camera pitched up. Declarative on purpose: the machine stays
+    pure, and the runner maps the word onto leg targets (or ignores it on a
+    backend without LEG_TARGET)."""
 
     @property
     def finished(self) -> bool:
@@ -304,6 +312,18 @@ class ApproachConfig:
     lost_close_margin: float = 0.10
     # The stop size must hold this long; one frame is not evidence (G2/G10).
     stop_confirm_seconds: float = 0.3
+    # --- peeking ----------------------------------------------------------
+    # When the target is lost close in, kneel the hind legs and pitch the
+    # camera up before declaring arrival: at half a metre a standing person's
+    # torso is far above a level lens, and the operator's observation is that
+    # the robot could simply look up (2026-08-25). The IMU measures the
+    # commanded pitch and the size correction absorbs it, so the reading
+    # stays honest while tilted. False disables (backends without
+    # LEG_TARGET cannot change stance).
+    peek: bool = True
+    # How long the upward look waits for the person to reappear before
+    # falling back to arrival-by-loss (G6), which was previously immediate.
+    peek_seconds: float = 2.5
     # The whole run, however it is going.
     timeout: float = 60.0
     default_search_turn: int = 1  # +1 right, -1 left
@@ -401,6 +421,8 @@ class ComeToMe:
     _last_turned: float | None = None
     _walk_since: float | None = None
     _walk_heading_ref: float | None = None
+    _peek_since: float | None = None
+    _peeked: bool = False
     _search_since: float | None = None
     _search_phase_since: float | None = None
     _turning: bool = True
@@ -435,6 +457,8 @@ class ComeToMe:
         threshold = self.config.keep_confidence if self._holding else self.config.acquire_confidence
         target = pick_target(detections, label=self.config.target, min_confidence=threshold)
 
+        if self.state is BehaviourState.PEEKING:
+            return self._peek_tick(target, now, pitch_deg)
         if self.state is BehaviourState.ALIGNING:
             return self._align_tick(target, now, pitch_deg)
         if self.state is BehaviourState.ADVANCING:
@@ -456,8 +480,12 @@ class ComeToMe:
                 self.state = BehaviourState.LOOKING
                 self.reason = f"looking ({waited:.1f}s)"
                 return Intent(Drive(0, 0), self.state, self.reason)
-            # The camera has had its chance. Near-loss is arrival (G6)...
+            # The camera has had its chance. Near-loss means the person is
+            # probably towering over a level lens -- so look up and CHECK,
+            # once, before calling it arrival on a heuristic (G6).
             if self._holding and self._last_height >= self.lost_close_height:
+                if config.peek and not self._peeked:
+                    return self._enter_peek(now)
                 self.state = BehaviourState.ARRIVED
                 self.reason = (
                     f"arrived: lost sight of the {config.target} at "
@@ -474,6 +502,9 @@ class ComeToMe:
             return self._confirm_arrival(size, now, target)
         self._big_since = None
 
+        if size < self.lost_close_height:
+            # Back at ordinary range: a later close approach earns a fresh peek.
+            self._peeked = False
         # Dwell before committing: the whole point of smoothing the bearing is
         # that more than one frame contributes to it, and a decision on the
         # first frame would hand one jittery box centre the entire alignment.
@@ -602,6 +633,46 @@ class ComeToMe:
                 return self._enter_look(now, "target off centre -- stopping to look")
         self.reason = "advancing straight"
         return Intent(Drive(1, 0), self.state, self.reason, target)
+
+    # --- peeking: kneel, look up, make sure -------------------------------
+
+    def _enter_peek(self, now: float) -> Intent:
+        self.state = BehaviourState.PEEKING
+        self._peek_since = now
+        self._peeked = True
+        self._steered_bearing = None
+        self.reason = "lost it close in -- kneeling to look up"
+        return Intent(Drive(0, 0), self.state, self.reason, stance="peek")
+
+    def _peek_tick(self, target: Detection | None, now: float, pitch_deg: float) -> Intent:
+        config = self.config
+        assert self._peek_since is not None
+        if target is not None:
+            # There they are. The pitch the tilt commands is measured by the
+            # IMU and fed in here, so the size is corrected for the very tilt
+            # that made the sighting possible.
+            size = level_height_fraction(target, pitch_deg)
+            self._register_sighting(target, size, now)
+            if size >= config.stop_height_fraction:
+                self.state = BehaviourState.ARRIVED
+                self.reason = (
+                    f"arrived: looked up and found the {config.target} "
+                    f"({size * 100:.0f}% of the frame)"
+                )
+                return Intent(Drive(0, 0), self.state, self.reason, target, stance="peek")
+            # Visible but small: they stepped back. Stand up and resume.
+            return self._enter_look(now, "they moved away -- standing back up")
+        if now - self._peek_since >= config.peek_seconds:
+            # Looked up, saw nobody. The close-loss heuristic stands, minus
+            # its confidence: say what was and was not seen.
+            self.state = BehaviourState.ARRIVED
+            self.reason = (
+                f"arrived: lost the {config.target} at "
+                f"{self._last_height * 100:.0f}% of the frame; looking up found nothing"
+            )
+            return Intent(Drive(0, 0), self.state, self.reason)
+        self.reason = "peeking up"
+        return Intent(Drive(0, 0), self.state, self.reason, stance="peek")
 
     # --- searching (unchanged in spirit) ----------------------------------
 
