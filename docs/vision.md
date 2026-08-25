@@ -69,6 +69,29 @@ The detection boxes are drawn **over** the picture as HTML, positioned at the
 fractions the server computed. Nothing decodes a JPEG on either side, and the
 boxes land correctly whatever resolution the camera is set to.
 
+## Stop-and-look: the stream pauses while the robot moves
+
+The robot's firmware sends no video frames while a move is latched. That is
+not a limitation to work around -- it is the design, and it was the operator's
+own suggestion after a day of measuring: a held stream degrades the gait
+through mechanisms no task priority reaches (ASSUMPTIONS G12), and the frames
+it delivers mid-stride are motion-blurred and pitch-skewed -- precisely the
+ones that lie about distance (G2, F6).
+
+Nothing in the behaviour was changed to support this, which is the elegant
+part. Walking blanks the detections; the detections expire; the
+never-walk-blind invariant halts the robot within its grace period; the halt
+restarts the stream; the next look re-acquires. The approach becomes what a
+careful animal does anyway: look, commit to a bounded advance, stop, look
+again. The search was already built of turn-pulses with look-pauses, so it
+sees between pulses for free.
+
+Two consequences worth knowing at the controls: the Camera tab freezes while
+the robot drives (the vision panel says so rather than crying failure), and an
+approach takes longer than a continuous walk would -- trading speed for a gait
+that stays smooth and pictures that tell the truth. `streamgate=0` over
+`/control` restores the old behaviour for A/B.
+
 ## What the behaviour actually does
 
 ```

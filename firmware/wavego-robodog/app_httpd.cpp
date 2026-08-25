@@ -83,6 +83,16 @@ extern TaskHandle_t ROBODOG_LOOP_TASK;
 // both is doing less per second. Vision needs ~5 fps; nobody needs 20.
 // Runtime knob: var=fps, val = max frames/sec (0 = uncapped).
 static uint32_t ROBODOG_STREAM_MIN_MS = 200;
+// And the stronger rule, the operator's own suggestion (2026-08-25): no
+// frames at all while the robot MOVES. The 5 fps cap still left the walk
+// hitching, so whatever the stream costs -- DMA interrupts, radio airtime --
+// it costs too much per frame; and a frame taken mid-stride is motion-blurred
+// and pitched anyway, the exact frames that lie about distance (G2/F6). The
+// robot advances by looking, walking a bounded burst, and looking again; the
+// host's behaviour machine produces that rhythm by itself, because its
+// detections expire and it refuses to walk blind. var=streamgate 0 disables,
+// for A/B and for anyone who wants the vendor experience back.
+static int ROBODOG_STREAM_GATE = 1;
 // === end RoboDog ==========================================================
 // RoboDog: the IMU ring, sampled in loop() and formatted here (InitConfig.h).
 extern int robodogImuJson(char *out, size_t n, uint32_t since);
@@ -170,6 +180,16 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   }
  
   while (true) {
+    // === RoboDog: stop-and-look ==========================================
+    // While a move is latched the stream sends nothing: the gait keeps its
+    // core and its airtime, and the client sees a stalled stream, which the
+    // host reader is built to ride out. Polled at 50 ms so frames return
+    // within a step of the robot stopping.
+    while (ROBODOG_STREAM_GATE && (moveFB != 0 || moveLR != 0)) {
+      vTaskDelay(50 / portTICK_PERIOD_MS);
+    }
+    // === end RoboDog ======================================================
+
     // === RoboDog: the frame-rate cap =====================================
     // vTaskDelay rather than a busy check, so the wait itself yields the
     // core and the radio.
@@ -381,6 +401,13 @@ static esp_err_t cmd_handler(httpd_req_t *req){
   // RoboDog: keep-alive that changes nothing else. The feed above did the work.
   else if (!strcmp(variable, "ping")){
   }
+
+  // === RoboDog: stop-and-look gate, live =================================
+  else if (!strcmp(variable, "streamgate")){
+    ROBODOG_STREAM_GATE = (val != 0) ? 1 : 0;
+    Serial.print("streamgate:");Serial.println(ROBODOG_STREAM_GATE);
+  }
+  // === end RoboDog =========================================================
 
   // === RoboDog: stream frame-rate cap, live ==============================
   else if (!strcmp(variable, "fps")){

@@ -1040,6 +1040,10 @@ class TeachUIServer:
         )
         status["stop_height_max"] = STOP_HEIGHT_MAX
         status["frame_url"] = _FRAME_PATH
+        # The firmware gates the stream while a move is latched (stop-and-look),
+        # so a stale detector during a drive is the design working, not a fault
+        # -- and the page must not cry wolf over it.
+        status["moving"] = self._client.state().drive != Drive(0, 0)
         return status
 
     def _say(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
