@@ -779,35 +779,56 @@ def clipped(height: float, *, bearing: float = 0.0) -> Detection:
     )
 
 
-def test_a_near_clipped_sighting_makes_the_standing_look_kneel() -> None:
-    """The report from the robot: it closed to ~1.5 m with the torso plainly
-    cut off at the frame edge and never tilted, because nothing had been lost
-    yet. Nearness itself is the trigger now, not loss."""
+def test_a_far_clipped_sighting_does_not_kneel() -> None:
+    """The operator's regression, verbatim: far away and at the frame edge,
+    box top-clipped but most of the body visible -- and the robot kneeled.
+    A top-clipped box is true from 3.4 m inward on this camera (G2), so the
+    edge alone is no nearness signal. Only a close LOSS starts the kneeling."""
     machine = ComeToMe(config=ApproachConfig())
-    intent = machine.update([clipped(0.55)], 0.0)
-    assert intent.state is BehaviourState.LOOKING
-    assert intent.stance == "peek"
+    intent = machine.update([clipped(0.55, bearing=0.6)], 0.0)
+    assert intent.stance == "stand"
+    assert not machine._near
 
 
-def test_a_far_or_unclipped_sighting_stands_tall() -> None:
-    machine = ComeToMe(config=ApproachConfig())
-    assert machine.update([clipped(0.2)], 0.0).stance == "stand"  # clipped but far
-    machine = ComeToMe(config=ApproachConfig())
-    assert machine.update([person(0.0, 0.5)], 0.0).stance == "stand"  # big but whole
+def test_the_close_loss_starts_the_kneeling_checks() -> None:
+    """Walk at the box until it vanishes; look up; if the person is found and
+    still short of the stop size, PRESS ON -- with every check taken kneeling."""
+    config = instant(look_patience=0.4, walk_burst_seconds=0.3, peek_seconds=1.0)
+    machine = close_then_lose(config)
+    machine.update([], 1.0)  # patience over -> kneel and look up
+    assert machine.state is BehaviourState.PEEKING
+    intent = machine.update([clipped(0.60)], 1.2)  # found, short of stop
+    assert "pressing on" in intent.reason
+    assert machine._near, "the close band stays kneeling from here"
+    # A sighting decides immediately here (settle=0) and walking intents are
+    # always "stand" -- the gait owns the servos. The kneeling shows on the
+    # STANDING intents: an empty look while near is taken camera-up.
+    follow = machine.update([clipped(0.62)], 1.4)
+    assert follow.state is BehaviourState.ADVANCING
+    assert follow.stance == "stand"  # moving: the gait owns the servos
+    standing = machine.update([], 1.8)  # burst (0.3 s) over -> a standing look
+    assert standing.drive == Drive(0, 0)
+    assert standing.stance == "peek"
+    assert standing.state is not BehaviourState.ARRIVED
 
 
-def test_nearness_has_hysteresis_on_the_way_out() -> None:
-    """A size flickering round the threshold must not bob the robot."""
-    machine = ComeToMe(config=ApproachConfig())
-    machine.update([clipped(0.50)], 0.0)  # near
-    assert machine.update([clipped(0.42)], 0.3).stance == "peek"  # inside the band
-    assert machine.update([clipped(0.30)], 0.6).stance == "stand"  # clearly out
+def test_the_kneeling_mode_ends_when_they_clearly_step_back() -> None:
+    config = instant(look_patience=0.4, walk_burst_seconds=0.3, peek_seconds=1.0)
+    machine = close_then_lose(config)
+    machine.update([], 1.0)  # kneel
+    # Mid-band sighting keeps kneeling (hysteresis against bobbing)...
+    machine.update([clipped(0.58)], 1.2)
+    assert machine._near
+    # ... a clearly small one stands the robot back up.
+    machine.update([person(0.0, 0.30)], 1.6)
+    assert not machine._near
 
 
 def test_the_runner_rekneels_after_every_walk_burst() -> None:
-    """The gait stands the robot back up whenever it moves; the runner must
-    know that and re-apply the tilt at the next halt, not believe a pose the
-    firmware has already walked out of."""
+    """The gait stands the robot back up whenever it moves; once the close
+    loss has switched the approach to kneeling checks, the runner must
+    re-apply the tilt at every halt, not believe a pose the firmware has
+    already walked out of."""
 
     class PoseRecorder(MockBackend):
         def __init__(self) -> None:
@@ -824,10 +845,17 @@ def test_the_runner_rekneels_after_every_walk_burst() -> None:
             super().send(command)
 
     backend = PoseRecorder()
-    config = instant(look_patience=0.3, walk_burst_seconds=0.2, stop_confirm_seconds=0.0)
-    # Near-clipped sightings around walk bursts: kneel, walk, kneel again.
-    script: list[list[Detection]] = [[clipped(0.5)]] + [[]] * 12 + [[clipped(0.55)]] + [[]] * 12
-    script += [[clipped(0.7)]]  # big enough to arrive
+    config = instant(
+        look_patience=0.3,
+        walk_burst_seconds=0.2,
+        peek_seconds=1.0,
+        stop_confirm_seconds=0.0,
+    )
+    script: list[list[Detection]] = [[person(0.0, config.stop_height_fraction - 0.02)]]
+    script += [[]] * 40  # burst, empty looks, close loss -> kneel (batch 1)
+    script += [[clipped(0.60)]]  # found while peeking: press on
+    script += [[]] * 40  # walk burst wipes the stance, next halt re-kneels (2)
+    script += [[clipped(0.75)]]  # big enough: visual arrival
     runner, _client, _backend, _clock = make_runner(script, config=config, backend=backend)
     report = runner.run()
     assert report.state is BehaviourState.ARRIVED

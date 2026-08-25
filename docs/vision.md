@@ -131,18 +131,21 @@ search that had to start over. Hence three rules, each pinned by tests:
    the gyro aborts the burst early if the heading drifts (the robot veers
    when walking, F1).
 
-**And once you are near, it kneels to look at you between steps.** A close
-sighting on this robot is always clipped by the top of the frame (the camera
-rides a hand's width off the floor), so the clipped edge itself is the
-trigger: from ~45% of frame height on, every standing look is taken with the
-hindquarters dropped and the camera pitched up. The gait owns the servos
-while the robot moves, so the tilt cannot persist through a walk burst -- the
-runner re-kneels at every halt, which gives the approach its final rhythm:
-step, kneel, look up, step. The overlay only draws boxes above 60% confidence
-(the operator's request -- weak guesses cluttered the picture), with one
-exception: the box the robot is actually following is always drawn, whatever
-its score, because a robot following something the page refuses to show would
-be debugging blindfolded.
+**The last stretch is walked kneeling.** The robot approaches the box until a
+level look loses it entirely -- which on this camera means the person is
+towering over the lens -- then kneels, pitches the camera up, and checks. If
+the person is found but still short of the stop size, it presses on, and from
+that point every standing check is taken kneeling: walk, kneel, look up,
+walk. The trigger is deliberately the loss, not the clipped box edge -- a
+top-clipped box is true from 3.4 m inward here (the camera rides a hand's
+width off the floor), so as a nearness signal the edge alone fires half a
+room too early, which one afternoon on the robot demonstrated. Stepping
+clearly back out of the close band stands it tall again.
+
+The overlay only draws boxes above 60% confidence (the operator's request --
+weak guesses cluttered the picture), with one exception: the box the robot is
+actually following is always drawn, whatever its score, because a robot
+following something the page refuses to show would be debugging blindfolded.
 
 **And when it gets so close that a level lens loses you entirely, the same
 kneel becomes the verdict.** The operator's observation: at arrival distance a standing person's

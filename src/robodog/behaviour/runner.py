@@ -156,7 +156,10 @@ class BehaviourRunner:
                     self._detections(), self._clock(), pitch_deg, turned_deg
                 )
                 self.last_intent = intent
-                if intent.stance != self._stance:
+                if intent.drive == Drive(0, 0) and intent.stance != self._stance:
+                    # Only a standing robot can hold a stance -- applying one in
+                    # the same tick as a drive would buy a pose the gait wipes
+                    # a moment later, one round trip each, every tick.
                     self._apply_stance(intent.stance)
                 if intent.drive != last:
                     self._client.send(intent.drive)

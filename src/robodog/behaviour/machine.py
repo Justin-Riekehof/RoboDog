@@ -324,17 +324,6 @@ class ApproachConfig:
     # How long the upward look waits for the person to reappear before
     # falling back to arrival-by-loss (G6), which was previously immediate.
     peek_seconds: float = 2.5
-    # From this size on, a sighting whose box is clipped by the top of the
-    # frame makes every STANDING phase kneel-and-look-up, proactively -- not
-    # just the loss reaction. Reported from the robot (2026-08-25): it closed
-    # to ~1.5 m with the person's torso plainly cut off at the frame edge and
-    # never tilted, because nothing had been lost yet. The gait owns the
-    # servos while moving, so the tilt can only ever hold while standing --
-    # which is exactly when the camera looks anyway.
-    peek_look_fraction: float = 0.45
-    # Hysteresis on the way out, so a size flickering around the threshold
-    # does not bob the robot up and down.
-    peek_look_exit: float = 0.38
     # The whole run, however it is going.
     timeout: float = 60.0
     default_search_turn: int = 1  # +1 right, -1 left
@@ -361,8 +350,6 @@ class ApproachConfig:
             raise ValueError("walk_burst_seconds must be within 0.2..5")
         if self.stop_confirm_seconds < 0.0:
             raise ValueError("stop_confirm_seconds must be >= 0")
-        if not 0.0 < self.peek_look_exit <= self.peek_look_fraction:
-            raise ValueError("peek_look thresholds must satisfy 0 < exit <= enter")
         if not 0.0 <= self.lost_close_margin < self.stop_height_fraction:
             raise ValueError(
                 f"lost_close_margin {self.lost_close_margin} must be >= 0 and smaller "
@@ -436,9 +423,13 @@ class ComeToMe:
     _walk_heading_ref: float | None = None
     _peek_since: float | None = None
     _peeked: bool = False
-    # True while the target is near enough (and top-clipped) that standing
-    # phases should look up. The gait stands the robot back to its own
-    # geometry whenever it moves, so this is re-applied at every halt.
+    # True from the first close loss until the target reads clearly far
+    # again: in this mode every standing check is taken kneeling, camera up.
+    # The trigger is deliberately the LOSS, not the clipped box edge -- a
+    # top-clipped box is true from 3.4 m inward on this camera (G2), so as a
+    # nearness signal the edge alone fires half a room too early, which the
+    # operator watched it do (2026-08-25). The gait stands the robot back up
+    # whenever it moves, so the runner re-kneels at every halt.
     _near: bool = False
     _search_since: float | None = None
     _search_phase_since: float | None = None
@@ -543,10 +534,9 @@ class ComeToMe:
         self._last_bearing_deg = target.bearing * (self.config.hfov_deg / 2.0)
         self._holding = True
         self._search_since = None
-        top_clipped = target.box.top <= _CLIPPED_TOP
-        if top_clipped and size >= self.config.peek_look_fraction:
-            self._near = True
-        elif size < self.config.peek_look_exit:
+        if self._near and size < self.lost_close_height - 0.05:
+            # Clearly back at distance: stand tall again. The margin keeps a
+            # size wobbling around the close band from bobbing the robot.
             self._near = False
 
     def _stand_stance(self) -> str:
@@ -626,7 +616,9 @@ class ComeToMe:
         self._walk_since = None
         self._walk_heading_ref = None
         self.reason = reason
-        return Intent(Drive(0, 0), self.state, self.reason)
+        # The stance rides along: in the close band (self._near) every halt is
+        # taken kneeling, and this is the return path every halt goes through.
+        return Intent(Drive(0, 0), self.state, self.reason, stance=self._stand_stance())
 
     # --- advancing --------------------------------------------------------
 
@@ -666,6 +658,7 @@ class ComeToMe:
         self.state = BehaviourState.PEEKING
         self._peek_since = now
         self._peeked = True
+        self._near = True
         self._steered_bearing = None
         self.reason = "lost it close in -- kneeling to look up"
         return Intent(Drive(0, 0), self.state, self.reason, stance="peek")
@@ -686,8 +679,15 @@ class ComeToMe:
                     f"({size * 100:.0f}% of the frame)"
                 )
                 return Intent(Drive(0, 0), self.state, self.reason, target, stance="peek")
-            # Visible but small: they stepped back. Stand up and resume.
-            return self._enter_look(now, "they moved away -- standing back up")
+            if size < self.lost_close_height - 0.05:
+                # Genuinely small again: they stepped back out of the close
+                # band. Stand tall and resume the ordinary approach.
+                self._near = False
+                return self._enter_look(now, "they moved away -- standing back up")
+            # Found, still short of the stop size: the operator's design says
+            # keep going. _near stays set, so every check on the way in is
+            # taken kneeling, camera up -- walk, kneel, look, walk.
+            return self._enter_look(now, "still there -- pressing on, looking up")
         if now - self._peek_since >= config.peek_seconds:
             # Looked up, saw nobody. The close-loss heuristic stands, minus
             # its confidence: say what was and was not seen.
@@ -704,6 +704,7 @@ class ComeToMe:
 
     def _enter_search(self, now: float) -> Intent:
         self._holding = False
+        self._near = False
         self._steered_bearing = None
         self._look_target_since = None
         self._search_since = now
